@@ -16,7 +16,7 @@ from torchtext._torchtext import (
 )
 
 import scgpt as scg
-from scgpt.tokenizer import tokenize_and_pad_batch, random_mask_value
+from utils.custom_tokenizer import tokenize_and_pad_batch, random_mask_value
 from scgpt import SubsetsBatchSampler
 
 def add_pred_layer(adata: AnnData, 
@@ -472,7 +472,7 @@ def produce_training_datasets(adata_input, config,
 
     # construct tokenized data
     print('tokenize data...')
-    tokenized_train = tokenize_and_pad_batch(
+    tokenized_train, gene_idx_list_train= tokenize_and_pad_batch(
         train_data,
         gene_ids,
         max_len=config.max_seq_len,
@@ -482,7 +482,7 @@ def produce_training_datasets(adata_input, config,
         append_cls=True,  # append <cls> token at the beginning
         include_zero_gene=True,
     )
-    tokenized_valid = tokenize_and_pad_batch(
+    tokenized_valid, gene_idx_list_valid = tokenize_and_pad_batch(
         valid_data,
         gene_ids,
         max_len=config.max_seq_len,
@@ -493,7 +493,7 @@ def produce_training_datasets(adata_input, config,
         include_zero_gene=True,
     )
 
-    tokenized_train_next = tokenize_and_pad_batch(
+    tokenized_train_next, _ = tokenize_and_pad_batch(
         train_data_next,
         gene_ids,
         max_len=config.max_seq_len,
@@ -502,8 +502,9 @@ def produce_training_datasets(adata_input, config,
         pad_value=config.pad_value,
         append_cls=True,  # append <cls> token at the beginning
         include_zero_gene=True,
+         sample_indices= gene_idx_list_train
     )
-    tokenized_valid_next = tokenize_and_pad_batch(
+    tokenized_valid_next, _ = tokenize_and_pad_batch(
         valid_data_next,
         gene_ids,
         max_len=config.max_seq_len,
@@ -511,7 +512,9 @@ def produce_training_datasets(adata_input, config,
         pad_token=config.pad_token,
         pad_value=config.pad_value,
         append_cls=True,
-        include_zero_gene=True,
+        include_zero_gene=True, 
+        sample_indices= gene_idx_list_valid
+
     )
     if logger is not None:
         logger.info(

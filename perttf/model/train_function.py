@@ -24,7 +24,7 @@ from scgpt.loss import (
     masked_relative_error,
     criterion_neg_log_bernoulli,
 )
-from scgpt.tokenizer import tokenize_and_pad_batch, random_mask_value
+from utils.custom_tokenizer import tokenize_and_pad_batch, random_mask_value
 from scgpt.model import TransformerModel, AdversarialDiscriminator
 
 import matplotlib.pyplot as plt
@@ -547,7 +547,7 @@ def eval_testdata(
     if "cls" in include_types:
         if logger is not None:
             logger.info("Evaluating cls cell embeddings")
-        tokenized_all = tokenize_and_pad_batch(
+        tokenized_all, gene_idx_list= tokenize_and_pad_batch(
             all_counts,
             gene_ids,
             max_len=config.max_seq_len,
@@ -562,7 +562,7 @@ def eval_testdata(
         all_gene_ids, all_values = tokenized_all["genes"], tokenized_all["values"]
 
         if next_layer_key in adata_t.layers:
-            tokenized_all_next = tokenize_and_pad_batch(
+            tokenized_all_next, _ = tokenize_and_pad_batch(
                 all_counts_next,
                 gene_ids,
                 max_len=config.max_seq_len,
@@ -571,6 +571,7 @@ def eval_testdata(
                 pad_value=config.pad_value,
                 append_cls=True,  # append <cls> token at the beginning
                 include_zero_gene=True,
+                sample_indices=gene_idx_list
             )
             all_gene_ids_next, all_values_next = tokenized_all_next["genes"], tokenized_all_next["values"]
 

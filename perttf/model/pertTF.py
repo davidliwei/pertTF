@@ -127,6 +127,7 @@ class PertExpEncoder(nn.Module):
     ):
         super().__init__()
         d_in = d_model * 2 
+        #d_in = d_model
         self.fc = nn.Sequential(
             nn.Linear(d_in, d_model),
             nn.Sigmoid(),#nn.ReLU(),#nn.LeakyReLU(),
@@ -354,6 +355,7 @@ class PerturbationTFModel(TransformerModel):
                 ],
                 dim=1,
             )
+            #tf_concat = cell_emb_orig + pert_emb_next
             cell_emb_next=self.pert_exp_encoder(tf_concat)
         else:
             cell_emb_next=cell_emb_orig
@@ -550,6 +552,7 @@ class PerturbationTFModel(TransformerModel):
                 tf_concat=torch.cat(
                     [cell_emb,pert_emb_next], dim=1,
                 )
+                #tf_concat = cell_emb + pert_emb_next
                 cell_emb_next=self.pert_exp_encoder(tf_concat)
                 if output_to_cpu:
                     cell_emb_next_cpu = cell_emb_next.cpu()
