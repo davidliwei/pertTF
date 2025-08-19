@@ -1,0 +1,116 @@
+# Modified from scGPT
+import torch
+import torch.nn.functional as F
+
+from typing import Optional
+
+def semi_masked_mse_loss(
+    input: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, alpha = 0.7
+) -> torch.Tensor:
+    """
+    Compute the masked MSE loss between input and target.
+    """
+    mask = mask.float()
+    loss_mask = F.mse_loss(input * mask, target * mask, reduction="sum") / mask.sum()
+    loss_other = F.mse_loss(input * (1 - mask), target * (1 - mask), reduction="sum") / (1- mask).sum()
+    loss = loss_other*(1-alpha) + loss_mask*alpha
+    return loss 
+
+
+def criterion_semi_neg_log_bernoulli(
+    input: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, alpha = 0.7
+) -> torch.Tensor:
+    """
+    Compute the negative log-likelihood of Bernoulli distribution
+    """
+    mask = mask.float()
+    bernoulli = torch.distributions.Bernoulli(probs=input)
+    log_probs = bernoulli.log_prob((target > 0).float())
+    masked_log_probs_mask = log_probs * mask / mask.sum()
+    masked_log_probs_other = log_probs * (1- mask) / (1 - mask).sum()
+    masked_log_probs = masked_log_probs_other*(1-alpha) + masked_log_probs_mask*alpha
+    return -masked_log_probs.sum()
+
+
+def semi_masked_relative_error(
+    input: torch.Tensor, target: torch.Tensor, mask: torch.LongTensor, alpha = 0.7
+) -> torch.Tensor:
+    """
+    Compute the masked relative error between input and target.
+    """
+    assert mask.any()
+    #loss_mask = torch.abs(input[mask] - target[mask]) / (target[mask] + 1e-6)
+    loss = torch.abs(input- target) / (target + 1e-6)
+    loss[mask] = loss[mask]*alpha
+    loss[~mask] = loss[~mask]*(1-alpha)
+    #loss_other = torch.abs(input[~mask] - target[~mask]) / (target[~mask] + 1e-6)
+    #loss = loss_other*(1-alpha) + loss_mask*alpha
+    return loss.mean()
+
+
+
+
+
+def l1_loss_flexible(
+    v_head: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    p_head: Optional[torch.Tensor] = None,
+    alpha: float = 0.7,
+) -> torch.Tensor:
+    """
+    Computes a flexible L1 loss with weighted masking.
+
+    If p_head is provided, it computes the unified loss where the final prediction
+    is the product of the probability and value heads (y_pred = p_head * v_head).
+
+    If p_head is None, it computes a standard L1 loss directly on the value
+    head (y_pred = v_head).
+
+    Args:
+        v_head (torch.Tensor): The output of the continuous value head.
+        target (torch.Tensor): The ground truth sparse vector.
+        mask (torch.Tensor): The binary mask tensor. 1 for primary loss positions.
+        p_head (Optional[torch.Tensor]): The optional output of the probability
+                                           head (after sigmoid, in [0, 1]).
+                                           Defaults to None.
+        alpha (float): The weight for the loss on the masked positions.
+
+    Returns:
+        torch.Tensor: The final computed loss value.
+    """
+    # Step 1: Create the prediction based on whether p_head is provided
+    if p_head is not None:
+        # Unified model: prediction is the gated value
+        y_pred = p_head * v_head
+    else:
+        # Standard model: prediction is just the value
+        y_pred = v_head
+
+    # --- The rest of the logic remains the same ---
+
+    # Ensure mask is float for calculations
+    mask = mask.float()
+
+    # Step 2: Calculate the per-element absolute error
+    abs_error = torch.abs(y_pred - target)
+
+    # Step 3: Calculate the mean loss for the masked and unmasked parts separately
+    # Add a small epsilon (1e-8) to the denominator to prevent division by zero
+    sum_mask = mask.sum()
+    loss_mask = (abs_error * mask).sum() / (sum_mask + 1e-8)
+
+    sum_other = (1 - mask).sum()
+    loss_other = (abs_error * (1 - mask)).sum() / (sum_other + 1e-8)
+
+    # Step 4: Combine the losses using the alpha weight
+    loss = loss_mask * alpha + loss_other * (1 - alpha)
+    
+    # Handle cases where one of the masks is empty
+    if sum_mask == 0 and sum_other > 0:
+        loss = loss_other
+    elif sum_other == 0 and sum_mask > 0:
+        loss = loss_mask
+        
+    return loss
+
