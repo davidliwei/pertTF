@@ -73,7 +73,7 @@ class SimpleVocab:
 
 
 
-# added the cls value is append cls (previously it was 0)
+# This function remains unchanged
 def tokenize_batch(
     data: np.ndarray,
     gene_ids: np.ndarray,
