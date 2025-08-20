@@ -10,13 +10,9 @@ from scipy.sparse import issparse
 from anndata import AnnData
 from sklearn.model_selection import train_test_split
 
-from torchtext.vocab import Vocab
-from torchtext._torchtext import (
-    Vocab as VocabPybind,
-)
 
 import scgpt as scg
-from perttf.utils.custom_tokenizer import tokenize_and_pad_batch, random_mask_value
+from perttf.utils.custom_tokenizer import tokenize_and_pad_batch, random_mask_value, SimpleVocab
 from perttf.utils.pert_data_loader import PertBatchCollator, PertTFDataset, PertTFUniDataManager, add_batch_info
 from scgpt import SubsetsBatchSampler
 
@@ -522,9 +518,7 @@ def produce_training_datasets(adata_input, config,
 
     # construct vocab
     if vocab is None:
-        vocab = Vocab(
-                VocabPybind(genes + config.special_tokens, None)
-        )  # bidirectional lookup [gene <-> int]
+        vocab = SimpleVocab(genes, config.special_tokens) # bidirectional lookup [gene <-> int]
         vocab.set_default_index(vocab["<pad>"])
     gene_ids = np.array(vocab(genes), dtype=int)
 
