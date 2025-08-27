@@ -20,7 +20,24 @@ This should resolve all conflicts between torch versions, cuda versions for scGP
 
 This version still requires torchtext to be installed, because scgpt imports it, but it will not throw errors for torch > 2.3.0 version, this allows flash-attention to be utilized. pertTF no longer imports torchtext componenets, thus will work fine
 
-## Clean Install
+### Colab Install
+**NOTE for GOOGLE COLAB installation, check python, cuda and torch versions**
+ - Tesla T4s can only use flash v1
+ - V100s have no flash attn support (hopefully if SDPA layers are integrated into pertTF.py it can bring better performance)
+ - A100/L4 can use flash v2
+
+When installing flash v2 directly via `pip install flash-attn=xxx` as that will force compilation which takes forever, always install wheels
+currently colab comes with pytorch 2.8 and cuda 12.6
+The following might work (probably needs some tweeking)
+```
+pip install orbax==0.1.7
+pip install --no-deps scgpt 
+pip install --no-deps torchtext==0.5.0
+pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
+pip install pandas scanpy "scvi-tools<1.0" numba cell-gears==0.0.2 torch_geometric pyarrow==15.0.2 sentencepiece
+```
+
+### Clean Install on HPC
 ```bash
 mamba create -n pertTF_flashv2_1 cuda-toolkit=12.8 python=3.10 'gxx>=6.0.0,<12.0' cudnn jupyter ipykernel ca-certificates matplotlib -y -c pytorch -c nvidia -c conda-forge
 pip install torch==2.6.0 torchvision orbax==0.1.7 torchdata torchmetrics 
@@ -36,7 +53,7 @@ pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.
 
 ```
 
-## INSTALL with FLASH ATTENTION v3 Beta (only on H200 architecture, 1.5-2x speed up over flash v2), 
+#### INSTALL with FLASH ATTENTION v3 Beta (only on H200 architecture, 1.5-2x speed up over flash v2), 
 ```bash
 mamba create -n pertTF_flashv3 cuda-toolkit=12.8 python=3.10 'gxx>=6.0.0,<12.0' cudnn jupyter ipykernel ca-certificates matplotlib -y -c pytorch -c nvidia -c conda-forge
 pip install torch==2.8.0 torchvision orbax==0.1.7 torchdata torchmetrics 
