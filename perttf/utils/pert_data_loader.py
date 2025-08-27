@@ -14,12 +14,12 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from anndata import AnnData
 from scipy.sparse import issparse
-from torchtext.vocab import Vocab
-from torchtext._torchtext import (
-    Vocab as VocabPybind,
-)
+#from torchtext.vocab import Vocab
+#from torchtext._torchtext import (
+#    Vocab as VocabPybind,
+#)
 from sklearn.model_selection._split import _BaseKFold
-from perttf.utils.custom_tokenizer import tokenize_and_pad_batch, random_mask_value
+from perttf.utils.custom_tokenizer import tokenize_and_pad_batch, random_mask_value, SimpleVocab
 
 
 def add_batch_info(adata):
@@ -333,7 +333,7 @@ class PertTFUniDataManager:
                  ps_columns: list = None,
                  ps_columns_perturbed_genes: list = None,
                  celltype_to_index: dict = None, 
-                 vocab: Vocab = None,
+                 vocab: SimpleVocab= None,
                  genotype_to_index: dict = None, 
                  expr_layer: str = 'X_binned',
                  next_cell_pred_type: str = "identity", 
@@ -360,7 +360,7 @@ class PertTFUniDataManager:
         add_batch_info(self.adata)
         self.num_batch_types = len(self.adata.obs["batch_id"].unique())
         self.genes = self.adata.var.index.tolist()
-        self.vocab = Vocab(VocabPybind(self.genes + self.config.special_tokens, None)) if vocab is None else vocab
+        self.vocab = SimpleVocab(self.genes, config.special_tokens) if vocab is None else vocab
         self.vocab.set_default_index(self.vocab["<pad>"])
         self.gene_ids = np.array(self.vocab(self.genes), dtype=int)
 

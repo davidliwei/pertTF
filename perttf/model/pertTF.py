@@ -16,6 +16,9 @@ import torch.distributed as dist
 
 import scgpt as scg
 from scgpt.model import TransformerModel
+from torch.nn import TransformerEncoder
+from perttf.model.modules import FlashTransformerEncoderLayerVarlen, SDPATransformerEncoderLayer
+
 
 class PerturbationDecoder(nn.Module):
     """
@@ -175,7 +178,27 @@ class PerturbationTFModel(TransformerModel):
         self.batch2_encoder = Batch2LabelEncoder(2, d_model) # should replace 2 to n_batch later
         self.n_pert = n_pert
         self.n_cls = kwargs.get("n_cls") if "n_cls" in kwargs else 1
-
+        
+        if self.transformer_encoder is not None:
+            nlayers = self.transformer_encoder.num_layers
+        else:
+            nlayers = 2
+        if kwargs.get('use_fast_transformer', False):
+            try:
+                encoder_layers = FlashTransformerEncoderLayerVarlen(
+                    d_model,
+                    kwargs.get('nhead', 4),
+                    kwargs.get('d_hid', 32),
+                    kwargs.get('dropout', 0.4),
+                    batch_first=True,
+                    norm_scheme=self.norm_scheme,
+                )
+                if encoder_layers.flash_version is not None:
+                    self.transformer_encoder = TransformerEncoder(encoder_layers, kwargs.get('nlayers', nlayers))
+            except Exception as e: 
+                print(e)
+                print('Custom flash attention v2/v3 setup failed, falling back to scGPT implementation')
+        
         # added: adding PS score decoder
         #self.n_ps = kwargs.get("n_ps") if "n_ps" in kwargs else 0
         self.n_ps = n_ps
