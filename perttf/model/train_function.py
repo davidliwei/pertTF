@@ -555,8 +555,14 @@ def eval_testdata(
 
     # evaluate the next prediction?
 
-    if "genotype_next" in adata_t.obs.columns and config.perturbation_classifier_weight > 0 and config.next_cell_pred_type == 'pert':
-        next_cell_prediction = True
+    if "genotype_next" in adata_t.obs.columns: 
+        if config.perturbation_classifier_weight > 0 and config.next_cell_pred_type == 'pert':
+            next_cell_prediction = True
+        elif config.next_cell_pred_type ==  'lochness':
+            if hasattr(config, "pred_lochness_next") and config.pred_lochness_next >0:
+                next_cell_prediction = True
+            else:
+                next_cell_prediction = False
     else:
         next_cell_prediction = False
 
@@ -618,7 +624,7 @@ def eval_testdata(
             #    time_step=0,
             #    return_np=True,
             #)
-            cell_embeddings, cell_embeddings_next, pert_preds, cls_preds, ps_preds, expr_dict = model.encode_batch_with_perturb(all_gene_ids,all_values.float(),
+            cell_embeddings, cell_embeddings_next, pert_preds, cls_preds, ps_preds, ps_preds_next, expr_dict = model.encode_batch_with_perturb(all_gene_ids,all_values.float(),
                 src_key_padding_mask=src_key_padding_mask,
                 batch_size=config.batch_size,
                 batch_labels=torch.from_numpy(batch_ids).long() if config.use_batch_label else None, # if config.DSBN else None,
@@ -641,6 +647,8 @@ def eval_testdata(
         #adata_t.obsm["X_pert_pred"] = pert_preds
         if config.ps_weight >0:
             adata_t.obsm["ps_pred"] = ps_preds
+        if config.next_cell_pred_type ==  'lochness':
+            adata_t.obsm["ps_pred_next"] = ps_preds_next 
         for k in expr_dict:
 
             adata_t.obsm[k] = expr_dict[k][0]
@@ -892,7 +900,7 @@ def wrapper_train(model, config, data_gen,
                 f"valid loss/mse {val_loss:5.4f} | mre {val_mre:5.4f} | "
                 f"valid loss/mse_next {val_loss_next:5.4f} | mre_next {val_mre_next:5.4f} | "
                 f"valid dab {val_dab:5.4f} | valid cls {val_cls:5.4f} | valid pert {val_pert:5.4f} |"
-                f"valid ps {val_ps:5.4f} |"
+                f"valid ps {val_ps:5.4f} | valid ps_next {val_ps_next:5.4f} |"
             )
             logger.info("-" * 89)
 
