@@ -339,24 +339,22 @@ class PerturbationTFModel(TransformerModel):
         if self.use_batch_labels:
             batch_emb = self.batch_encoder(batch_labels)  # (batch, embsize)
 
-        pert_emb = None
         if pert_labels is not None :
             pert_emb = self.pert_encoder(pert_labels)
-        # transformmer output concatenate ?
-        # note only input pert_labels should be concatenated, not pert_label_next
-        if pert_labels is not None:
-
+            # transformmer output concatenate ?
+            # note only input pert_labels should be concatenated, not pert_label_next
             #import pdb; pdb.set_trace()
-            tf_o_concat=torch.cat(
-                [
-                    transformer_output_0,
-                    pert_emb.unsqueeze(1).repeat(1, transformer_output_0.shape[1], 1),
-                ],
-                dim=2,
-            )
+            #tf_o_concat=torch.cat(
+            #    [
+            #        transformer_output_0,
+            #        pert_emb.unsqueeze(1).repeat(1, transformer_output_0.shape[1], 1),
+            #   ],
+            #    dim=2,
+            #)
             #transformer_output=self.pert_exp_encoder(tf_o_concat)
         else:
-            tf_o_concat = None # a placeholder
+            #tf_o_concat = None # a placeholder
+            pert_emb = None
         
         transformer_output=transformer_output_0
             
