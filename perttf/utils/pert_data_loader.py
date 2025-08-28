@@ -204,25 +204,24 @@ class PertTFDataset(Dataset):
 
         # 5. Get labels and PS scores
         cell_label = self.cell_type_to_index[current_cell_obs['celltype']]
-        if self.next_cell_pred == "lochness":
-            #pert_label = self.genotype_to_index[current_cell_obs['genotype']]
-            random_pert_ind = random.randint(0, len(self.ps_columns_perturbed_genes)-1)
-            pert_label = self.genotype_to_index[self.ps_columns_perturbed_genes[random_pert_ind]]
-        else:
-            pert_label = self.genotype_to_index[current_cell_obs['genotype']]
-            random_pert_ind = 0
+        pert_label = self.genotype_to_index[current_cell_obs['genotype']]
+        
+
         batch_label = current_cell_obs['batch_id']
 
         # Next cell labels are the same for cell type, but perturbation can change
         cell_label_next = cell_label
         pert_label_next = self.genotype_to_index[next_pert_label_str]
-        
+
+                
         ps_scores = current_cell_obs[self.ps_columns].values.astype(np.float32) if self.ps_columns else np.array([0.0], dtype=np.float32)
         ps_scores_next = self.adata.obs.loc[next_cell_id, self.ps_columns].values.astype(np.float32) if self.ps_columns else np.array([0.0], dtype=np.float32)
 
         if self.next_cell_pred == "lochness":
-            ps_scores = ps_scores[random_pert_ind]
-            ps_scores_next = ps_scores_next[random_pert_ind]
+            #pert_label = self.genotype_to_index[current_cell_obs['genotype']]
+            random_pert_ind = random.randint(0, len(self.ps_columns_perturbed_genes)-1)
+            pert_label_next = self.genotype_to_index[self.ps_columns_perturbed_genes[random_pert_ind]] # this is the randomly assigned perturbations
+            ps_scores_next = ps_scores[random_pert_ind] # note that the target prediction is not the PS of NEXT cell, but the current cell
 
         return {
             "expr": current_expr,
