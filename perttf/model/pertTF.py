@@ -17,7 +17,6 @@ import torch.distributed as dist
 import scgpt as scg
 from scgpt.model import TransformerModel
 from torch.nn import TransformerEncoder
-from perttf.model.modules import FlashTransformerEncoderLayerVarlen, SDPATransformerEncoderLayer
 
 
 class PerturbationDecoder(nn.Module):
@@ -185,6 +184,7 @@ class PerturbationTFModel(TransformerModel):
             nlayers = 2
         if kwargs.get('use_fast_transformer', False):
             try:
+                from perttf.model.modules import FlashTransformerEncoderLayerVarlen, SDPATransformerEncoderLayer
                 encoder_layers = FlashTransformerEncoderLayerVarlen(
                     d_model,
                     kwargs.get('nhead', 4),
