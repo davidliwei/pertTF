@@ -76,8 +76,10 @@ def train(model: nn.Module,
 
     # check ps_next_weight. The ps_next prediction is used for predicting the lochness score for a new gene from pert_next label
     if hasattr(config, "pred_lochness_next"):
+        has_lochness_next_pred = True
         ps_next_training_weight = config.pred_lochness_next
     else:
+        has_lochness_next_pred = False
         ps_next_training_weight = config.ps_weight * config.next_weight
 
     num_batches = len(loader)
@@ -107,7 +109,7 @@ def train(model: nn.Module,
                 src_key_padding_mask=src_key_padding_mask,
                 batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
                 pert_labels = perturbation_labels if config.perturbation_input else None,
-                pert_labels_next = perturbation_labels_next if config.next_weight >0 else None,
+                pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
                 MVC=config.GEPC,
                 ECS=config.ecs_thres > 0,
                 CLS=config.cell_type_classifier,
@@ -242,7 +244,7 @@ def train(model: nn.Module,
                 src_key_padding_mask=src_key_padding_mask,
                 batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
                 pert_labels = perturbation_labels if config.perturbation_input else None,
-                pert_labels_next = perturbation_labels_next if config.next_weight >0 else None,
+                pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
                 MVC=config.GEPC,
                 ECS=config.ecs_thres > 0,
                 CLS=config.cell_type_classifier,
@@ -396,10 +398,12 @@ def evaluate(model: nn.Module,
     total_num = 0
 
     if hasattr(config, "pred_lochness_next"):
+        has_lochness_next_pred = True
         ps_next_training_weight = config.pred_lochness_next
     else:
+        has_lochness_next_pred = False
         ps_next_training_weight = config.ps_weight * config.next_weight
-        
+
     with torch.no_grad():
         for batch_data in loader:
             input_gene_ids = batch_data["gene_ids"].to(device)
@@ -421,7 +425,7 @@ def evaluate(model: nn.Module,
                     src_key_padding_mask=src_key_padding_mask,
                     batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
                     pert_labels = perturbation_labels if config.perturbation_input else None,
-                    pert_labels_next = perturbation_labels_next if config.next_weight >0 else None,
+                    pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
                     MVC=config.GEPC,
                     ECS=config.ecs_thres > 0,
                     CLS=config.cell_type_classifier,
@@ -554,20 +558,27 @@ def eval_testdata(
 
 
     # evaluate the next prediction?
-
-    if "genotype_next" in adata_t.obs.columns: 
-        if config.perturbation_classifier_weight > 0 and config.next_cell_pred_type == 'pert':
-            next_cell_prediction = True
-        elif config.next_cell_pred_type ==  'lochness':
-            if hasattr(config, "pred_lochness_next") and config.pred_lochness_next >0:
+    next_cell_prediction = False
+    perturbation_labels_next = None
+    if config.next_cell_pred_type == "pert":
+        if "genotype_next" in adata_t.obs.columns:
+            # this is the pred_next  
+            if config.perturbation_classifier_weight > 0:
                 next_cell_prediction = True
-            else:
-                next_cell_prediction = False
-    else:
-        next_cell_prediction = False
+        else:
+            logger.warning('next cell pred is set to pert but the provided adata does not have genotype_next column')
+            next_cell_prediction = False
+        if next_cell_prediction:
+            perturbation_labels_next = adata_t.obs["genotype_next"].tolist()  # make sure count from 0
+    if config.next_cell_pred_type ==  'lochness':
+        if hasattr(config, "pred_lochness_next") and config.pred_lochness_next >0:
+            next_cell_prediction = True
+        else:
+            next_cell_prediction = False
+        if next_cell_prediction:
+            perturbation_labels_next = adata_t.obs["genotype"].tolist()  # make sure count from 0
 
     if next_cell_prediction:
-        perturbation_labels_next = adata_t.obs["genotype_next"].tolist()  # make sure count from 0
         perturbation_labels_next = np.array(perturbation_labels_next)
         perturbation_labels_next = np.array([genotype_to_index[perturbation_type] for perturbation_type in perturbation_labels_next])
     else:

@@ -101,10 +101,15 @@ class PertTFDataset(Dataset):
 
     def get_adata_subset(self, next_cell_pred = 'identity'):
         assert next_cell_pred in ['pert', 'identity', "lochness"], 'next_cell_pred can only be identity or pert or lochness'
-        if next_cell_pred == "identity" or next_cell_pred == "lochness":
-            return self.adata[self.indices,].copy()
+
+        adata_small = self.adata[self.indices,].copy()
+        if next_cell_pred == "identity" :
+            return adata_small
+        elif next_cell_pred == "lochness":
+            adata_small.obs['genotype_next'] = adata_small.obs['genotype']
+            return adata_small
         else:
-            adata_small = self.adata[self.indices,].copy()
+            #adata_small = self.adata[self.indices,].copy()
             next_cell_id_list = []
             next_pert_list = []
             next_cell_global_idx_list = []

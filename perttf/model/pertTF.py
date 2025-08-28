@@ -591,7 +591,7 @@ class PerturbationTFModel(TransformerModel):
 
             #import pdb; pdb.set_trace()
             cell_emb = self._get_cell_emb_from_layer(raw_output, values_d)
-            
+            tf_concat = None
             if pert_labels_next_d is not None:
                 pert_emb_next = self.pert_encoder(pert_labels_next_d)
                 tf_concat=torch.cat(
@@ -634,7 +634,10 @@ class PerturbationTFModel(TransformerModel):
                 ps_outputs[i : i + batch_size] = ps_output   
             if self.pred_lochness_next:
                 if self.ps_decoder2 is not None:
+                    #import pdb; pdb.set_trace()
                     ps_output_next = self.ps_decoder2(tf_concat)
+                if output_to_cpu:
+                    ps_output_next = ps_output_next.cpu()
                 if return_np:
                     ps_output_next = ps_output_next.numpy()
                 ps_outputs_next[i : i + batch_size] = ps_output_next   
