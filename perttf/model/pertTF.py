@@ -552,8 +552,12 @@ class PerturbationTFModel(TransformerModel):
         # added for PS score predictions
         shape_ps = (N, self.n_ps) if time_step is not None else (N, src.size(1), self.n_ps)
         ps_outputs =  array_func(shape_ps, dtype=float32_)
-        
-       
+
+        if self.pred_lochness_next:
+            shape_ps_next =  (N, 1) 
+        else:
+            shape_ps_next = shape_ps
+        ps_outputs_next = array_func(shape_ps_next, dtype=float32_)
         
         expr_dict = {}
         if predict_expr:
@@ -628,7 +632,14 @@ class PerturbationTFModel(TransformerModel):
                 if return_np:
                     ps_output = ps_output.numpy()
                 ps_outputs[i : i + batch_size] = ps_output   
-            
+            if self.pred_lochness_next:
+                if self.ps_decoder2 is not None:
+                    ps_output_next = self.ps_decoder2(tf_concat)
+                if return_np:
+                    ps_output_next = ps_output_next.numpy()
+                ps_outputs_next[i : i + batch_size] = ps_output_next   
+            else:
+                ps_outputs_next[i : i + batch_size] = ps_outputs[i : i + batch_size]
             
             if predict_expr:
                 if self.use_batch_labels:
@@ -684,5 +695,5 @@ class PerturbationTFModel(TransformerModel):
             expr_dict['mvc_expr'] = (mvc_outputs, mvc_zero_outputs)
             expr_dict['mvc_next_expr'] = (mvc_next_outputs, mvc_next_zero_outputs)
 
-        return outputs, outputs_next, pert_outputs, cls_outputs, ps_outputs, expr_dict
+        return outputs, outputs_next, pert_outputs, cls_outputs, ps_outputs, ps_outputs_next, expr_dict
 
