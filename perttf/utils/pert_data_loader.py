@@ -226,7 +226,7 @@ class PertTFDataset(Dataset):
             #pert_label = self.genotype_to_index[current_cell_obs['genotype']]
             random_pert_ind = random.randint(0, len(self.ps_columns_perturbed_genes)-1)
             pert_label_next = self.genotype_to_index[self.ps_columns_perturbed_genes[random_pert_ind]] # this is the randomly assigned perturbations
-            ps_scores_next = ps_scores[random_pert_ind] # note that the target prediction is not the PS of NEXT cell, but the current cell
+            ps_scores_next = np.array([ps_scores[random_pert_ind]], dtype=np.float32)  # note that the target prediction is not the PS of NEXT cell, but the current cell
 
         return {
             "expr": current_expr,
