@@ -58,7 +58,7 @@ def train(model: nn.Module,
     total_mse_next, total_gepc_next = 0.0, 0.0
     total_error, total_error_next = 0.0, 0.0
     total_dab, total_adv_E, total_adv_D = 0.0, 0.0, 0.0
-    total_cls, total_pert, total_ps = 0.0, 0.0, 0.0
+    total_cls, total_pert, total_ps, total_ps_next = 0.0, 0.0, 0.0, 0.0
     log_interval = config.log_interval
     start_time = time.time()
 
@@ -74,7 +74,13 @@ def train(model: nn.Module,
     optimizer_D=optim_dict["optimizer_D"]
     scheduler_D=optim_dict["scheduler_D"]
 
-
+    # check ps_next_weight. The ps_next prediction is used for predicting the lochness score for a new gene from pert_next label
+    if hasattr(config, "pred_lochness_next"):
+        has_lochness_next_pred = True
+        ps_next_training_weight = config.pred_lochness_next
+    else:
+        has_lochness_next_pred = False
+        ps_next_training_weight = config.ps_weight * config.next_weight
 
     num_batches = len(loader)
     for batch, batch_data in enumerate(loader):
@@ -103,7 +109,7 @@ def train(model: nn.Module,
                 src_key_padding_mask=src_key_padding_mask,
                 batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
                 pert_labels = perturbation_labels if config.perturbation_input else None,
-                pert_labels_next = perturbation_labels_next if config.next_weight >0 else None,
+                pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
                 MVC=config.GEPC,
                 ECS=config.ecs_thres > 0,
                 CLS=config.cell_type_classifier,
@@ -197,7 +203,7 @@ def train(model: nn.Module,
                 loss = loss + config.ps_weight * loss_ps
                 metrics_to_log.update({"train/ps": loss_ps.item()})
                 loss_ps_next = criterion_ps(output_dict["ps_output_next"], ps_score_next)
-                loss = loss + config.ps_weight * loss_ps_next * config.next_weight
+                loss = loss + ps_next_training_weight * loss_ps_next 
                 metrics_to_log.update({"train/ps_next": loss_ps_next.item()})
 
             if config.ecs_thres > 0:
@@ -238,6 +244,7 @@ def train(model: nn.Module,
                 src_key_padding_mask=src_key_padding_mask,
                 batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
                 pert_labels = perturbation_labels if config.perturbation_input else None,
+                pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
                 MVC=config.GEPC,
                 ECS=config.ecs_thres > 0,
                 CLS=config.cell_type_classifier,
@@ -294,6 +301,7 @@ def train(model: nn.Module,
         total_cls += loss_cls.item() if config.cell_type_classifier else 0.0
         total_pert += loss_pert.item() if config.perturbation_classifier_weight > 0 else 0.0
         total_ps += loss_ps.item() if config.ps_weight >0 else 0.0
+        total_ps_next += loss_ps_next.item() if ps_next_training_weight >0 else 0.0
 
         if batch % log_interval == 0 and batch > 0:
             lr = scheduler.get_last_lr()[0]
@@ -311,6 +319,7 @@ def train(model: nn.Module,
             cur_cls = total_cls / log_interval if config.cell_type_classifier else 0.0
             cur_pert = total_pert / log_interval if config.perturbation_classifier_weight > 0 else 0.0
             cur_ps = total_ps / log_interval if config.ps_weight >0 else 0.0
+            cur_ps_next = total_ps_next / log_interval if ps_next_training_weight >0 else 0.0
             # ppl = math.exp(cur_loss)
             if logger is not None:
                 logger.info(
@@ -318,7 +327,7 @@ def train(model: nn.Module,
                     f"lr {lr:05.8f} | ms/batch {ms_per_batch:5.2f} | "
                     f"loss {cur_loss:5.2f} | mse {cur_mse:5.2f} | mre {cur_error:5.2f} |"
                     f"mse_next {cur_mse_next:5.2f} | mre_next {cur_error_next:5.2f} |"
-                    f"cls {cur_cls:5.2f} | pert {cur_pert:5.2f} | ps {cur_ps:5.2f} |"
+                    f"cls {cur_cls:5.2f} | pert {cur_pert:5.2f} | ps {cur_ps:5.2f} | ps_next {cur_ps_next:5.2f} |"
                     + (f"gepc {cur_gepc:5.2f} |" if config.GEPC else "")
                     + (f"gepc_next {cur_gepc_next:5.2f} |" if config.GEPC else "")
                     + (f"dab {cur_dab:5.2f} |" if config.dab_weight >0 else "")
@@ -338,6 +347,7 @@ def train(model: nn.Module,
             total_cls = 0
             total_pert  = 0
             total_ps  = 0
+            total_ps_next = 0
 
             start_time = time.time()
 
@@ -351,6 +361,7 @@ def define_wandb_metrcis():
     wandb.define_metric("valid/cls", summary="min", step_metric="epoch")
     wandb.define_metric("valid/pert", summary="min", step_metric="epoch")
     wandb.define_metric("valid/ps", summary="min", step_metric="epoch")
+    wandb.define_metric("valid/ps_next", summary="min", step_metric="epoch")
     wandb.define_metric("valid/sum_mse_dab", summary="min", step_metric="epoch")
     wandb.define_metric("test/avg_bio", summary="max")
 
@@ -374,7 +385,6 @@ def evaluate(model: nn.Module,
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
     model.eval()
     total_loss = 0.0
     total_loss_next = 0.0
@@ -384,7 +394,16 @@ def evaluate(model: nn.Module,
     total_cls = 0.0
     total_pert = 0.0
     total_ps = 0.0
+    total_ps_next = 0.0
     total_num = 0
+
+    if hasattr(config, "pred_lochness_next"):
+        has_lochness_next_pred = True
+        ps_next_training_weight = config.pred_lochness_next
+    else:
+        has_lochness_next_pred = False
+        ps_next_training_weight = config.ps_weight * config.next_weight
+
     with torch.no_grad():
         for batch_data in loader:
             input_gene_ids = batch_data["gene_ids"].to(device)
@@ -394,8 +413,10 @@ def evaluate(model: nn.Module,
             batch_labels = batch_data["batch_labels"].to(device)
             celltype_labels = batch_data["celltype_labels"].to(device) #added
             perturbation_labels = batch_data["perturbation_labels"].to(device) #added
+            perturbation_labels_next = batch_data["perturbation_labels_next"].to(device) #added
             ps_score = batch_data["ps"].to(device) #added
-
+            ps_score_next = batch_data["ps_next"].to(device) #added
+            
             src_key_padding_mask = input_gene_ids.eq(vocab[config.pad_token])
             with torch.cuda.amp.autocast(enabled=config.amp):
                 output_dict = model(
@@ -404,6 +425,7 @@ def evaluate(model: nn.Module,
                     src_key_padding_mask=src_key_padding_mask,
                     batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
                     pert_labels = perturbation_labels if config.perturbation_input else None,
+                    pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
                     MVC=config.GEPC,
                     ECS=config.ecs_thres > 0,
                     CLS=config.cell_type_classifier,
@@ -436,6 +458,8 @@ def evaluate(model: nn.Module,
                 if config.ps_weight > 0:
                     loss_ps = criterion_ps(output_dict["ps_output"], ps_score)
                     # = loss + loss_pert
+                if ps_next_training_weight >0:
+                    loss_ps_next = criterion_ps(output_dict["ps_output_next"], ps_score_next)
 
             total_loss += loss.item() * len(input_gene_ids)
             total_loss_next += loss_mse_next.item() * len(input_gene_ids)
@@ -449,6 +473,8 @@ def evaluate(model: nn.Module,
                 total_pert += loss_pert.item() * len(input_gene_ids)
             if config.ps_weight > 0:
                 total_ps += loss_ps.item() * len(input_gene_ids)
+            if ps_next_training_weight >0:
+                total_ps_next += loss_ps_next.item() * len(input_gene_ids)
             total_num += len(input_gene_ids)
 
     wandb.log(
@@ -461,12 +487,13 @@ def evaluate(model: nn.Module,
             "valid/cls": total_cls / total_num,
             "valid/pert": total_pert / total_num,
             "valid/ps": total_ps / total_num,
+            "valid/ps_next": total_ps_next / total_num,
             "valid/sum_mse_dab": (total_loss + config.dab_weight * total_dab)/ total_num,
             "epoch": epoch,
         },
     )
 
-    return total_loss / total_num, total_loss_next / total_num, total_error / total_num, total_error_next / total_num, total_dab / total_num, total_cls / total_num, total_pert / total_num, total_ps / total_num
+    return total_loss / total_num, total_loss_next / total_num, total_error / total_num, total_error_next / total_num, total_dab / total_num, total_cls / total_num, total_pert / total_num, total_ps / total_num, total_ps_next / total_num
 
 
 def eval_testdata(
@@ -531,14 +558,27 @@ def eval_testdata(
 
 
     # evaluate the next prediction?
-
-    if "genotype_next" in adata_t.obs.columns and config.perturbation_classifier_weight > 0 and config.next_cell_pred_type == 'pert':
-        next_cell_prediction = True
-    else:
-        next_cell_prediction = False
+    next_cell_prediction = False
+    perturbation_labels_next = None
+    if config.next_cell_pred_type == "pert":
+        if "genotype_next" in adata_t.obs.columns:
+            # this is the pred_next  
+            if config.perturbation_classifier_weight > 0:
+                next_cell_prediction = True
+        else:
+            logger.warning('next cell pred is set to pert but the provided adata does not have genotype_next column')
+            next_cell_prediction = False
+        if next_cell_prediction:
+            perturbation_labels_next = adata_t.obs["genotype_next"].tolist()  # make sure count from 0
+    if config.next_cell_pred_type ==  'lochness':
+        if hasattr(config, "pred_lochness_next") and config.pred_lochness_next >0:
+            next_cell_prediction = True
+        else:
+            next_cell_prediction = False
+        if next_cell_prediction:
+            perturbation_labels_next = adata_t.obs["genotype"].tolist()  # make sure count from 0
 
     if next_cell_prediction:
-        perturbation_labels_next = adata_t.obs["genotype_next"].tolist()  # make sure count from 0
         perturbation_labels_next = np.array(perturbation_labels_next)
         perturbation_labels_next = np.array([genotype_to_index[perturbation_type] for perturbation_type in perturbation_labels_next])
     else:
@@ -595,7 +635,7 @@ def eval_testdata(
             #    time_step=0,
             #    return_np=True,
             #)
-            cell_embeddings, cell_embeddings_next, pert_preds, cls_preds, ps_preds, expr_dict = model.encode_batch_with_perturb(all_gene_ids,all_values.float(),
+            cell_embeddings, cell_embeddings_next, pert_preds, cls_preds, ps_preds, ps_preds_next, expr_dict = model.encode_batch_with_perturb(all_gene_ids,all_values.float(),
                 src_key_padding_mask=src_key_padding_mask,
                 batch_size=config.batch_size,
                 batch_labels=torch.from_numpy(batch_ids).long() if config.use_batch_label else None, # if config.DSBN else None,
@@ -618,6 +658,8 @@ def eval_testdata(
         #adata_t.obsm["X_pert_pred"] = pert_preds
         if config.ps_weight >0:
             adata_t.obsm["ps_pred"] = ps_preds
+        if config.next_cell_pred_type ==  'lochness':
+            adata_t.obsm["ps_pred_next"] = ps_preds_next 
         for k in expr_dict:
 
             adata_t.obsm[k] = expr_dict[k][0]
@@ -853,7 +895,7 @@ def wrapper_train(model, config, data_gen,
                 logger = logger,
                 device = device
             )
-        val_loss, val_loss_next, val_mre, val_mre_next, val_dab, val_cls, val_pert, val_ps = evaluate(
+        val_loss, val_loss_next, val_mre, val_mre_next, val_dab, val_cls, val_pert, val_ps, val_ps_next = evaluate(
             model,
             loader=valid_loader,
             config=config,
@@ -869,7 +911,7 @@ def wrapper_train(model, config, data_gen,
                 f"valid loss/mse {val_loss:5.4f} | mre {val_mre:5.4f} | "
                 f"valid loss/mse_next {val_loss_next:5.4f} | mre_next {val_mre_next:5.4f} | "
                 f"valid dab {val_dab:5.4f} | valid cls {val_cls:5.4f} | valid pert {val_pert:5.4f} |"
-                f"valid ps {val_ps:5.4f} |"
+                f"valid ps {val_ps:5.4f} | valid ps_next {val_ps_next:5.4f} |"
             )
             logger.info("-" * 89)
 
