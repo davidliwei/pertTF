@@ -291,7 +291,7 @@ def produce_training_datasets(adata_input, config,
     """
     test_manager = PertTFUniDataManager(adata_input, 
                                      config, 
-                                     ps_columns=ps_columns, 
+                                     ps_columns=ps_columns, vocab=vocab,
                                      ps_columns_perturbed_genes=ps_columns_perturbed_genes,
                                      celltype_to_index = cell_type_to_index, 
                                      genotype_to_index= genotype_to_index, 

@@ -13,6 +13,7 @@ from torch import nn, Tensor
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from anndata import AnnData
+import anndata
 from scipy.sparse import issparse
 #from torchtext.vocab import Vocab
 #from torchtext._torchtext import (
@@ -251,7 +252,7 @@ class PertBatchCollator:
     """
     A collate function for the DataLoader that tokenizes, pads, and masks batches on the fly.
     """
-    def __init__(self,  vocab: object, gene_ids: np.ndarray, full_tokenize: bool = False, **config):
+    def __init__(self, vocab: object, gene_ids: np.ndarray, full_tokenize: bool = False, **config):
         self.config = config
         self.vocab = vocab
         self.gene_ids = gene_ids
@@ -259,6 +260,7 @@ class PertBatchCollator:
         self.include_zero_gene = config.get('include_zero_gene', True)
         self.append_cls = config.get('append_cls', True)
         self.cls_value = config.get('cls_value', -3)
+        self.cls_token = config.get('cls_token', '<cls>')
         self.max_seq_len = config.get('max_seq_len', 3000)
         self.pad_token = config.get('pad_token', '<pad>')
         self.pad_value = config.get('pad_value', -2)
@@ -282,13 +284,13 @@ class PertBatchCollator:
 
         # TODO: These functions may need to be modified to accomodate inputs w differing number of genes in the future
         tokenized, gene_idx_list = tokenize_and_pad_batch(
-            np.array(expr_list), self.gene_ids, max_len=max_seq_len,
+            np.array(expr_list), self.gene_ids, max_len=max_seq_len,cls_token=self.cls_token,
             vocab=self.vocab, pad_token=self.pad_token, pad_value=self.pad_value,
             append_cls=self.append_cls, include_zero_gene=self.include_zero_gene, 
             cls_value=self.cls_value
         )
         tokenized_next, _ = tokenize_and_pad_batch(
-            np.array(expr_next_list), self.gene_ids, max_len=max_seq_len,
+            np.array(expr_next_list), self.gene_ids, max_len=max_seq_len, cls_token=self.cls_token,
             vocab=self.vocab, pad_token=self.pad_token, pad_value=self.pad_value,
             append_cls=self.append_cls, include_zero_gene=self.include_zero_gene, 
             sample_indices=gene_idx_list, cls_value=self.cls_value
@@ -342,8 +344,8 @@ class PertTFUniDataManager:
                  expr_layer: str = 'X_binned',
                  next_cell_pred_type: str = "identity", 
                  only_sample_wt_pert: bool = False):
-        
-        self.adata = adata
+        #assert not adata.is_view, "The provided anndata is likely a view of the original anndata, this is probably due to slicing the original annadata object, please use the .copy() method to provide a copy"
+        self.adata = adata.copy() # make a copy of the data so that no issues arise if adata is a anndata view
         self.indices = np.arange(self.adata.n_obs)
         self.config = config
         self.ps_columns = ps_columns # perhaps this can incorporated into config
@@ -359,15 +361,19 @@ class PertTFUniDataManager:
         
         # Create and store mappings and vocab as instance attributes
                 #self.num_batch_types = len(self.adata.obs["batch_id"].unique())
-        self.set_genotype_index(genotype_to_index= genotype_to_index)
-        self.set_celltype_index(celltype_to_index= celltype_to_index)
-        add_batch_info(self.adata)
-        self.num_batch_types = len(self.adata.obs["batch_id"].unique())
+
+        
         self.genes = self.adata.var.index.tolist()
         self.vocab = SimpleVocab(self.genes, config.special_tokens) if vocab is None else vocab
+        assert self.adata.var.index.isin(self.vocab.stoi).all(), 'Not all genes are in provided vocab, please prefiltered the Anndata first'
         self.vocab.set_default_index(self.vocab["<pad>"])
         self.gene_ids = np.array(self.vocab(self.genes), dtype=int)
 
+        self.set_genotype_index(genotype_to_index= genotype_to_index)
+        self.set_celltype_index(celltype_to_index= celltype_to_index)
+        
+        add_batch_info(self.adata)
+        self.num_batch_types = len(self.adata.obs["batch_id"].unique())
         # The collators can be created once and reused
         ## first collator is the training collator, with a context window set in config
         self.collator = PertBatchCollator(self.vocab, self.gene_ids, **config)
