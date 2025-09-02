@@ -9,7 +9,7 @@ from typing_extensions import Self
 import numpy as np
 import pandas as pd
 import torch
-
+from numpy.random import default_rng
 # from transformers.tokenization_utils import PreTrainedTokenizer
 # from transformers import AutoTokenizer, BertTokenizer
 import collections
@@ -179,6 +179,7 @@ def pad_batch(
     cls_appended: bool = True,
     vocab_mod: SimpleVocab = None,
     sample_indices: List[np.ndarray] = None,
+    rng: default_rng = None
 ) -> Tuple[Dict[str, torch.Tensor], List[np.ndarray]]:
     """
     Pad a batch of data.
@@ -197,6 +198,7 @@ def pad_batch(
             - A dictionary of padded tensors for 'genes' and 'values'.
             - A list of numpy arrays with the indices used for each sample.
     """
+    rng = default_rng() if rng is None else rng # much faster sampling of genes
     max_ori_len = max(len(batch[i][0]) for i in range(len(batch)))
     max_len = min(max_ori_len, max_len)
 
@@ -219,10 +221,10 @@ def pad_batch(
             # Otherwise, perform random sampling
             else:
                 if not cls_appended:
-                    idx = np.random.choice(len(gene_ids), max_len, replace=False)
+                    idx = rng.choice(len(gene_ids), max_len, replace=False)
                 else:
                     # sample from non-CLS tokens and add CLS token back
-                    idx = np.random.choice(len(gene_ids) - 1, max_len - 1, replace=False)
+                    idx = rng.choice(len(gene_ids) - 1, max_len - 1, replace=False)
                     idx = idx + 1
                     idx = np.insert(idx, 0, 0)
             

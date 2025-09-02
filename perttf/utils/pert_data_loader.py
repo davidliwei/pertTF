@@ -72,14 +72,13 @@ class PertTFDataset(Dataset):
         # Mappings
         self.cell_type_to_index = cell_type_to_index if cell_type_to_index is not None else {t: i for i, t in enumerate(self.adata.obs['celltype'].unique())}
         self.genotype_to_index = genotype_to_index if genotype_to_index is not None else {t: i for i, t in enumerate(self.adata.obs['genotype'].unique())}
-        self.ps_columns = ps_columns or []
-
+        self.ps_columns = ps_columns or [] 
+        self.ps_columns = list(self.ps_columns) # must be a list 
         # For efficient next-cell sampling, pre-compute a dictionary of valid choices
         # IMPORTANT: This dictionary only contains cells from the current data split (train/valid)
         # to prevent data leakage.
         self.next_cell_dict = self._create_next_cell_pool()
         self.only_sample_wt_pert = only_sample_wt_pert
-
         if self.next_cell_pred == "lochness":
             if ps_columns is None:
                 raise ValueError("PS columns must be provided for lochness prediction")
@@ -91,6 +90,8 @@ class PertTFDataset(Dataset):
                 print('Specified perturbed genes for PS column after filtering:' + ','.join(ps_columns_perturbed_genes))
                 raise ValueError("The ps_columns_perturbed_genes must be specified and has to have equal length as ps_matrix")
             self.ps_columns_perturbed_genes = ps_columns_perturbed_genes
+        # store the ps_matrix as numpy array for fast retrival during training
+        self.ps_matrix = self.adata.obs[self.ps_columns].values.astype(np.float32) if self.ps_columns else np.zeros((self.adata.shape[0],1), dtype=np.float32)
 
     def _check_anndata_content(self):
         assert 'genotype' in self.adata.obs.columns and 'celltype' in self.adata.obs.columns, 'no genotype or celltype column found in anndata'
@@ -115,8 +116,10 @@ class PertTFDataset(Dataset):
             next_pert_list = []
             next_cell_global_idx_list = []
             for i in self.indices:
-                current_cell_obs = self.adata.obs.iloc[i]
-                next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_obs)
+                current_cell_idx = self.adata.obs.index[i]
+                current_cell_celltype = self.adata.obs.at[current_cell_idx, 'celltype']
+                current_cell_genotype = self.adata.obs.at[current_cell_idx, 'genotype']
+                next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_idx, current_cell_celltype, current_cell_genotype)
                 next_cell_id_list.append(next_cell_id)
                 next_pert_list.append(next_pert_label_str)
                 next_cell_global_idx_list.append(self.adata.obs.index.get_loc(next_cell_id))
@@ -147,11 +150,15 @@ class PertTFDataset(Dataset):
                     next_cell_dict[cell_type][genotype] = included_cells_indices
         return next_cell_dict
 
-    def _sample_next_cell(self, current_cell_obs):
+    def _sample_next_cell(self,  current_cell_idx, current_cell_celltype, current_cell_genotype):
         """Samples a 'next cell' for a given current cell."""
-        current_cell_id = current_cell_obs.name
-        current_cell_type = current_cell_obs['celltype']
-        current_genotype = current_cell_obs['genotype']
+        #current_cell_id = current_cell_obs.name
+        #current_cell_type = current_cell_obs['celltype']
+        #current_genotype = current_cell_obs['genotype']
+
+        current_cell_id = current_cell_idx
+        current_cell_type = current_cell_celltype
+        current_genotype = current_cell_genotype
 
         if self.next_cell_pred == "identity" or self.next_cell_pred == "lochness":
             return current_cell_id, current_genotype
@@ -184,20 +191,22 @@ class PertTFDataset(Dataset):
         # 1. Get the index for the current cell
         current_cell_global_idx = self.indices[idx]
 
-        current_cell_obs = self.adata.obs.iloc[current_cell_global_idx]
-        
+        #current_cell_obs = self.adata.obs.iloc[current_cell_global_idx] # too slow
+
+        current_cell_idx = self.adata.obs.index[current_cell_global_idx]
+        current_cell_celltype = self.adata.obs.at[current_cell_idx, 'celltype']
+        current_cell_genotype = self.adata.obs.at[current_cell_idx, 'genotype']
+        current_cell_batch_label = self.adata.obs.at[current_cell_idx, 'batch_id']
+
         # 2. Get expression data for the current cell
         binned_layer_key = self.expr_layer
-
         curr_gene = self.adata.var.index
-
-
         current_expr = self.adata.layers[binned_layer_key][current_cell_global_idx]
         if issparse(current_expr):
             current_expr = current_expr.toarray().flatten()
 
         # 3. Sample the next cell and its metadata
-        next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_obs)
+        next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_idx, current_cell_celltype,  current_cell_genotype)
         next_cell_global_idx = self.adata.obs.index.get_loc(next_cell_id)
         
         # 4. Get expression data for the next cell
@@ -209,20 +218,21 @@ class PertTFDataset(Dataset):
             next_expr = next_expr.toarray().flatten()
 
         # 5. Get labels and PS scores
-        cell_label = self.cell_type_to_index[current_cell_obs['celltype']]
-        pert_label = self.genotype_to_index[current_cell_obs['genotype']]
+        cell_label = self.cell_type_to_index[current_cell_celltype]
+        pert_label = self.genotype_to_index[current_cell_genotype]
         
 
-        batch_label = current_cell_obs['batch_id']
+        batch_label = current_cell_batch_label
 
         # Next cell labels are the same for cell type, but perturbation can change
         cell_label_next = cell_label
         pert_label_next = self.genotype_to_index[next_pert_label_str]
 
                 
-        ps_scores = current_cell_obs[self.ps_columns].values.astype(np.float32) if self.ps_columns else np.array([0.0], dtype=np.float32)
-        ps_scores_next = self.adata.obs.loc[next_cell_id, self.ps_columns].values.astype(np.float32) if self.ps_columns else np.array([0.0], dtype=np.float32)
-
+        #ps_scores = np.array([self.adata.obs.at[current_cell_idx, ps] for ps in self.ps_columns]).astype(np.float32) if self.ps_columns else np.array([0.0], dtype=np.float32)
+        ps_scores = self.ps_matrix[current_cell_global_idx]
+        #ps_scores_next = self.adata.obs.loc[next_cell_id, self.ps_columns].values.astype(np.float32) if self.ps_columns else np.array([0.0], dtype=np.float32)
+        ps_scores_next = self.ps_matrix[next_cell_global_idx]
         if self.next_cell_pred == "lochness":
             #pert_label = self.genotype_to_index[current_cell_obs['genotype']]
             random_pert_ind = random.randint(0, len(self.ps_columns_perturbed_genes)-1)
@@ -243,7 +253,7 @@ class PertTFDataset(Dataset):
             "ps_next": ps_scores_next,
             "index": current_cell_global_idx,
             "next_index": next_cell_global_idx,
-            'name': current_cell_obs.name,
+            'name': current_cell_idx,
             'next_name': next_cell_id
         }
 
@@ -422,7 +432,7 @@ class PertTFUniDataManager:
         collator = self.collator if not full_token_collator else self.full_token_collator 
         loader = DataLoader(
             dataset, batch_size=self.config.batch_size, shuffle=True,
-            num_workers=4, collate_fn=collator, pin_memory=True
+            num_workers=8, collate_fn=collator, pin_memory=True
         )
         return loader
 
