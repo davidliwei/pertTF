@@ -24,7 +24,8 @@ def generate_config(parameter_dict,
                                         parameter_dict.get('cls_token', '<cls>'), 
                                         "<eoc>"]
 
-
+    parameter_dict['reciprical_sampling'] = parameter_dict.get('reciprical_sampling', False)
+    parameter_dict['no_pert_for_perturb'] = True if parameter_dict['reciprical_sampling'] else parameter_dict.get('no_pert_for_perturb', False)
     #mask_ratio = config.mask_ratio
 
     # n_input_bins = config.n_bins

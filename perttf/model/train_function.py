@@ -86,15 +86,16 @@ def train(model: nn.Module,
     for batch, batch_data in enumerate(loader):
         input_gene_ids = batch_data["gene_ids"].to(device)
         input_values = batch_data["values"].to(device)
+        input_next_values = batch_data["values_next"].to(device)
         target_values = batch_data["target_values"].to(device)
         target_values_next = batch_data["target_values_next"].to(device)
         batch_labels = batch_data["batch_labels"].to(device)
         celltype_labels = batch_data["celltype_labels"].to(device) #added
         perturbation_labels = batch_data["perturbation_labels"].to(device) #added
-
         celltype_labels_next = batch_data["celltype_labels_next"].to(device) #added
         perturbation_labels_next = batch_data["perturbation_labels_next"].to(device) #added
-
+        perturbation = batch_data["perturbation"].to(device)
+        pert_scale = batch_data['pert_scale'].to(device)
         if config.ps_weight >0:
             ps_score = batch_data["ps"].to(device)
             ps_score_next = batch_data["ps_next"].to(device) #
@@ -109,7 +110,8 @@ def train(model: nn.Module,
                 src_key_padding_mask=src_key_padding_mask,
                 batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
                 pert_labels = perturbation_labels if config.perturbation_input else None,
-                pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
+                perturbation = perturbation if (config.next_weight >0 or has_lochness_next_pred )  else None,
+                pert_scale = pert_scale if (config.get('reciprical_sampling', False)) else None,
                 MVC=config.GEPC,
                 ECS=config.ecs_thres > 0,
                 CLS=config.cell_type_classifier,
@@ -244,7 +246,8 @@ def train(model: nn.Module,
                 src_key_padding_mask=src_key_padding_mask,
                 batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
                 pert_labels = perturbation_labels if config.perturbation_input else None,
-                pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
+                perturbation = perturbation if (config.next_weight >0 or has_lochness_next_pred )  else None,
+                pert_scale = pert_scale if (config.get('reciprical_sampling', False)) else None,
                 MVC=config.GEPC,
                 ECS=config.ecs_thres > 0,
                 CLS=config.cell_type_classifier,
@@ -416,7 +419,8 @@ def evaluate(model: nn.Module,
             perturbation_labels_next = batch_data["perturbation_labels_next"].to(device) #added
             ps_score = batch_data["ps"].to(device) #added
             ps_score_next = batch_data["ps_next"].to(device) #added
-            
+            perturbation = batch_data["perturbation"].to(device)
+            pert_scale =  batch_data["pert_scale"].to(device)
             src_key_padding_mask = input_gene_ids.eq(vocab[config.pad_token])
             with torch.cuda.amp.autocast(enabled=config.amp):
                 output_dict = model(
@@ -425,7 +429,8 @@ def evaluate(model: nn.Module,
                     src_key_padding_mask=src_key_padding_mask,
                     batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
                     pert_labels = perturbation_labels if config.perturbation_input else None,
-                    pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
+                    perturbation = perturbation if (config.next_weight >0 or has_lochness_next_pred )  else None,
+                    pert_scale = pert_scale if (config.get('reciprical_sampling', False)) else None,
                     MVC=config.GEPC,
                     ECS=config.ecs_thres > 0,
                     CLS=config.cell_type_classifier,
@@ -509,7 +514,9 @@ def eval_testdata(
     eval_key = "", # titles for evaluation
     make_plots = True,
     mask = False,
-    predict_expr = False
+    predict_expr = False,
+    no_pert_for_perturb = False,
+    reciprical_sampling = False
 ) -> Optional[Dict]: # Returns a dictionary containing the AnnData object
     """
     Evaluate the model on test data and return an AnnData object with embeddings.
@@ -563,6 +570,7 @@ def eval_testdata(
     # evaluate the next prediction?
     next_cell_prediction = False
     perturbation_labels_next = None
+    pert_scale = None
     if config.next_cell_pred_type == "pert":
         if "genotype_next" in adata_t.obs.columns:
             # this is the pred_next  
@@ -573,6 +581,11 @@ def eval_testdata(
             next_cell_prediction = False
         if next_cell_prediction:
             perturbation_labels_next = adata_t.obs["genotype_next"].tolist()  # make sure count from 0
+            if no_pert_for_perturb:
+                perturbation_labels_next = ['WT' if perturbed else adata_t.obs.genotype_next.iloc[i] for i, perturbed in enumerate(adata_t.obs.genotype == adata_t.obs.genotype_next)]
+                if reciprical_sampling:
+                    pert_scale = np.array([np.array([-1.0]) if perturbed and adata_t.obs.genotype.iloc[i] != 'WT' else np.array([1.0]) for i, perturbed in enumerate(adata_t.obs.genotype != adata_t.obs.genotype_next)])
+
     if config.next_cell_pred_type ==  'lochness':
         if hasattr(config, "pred_lochness_next") and config.pred_lochness_next >0:
             next_cell_prediction = True
@@ -652,7 +665,8 @@ def eval_testdata(
                 batch_size=config.batch_size,
                 batch_labels=torch.from_numpy(batch_ids).long() if config.use_batch_label else None, # if config.DSBN else None,
                 pert_labels = torch.from_numpy(perturbation_indexes).long() if config.perturbation_input else None,
-                pert_labels_next = torch.from_numpy(perturbation_indexes_next).long() if next_cell_prediction else None,
+                perturbation = torch.from_numpy(perturbation_indexes_next).long() if next_cell_prediction else None,
+                pert_scale = torch.from_numpy(pert_scale).float() if reciprical_sampling else None,
                 time_step=0,
                 return_np=True,
                 predict_expr = predict_expr
@@ -821,6 +835,8 @@ def wrapper_train(model, config, data_gen,
                     logger=logger,
                     epoch=epoch,
                     eval_key=eval_dict_key,
+                    reciprical_sampling = config.get('reciprical_sampling', False),
+                    no_pert_for_perturb = config.get('no_pert_for_perturb', config.get('reciprical_sampling', False))
                 )
                 adata_with_embeddings = results
                 

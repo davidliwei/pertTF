@@ -284,6 +284,8 @@ class PerturbationTFModel(TransformerModel):
         batch_labels: Optional[Tensor] = None,
         pert_labels: Optional[Tensor] = None, 
         pert_labels_next: Optional[Tensor] = None, 
+        perturbation: Optional[Tensor] = None, 
+        pert_scale: Optional[Tensor] = None,
         CLS: bool = False,
         CCE: bool = False,
         MVC: bool = False,
@@ -384,9 +386,10 @@ class PerturbationTFModel(TransformerModel):
         cell_emb_orig = self._get_cell_emb_from_layer(transformer_output, values)        
         
         #  concatenate cell embedding with perturbation embedding to generate next cell embedding
-        if pert_labels_next is not None: #and False:
+        if perturbation is not None: #and False:
             #import pdb; pdb.set_trace()
-            pert_emb_next = self.pert_encoder(pert_labels_next)
+            pert_emb_next = self.pert_encoder(perturbation)
+            pert_emb_next = pert_emb_next*pert_scale if pert_scale is not None else pert_emb_next
             tf_concat=torch.cat(
                 [
                     cell_emb_orig,
@@ -506,7 +509,8 @@ class PerturbationTFModel(TransformerModel):
         batch_size: int,
         batch_labels: Optional[Tensor] = None,
         pert_labels: Optional[Tensor] = None, # the first perturbation
-        pert_labels_next: Optional[Tensor] = None, # the second perturbation
+        perturbation: Optional[Tensor] = None, # the second perturbation
+        pert_scale: Optional[Tensor] = None,
         output_to_cpu: bool = True,
         time_step: Optional[int] = None,
         return_np: bool = False,
@@ -573,7 +577,8 @@ class PerturbationTFModel(TransformerModel):
             src_key_padding_mask_d = src_key_padding_mask[i : i + batch_size].to(device)
             batch_labels_d = batch_labels[i : i + batch_size].to(device) if batch_labels is not None else None
             pert_labels_d = pert_labels[i : i + batch_size].to(device) if pert_labels is not None else None
-            pert_labels_next_d = pert_labels_next[i : i + batch_size].to(device) if pert_labels_next is not None else None
+            pert_labels_next_d = perturbation[i : i + batch_size].to(device) if perturbation is not None else None
+            pert_scale_d = pert_scale[i : i + batch_size].to(device) if pert_scale is not None else None
             raw_output = self._encode(
                 src_d,
                 values_d,
@@ -595,6 +600,7 @@ class PerturbationTFModel(TransformerModel):
             tf_concat = None
             if pert_labels_next_d is not None:
                 pert_emb_next = self.pert_encoder(pert_labels_next_d)
+                pert_emb_next = pert_emb_next*pert_scale_d if pert_scale_d is not None else pert_emb_next
                 tf_concat=torch.cat(
                     [cell_emb,pert_emb_next], dim=1,
                 )

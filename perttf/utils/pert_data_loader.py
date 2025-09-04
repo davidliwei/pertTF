@@ -45,10 +45,14 @@ class PertTFDataset(Dataset):
     A PyTorch Dataset for AnnData objects that performs next-cell sampling on the fly.
     """
     def __init__(self, adata: AnnData, indices: np.ndarray = None, 
-                 cell_type_to_index: dict = None, genotype_to_index: dict = None, expr_layer: str = 'X_binned',
-                 ps_columns: list = None, ps_columns_perturbed_genes: list = None, next_cell_pred: str = "identity", 
+                 cell_type_to_index: dict = None, genotype_to_index: dict = None, 
+                 expr_layer: str = 'X_binned',ps_columns: list = None, 
+                 ps_columns_perturbed_genes: list = None, next_cell_pred: str = "identity", 
+                 
                  additional_ps_dict: dict = None, 
-                 only_sample_wt_pert: bool = False):
+                 only_sample_wt_pert: bool = False,
+                 no_pert_for_perturb: bool = False,
+                 reciprical_sampling: bool = False):
         """
         The PertTFDataset serves to interface with pytorch Dataloaders 
         Its main function is to subset and extract single samples from a single Anndata object that is in-memory
@@ -65,13 +69,17 @@ class PertTFDataset(Dataset):
             next_cell_pred (str): The mode for next cell prediction ("identity" or "pert" or "lochness").
             additional_ps_dict (dict): a dictionary {gene_name:ps} the pass the additional ps score for other genes to the training.
             only_sample_wt_pert: only random sample next cell for wild type cells
+            no_pert_for_perturb: if True, When next_cell_pred = True, assign 'WT' as perturbation target for all perturbed cells. Default: False, perturbed cells are assigned their own perturbation as target
+            reciprical_sampling: if True, Perturbed cells are assigned random WT as target, and perturbation will be assigned a -1 scale during training
         """
         self.adata = adata
         self._check_anndata_content()
         self.indices = indices if indices is not None else np.arange(len(self.adata.obs.index))
         self.expr_layer = expr_layer
         self.next_cell_pred = next_cell_pred
-        
+        self.only_sample_wt_pert = only_sample_wt_pert
+        self.reciprical_sampling = reciprical_sampling
+        self.no_pert_for_perturb = True if reciprical_sampling else no_pert_for_perturb
         # Mappings
         self.cell_type_to_index = cell_type_to_index if cell_type_to_index is not None else {t: i for i, t in enumerate(self.adata.obs['celltype'].unique())}
         self.genotype_to_index = genotype_to_index if genotype_to_index is not None else {t: i for i, t in enumerate(self.adata.obs['genotype'].unique())}
@@ -81,7 +89,7 @@ class PertTFDataset(Dataset):
         # IMPORTANT: This dictionary only contains cells from the current data split (train/valid)
         # to prevent data leakage.
         self.next_cell_dict = self._create_next_cell_pool()
-        self.only_sample_wt_pert = only_sample_wt_pert
+        
         if self.next_cell_pred == "lochness":
             if ps_columns is None:
                 raise ValueError("PS columns must be provided for lochness prediction")
@@ -183,18 +191,28 @@ class PertTFDataset(Dataset):
         valid_genotypes = self.next_cell_dict.get(current_cell_type, {})
         if not valid_genotypes:
              return current_cell_id, current_genotype # Fallback
-
+        
+    
+        # only reciprical sample if the pool of candidates has 'WT' cells
+        reciprical_sampling = self.reciprical_sampling if 'WT' in valid_genotypes else False
+        # Step 1. determine the genotype of the next cell
         if current_genotype == 'WT':
             # Randomly select a different genotype
             next_pert_value = random.choice(list(valid_genotypes.keys()))
-        else:
-            # For non-WT, the "next" state is the same perturbation
-            next_pert_value = current_genotype
+        elif reciprical_sampling:
+            next_pert_value = random.choice(list(['WT', current_genotype]))
+            #next_pert_value = 'WT'
+        else: # if no reciprical sampling, the "next" state remains the same 
+            next_pert_value = current_genotype 
 
-        if next_pert_value == current_genotype and self.only_sample_wt_pert:
+        # Step 2. sample the exact cell that is the used as perturbation outcome
+        if next_pert_value == current_genotype and self.only_sample_wt_pert: # if no perturbation, use same cell
             return current_cell_id, next_pert_value
-        else:
-            # Sample a random cell with the target cell type and genotype
+        elif next_pert_value == current_genotype and not self.only_sample_wt_pert: # if no perturbation, use similar cell
+            possible_next_cells = valid_genotypes.get(current_genotype, [current_cell_id])
+            next_cell_id = random.choice(possible_next_cells)
+            return next_cell_id, next_pert_value
+        else: # Sample a random cell with the target cell type and genotype
             possible_next_cells = valid_genotypes.get(next_pert_value, [current_cell_id])
             next_cell_id = random.choice(possible_next_cells)
             return next_cell_id, next_pert_value
@@ -219,9 +237,9 @@ class PertTFDataset(Dataset):
         curr_gene = self.adata.var.index
         current_expr = self.adata.layers[binned_layer_key][current_cell_global_idx]
         if issparse(current_expr):
-            current_expr = current_expr.toarray().flatten()
+            current_expr = current_expr.toarray().flatten()+1
 
-        # 3. Sample the next cell and its metadata
+        # 3. Sample a perturbation outcome for the current cell
         next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_idx, current_cell_celltype,  current_cell_genotype)
         next_cell_global_idx = self.adata.obs.index.get_loc(next_cell_id)
         
@@ -231,7 +249,7 @@ class PertTFDataset(Dataset):
         next_gene = self.adata.var.index
 
         if issparse(next_expr):
-            next_expr = next_expr.toarray().flatten()
+            next_expr = next_expr.toarray().flatten()+1
 
         # 5. Get labels and PS scores
         cell_label = self.cell_type_to_index[current_cell_celltype]
@@ -244,7 +262,23 @@ class PertTFDataset(Dataset):
         cell_label_next = cell_label
         pert_label_next = self.genotype_to_index[next_pert_label_str]
 
-                
+        # TODO: this section maybe should be in the sampling function
+        # Introduce the actual perturbation that is used to achieve the perturbed outcome
+        pert_scale  = np.array([1], dtype=np.float32) # vector to scale perturbation embeddings (TODO: make this learnable, i.e. 2*sigmoid-1)
+        if pert_label == pert_label_next: # e.g. PDX1 -> PDX1 
+            if self.no_pert_for_perturb: # e.g. PDX1 -> PDX1: perturbation = WT
+                perturbation = self.genotype_to_index['WT']
+            else: # e.g. PDX1 -> PDX1: perturbation = PDX1 (original definition of perturbation)
+                perturbation = pert_label_next
+        else:
+            if current_cell_genotype == 'WT': # e.g. WT -> PDX1: perturbation = PDX1 (always the case for WT cells)
+                perturbation = pert_label_next
+            elif self.reciprical_sampling: # e.g. PDX1 -> WT: perturbation = PDX1;
+                perturbation = cell_label_next 
+                pert_scale = np.array([-1], dtype=np.float32) # "turning PDX1 back to WT, so take negative"
+
+
+
         #ps_scores = np.array([self.adata.obs.at[current_cell_idx, ps] for ps in self.ps_columns]).astype(np.float32) if self.ps_columns else np.array([0.0], dtype=np.float32)
         ps_scores = self.ps_matrix[current_cell_global_idx]
         #ps_scores_next = self.adata.obs.loc[next_cell_id, self.ps_columns].values.astype(np.float32) if self.ps_columns else np.array([0.0], dtype=np.float32)
@@ -271,6 +305,8 @@ class PertTFDataset(Dataset):
             "batch_labels": batch_label,
             "celltype_labels_next": cell_label_next,
             "perturbation_labels_next": pert_label_next,
+            'perturbation': perturbation,
+            'pert_scale': pert_scale,
             "ps": ps_scores,
             "ps_next": ps_scores_next,
             "index": current_cell_global_idx,
@@ -341,11 +377,18 @@ class PertBatchCollator:
             cls_value= self.cls_value
         )
 
+        masked_values_next = random_mask_value(
+            tokenized_next["values"], mask_ratio=self.mask_ratio,
+            mask_value=self.mask_value, pad_value=self.pad_value,
+            cls_value= self.cls_value
+        )
+
         # 4. Collate all other labels into tensors
         collated_batch = {
             "gene_ids": tokenized["genes"],
             "next_gene_ids": tokenized_next["genes"],
             "values": masked_values,
+            "values_next": masked_values_next,
             "target_values": tokenized["values"],
             "target_values_next": tokenized_next["values"],
         }
@@ -359,7 +402,7 @@ class PertBatchCollator:
                 values = [item[key] for item in batch]
                 tensor = torch.from_numpy(np.array(values))
                 # Ensure labels are long type and scores are float
-                collated_batch[key] = tensor.long() if 'label' in key else tensor.float()
+                collated_batch[key] = tensor.long() if 'label' in key or 'perturbation' in key else tensor.float()
 
         return collated_batch
     
@@ -382,7 +425,10 @@ class PertTFUniDataManager:
                  expr_layer: str = 'X_binned',
                  next_cell_pred_type: str = "identity", 
                  additional_ps_dict: dict = None, 
-                 only_sample_wt_pert: bool = False):
+                 only_sample_wt_pert: bool = False,
+                 no_pert_for_perturb: bool = False,
+                 reciprical_sampling: bool = False,
+                 ):
         #assert not adata.is_view, "The provided anndata is likely a view of the original anndata, this is probably due to slicing the original annadata object, please use the .copy() method to provide a copy"
         self.adata = adata.copy() # make a copy of the data so that no issues arise if adata is a anndata view
         self.indices = np.arange(self.adata.n_obs)
@@ -393,15 +439,11 @@ class PertTFUniDataManager:
         self.expr_layer = expr_layer
         self.only_sample_wt_pert = config.get('only_sample_wt_pert', only_sample_wt_pert)
         self.next_cell_pred_type = config.get('next_cell_pred_type', next_cell_pred_type)
+        self.no_pert_for_perturb = config.get('no_pert_for_perturb', no_pert_for_perturb)
+        self.reciprical_sampling = config.get('reciprical_sampling', reciprical_sampling)
+
         # --- Perform one-time data setup ---
         print("Initializing PertTFUniDataManager: Creating vocab and mappings...")
-        #if "batch_id" not in self.adata.obs.columns:
-         #   self.adata.obs["str_batch"] = "batch_0"
-          #  self.adata.obs["batch_id"] = self.adata.obs["str_batch"].astype("category").cat.codes
-        
-        # Create and store mappings and vocab as instance attributes
-                #self.num_batch_types = len(self.adata.obs["batch_id"].unique())
-
         
         self.genes = self.adata.var.index.tolist()
         self.vocab = SimpleVocab(self.genes, config.special_tokens) if vocab is None else vocab
@@ -454,8 +496,8 @@ class PertTFUniDataManager:
             self.adata, indices=indices, cell_type_to_index=self.cell_type_to_index, genotype_to_index=self.genotype_to_index,
             ps_columns=self.ps_columns, ps_columns_perturbed_genes = self.ps_columns_perturbed_genes, 
             next_cell_pred=self.next_cell_pred_type ,    additional_ps_dict = self.additional_ps_dict,  
-            expr_layer=self.expr_layer, only_sample_wt_pert=self.only_sample_wt_pert
-        )
+            expr_layer=self.expr_layer, only_sample_wt_pert=self.only_sample_wt_pert,
+            no_pert_for_perturb = self.no_pert_for_perturb, reciprical_sampling= self.reciprical_sampling)
         return perttf_dataset
 
     def _create_loaders_from_dataset(self, dataset, full_token_collator = False):
