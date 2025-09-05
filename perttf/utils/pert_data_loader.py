@@ -274,7 +274,7 @@ class PertTFDataset(Dataset):
             if current_cell_genotype == 'WT': # e.g. WT -> PDX1: perturbation = PDX1 (always the case for WT cells)
                 perturbation = pert_label_next
             elif self.reciprical_sampling: # e.g. PDX1 -> WT: perturbation = PDX1;
-                perturbation = cell_label_next 
+                perturbation = pert_label
                 pert_scale = np.array([-1], dtype=np.float32) # "turning PDX1 back to WT, so take negative"
 
 

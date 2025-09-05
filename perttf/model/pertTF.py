@@ -134,10 +134,12 @@ class PertExpEncoder(nn.Module):
     """
     def __init__(
         self,
-        d_model: int
+        d_model: int,
+        d_pert_emb: int = None,
     ):
         super().__init__()
-        d_in = d_model * 2 
+        d_pert_emb = d_model if d_pert_emb is None else d_pert_emb
+        d_in = d_model + d_pert_emb
         #d_in = d_model
         self.fc = nn.Sequential(
             nn.Linear(d_in, d_model),
@@ -164,19 +166,32 @@ class PerturbationTFModel(TransformerModel):
                  nlayers_pert: int,
                  n_ps: int,
                  *args, **kwargs):
+        # pop out params uniquely for pertTF
         self.pred_lochness_next = kwargs.pop("pred_lochness_next", False) # additional optional parameter to ask whether to predict lochness scores
         ps_decoder2_nlayer = kwargs.pop("ps_decoder2_nlayer",3) # additional parameter to specify ps_decoder2 nlayer
+        self.pert_pad_id = kwargs.pop("pert_pad_id", None) # get the pert_pad_id
+        self.pert_embed_dim = kwargs.pop("pert_embed_dim", None) # set the pert_embedding dim
+        self.sep_genotype_embed = kwargs.pop("sep_embed_pert", False)
+        self.pert_exp_mode = kwargs.pop("pert_exp_mode", 'concat')
+        self.pert_exp_mode = self.pert_exp_mode if self.pert_exp_mode in ['concat', 'sum', 'direct_sum'] else 'concat'
         super().__init__(*args, **kwargs)
         self.expr_act = ExpressionActivate(activation = 'linear')
         # add perturbation encoder
         # variables are defined in super class
         d_model = self.d_model
-        self.pert_pad_id = kwargs.get("pert_pad_id", None) 
+        self.pert_embed_dim = d_model if self.pert_embed_dim is None else self.pert_embed_dim
         #self.pert_encoder = nn.Embedding(3, d_model, padding_idx=pert_pad_id)
-        self.pert_encoder = PertLabelEncoder(n_pert, d_model, padding_idx=self.pert_pad_id)
-
-        self.pert_exp_encoder = PertExpEncoder (d_model) 
-
+        self.pert_encoder = PertLabelEncoder(n_pert, self.pert_embed_dim, padding_idx=self.pert_pad_id)
+        self.genotype_encoder = self.pert_encoder # these two are default to be the same thing
+        if self.pert_embed_dim != self.d_model or self.sep_genotype_embed:
+            self.genotype_encoder = PertLabelEncoder(n_pert, self.d_model, padding_idx=self.pert_pad_id)
+            self.pert_exp_mode = 'concat'
+        if self.pert_exp_mode in ['sum', 'direct_sum']:
+            self.pert_embed_dim = 0
+        print(self.pert_embed_dim)
+        print(self.pert_exp_mode)
+        self.pert_exp_encoder = PertExpEncoder (d_model, d_pert_emb = self.pert_embed_dim) 
+        
         # the following is the perturbation decoder
         #n_pert = kwargs.get("n_perturb", 1) 
         #nlayers_pert = kwargs.get("nlayers_perturb", 3) 
@@ -249,7 +264,7 @@ class PerturbationTFModel(TransformerModel):
 
         # add additional perturbs
         if input_pert_flags is not None:
-            perts = self.pert_encoder(input_pert_flags)  # (batch, seq_len, embsize)
+            perts = self.genotype_encoder(input_pert_flags)  # (batch, seq_len, embsize)
             #import pdb; pdb.set_trace()
             perts_expand = perts.unsqueeze(1).repeat(1, total_embs.shape[1], 1)
             total_embs = total_embs + perts_expand
@@ -397,8 +412,13 @@ class PerturbationTFModel(TransformerModel):
                 ],
                 dim=1,
             )
-            #tf_concat = cell_emb_orig + pert_emb_next
-            cell_emb_next=self.pert_exp_encoder(tf_concat)
+            if self.pert_exp_mode == 'sum': # transform the sum
+                tf_concat = cell_emb_orig + pert_emb_next
+                cell_emb_next=self.pert_exp_encoder(tf_concat)
+            elif self.pert_exp_mode == 'direct_sum': # don't transform, just add
+                cell_emb_next=cell_emb_orig + pert_emb_next
+            elif self.pert_exp_mode == 'concat':
+                cell_emb_next=self.pert_exp_encoder(tf_concat) # transform the concat
         else:
             tf_concat = None # add a placeholder
             cell_emb_next=cell_emb_orig
@@ -508,8 +528,9 @@ class PerturbationTFModel(TransformerModel):
         src_key_padding_mask: Tensor,
         batch_size: int,
         batch_labels: Optional[Tensor] = None,
-        pert_labels: Optional[Tensor] = None, # the first perturbation
-        perturbation: Optional[Tensor] = None, # the second perturbation
+        pert_labels: Optional[Tensor] = None, # the current perturbation label
+        pert_labels_next: Optional[Tensor] = None, # the next perturbation label
+        perturbation: Optional[Tensor] = None, # the perturbation induced
         pert_scale: Optional[Tensor] = None,
         output_to_cpu: bool = True,
         time_step: Optional[int] = None,
@@ -577,7 +598,8 @@ class PerturbationTFModel(TransformerModel):
             src_key_padding_mask_d = src_key_padding_mask[i : i + batch_size].to(device)
             batch_labels_d = batch_labels[i : i + batch_size].to(device) if batch_labels is not None else None
             pert_labels_d = pert_labels[i : i + batch_size].to(device) if pert_labels is not None else None
-            pert_labels_next_d = perturbation[i : i + batch_size].to(device) if perturbation is not None else None
+            pert_labels_next_d = pert_labels_next[i : i + batch_size].to(device) if pert_labels_next is not None else None
+            perturbation_d = perturbation[i : i + batch_size].to(device) if perturbation is not None else None
             pert_scale_d = pert_scale[i : i + batch_size].to(device) if pert_scale is not None else None
             raw_output = self._encode(
                 src_d,
@@ -598,14 +620,19 @@ class PerturbationTFModel(TransformerModel):
             #import pdb; pdb.set_trace()
             cell_emb = self._get_cell_emb_from_layer(raw_output, values_d)
             tf_concat = None
-            if pert_labels_next_d is not None:
-                pert_emb_next = self.pert_encoder(pert_labels_next_d)
+            if  perturbation_d is not None:
+                pert_emb_next = self.pert_encoder( perturbation_d)
                 pert_emb_next = pert_emb_next*pert_scale_d if pert_scale_d is not None else pert_emb_next
                 tf_concat=torch.cat(
                     [cell_emb,pert_emb_next], dim=1,
                 )
-                #tf_concat = cell_emb + pert_emb_next
-                cell_emb_next=self.pert_exp_encoder(tf_concat)
+                if self.pert_exp_mode == 'sum':
+                    tf_concat = cell_emb + pert_emb_next
+                    cell_emb_next=self.pert_exp_encoder(tf_concat)
+                elif self.pert_exp_mode == 'direct_sum':
+                    cell_emb_next = cell_emb + pert_emb_next
+                elif self.pert_exp_mode == 'concat':
+                    cell_emb_next=self.pert_exp_encoder(tf_concat)
                 if output_to_cpu:
                     cell_emb_next_cpu = cell_emb_next.cpu()
                 if return_np:

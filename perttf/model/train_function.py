@@ -581,11 +581,20 @@ def eval_testdata(
             next_cell_prediction = False
         if next_cell_prediction:
             perturbation_labels_next = adata_t.obs["genotype_next"].tolist()  # make sure count from 0
-            if no_pert_for_perturb:
+            if no_pert_for_perturb and not reciprical_sampling:
                 perturbation_labels_next = ['WT' if perturbed else adata_t.obs.genotype_next.iloc[i] for i, perturbed in enumerate(adata_t.obs.genotype == adata_t.obs.genotype_next)]
-                if reciprical_sampling:
-                    pert_scale = np.array([np.array([-1.0]) if perturbed and adata_t.obs.genotype.iloc[i] != 'WT' else np.array([1.0]) for i, perturbed in enumerate(adata_t.obs.genotype != adata_t.obs.genotype_next)])
-
+            if reciprical_sampling:
+                perturbation_labels_next = []
+                for i, (curr, next) in enumerate(zip(adata_t.obs.genotype.tolist(), adata_t.obs.genotype_next.tolist())):
+                    if curr == next:
+                        perturbation_labels_next.append('WT')
+                    else:
+                        if curr == 'WT':
+                            perturbation_labels_next.append(next)
+                        else:
+                            perturbation_labels_next.append(curr)
+                pert_scale = np.array([np.array([-1.0]) if perturbed and adata_t.obs.genotype.iloc[i] != 'WT' else np.array([1.0]) for i, perturbed in enumerate(adata_t.obs.genotype != adata_t.obs.genotype_next)])
+    next_genotype = np.array([genotype_to_index[genotype] for genotype in adata_t.obs["genotype_next"].tolist()])
     if config.next_cell_pred_type ==  'lochness':
         if hasattr(config, "pred_lochness_next") and config.pred_lochness_next >0:
             next_cell_prediction = True
@@ -665,6 +674,7 @@ def eval_testdata(
                 batch_size=config.batch_size,
                 batch_labels=torch.from_numpy(batch_ids).long() if config.use_batch_label else None, # if config.DSBN else None,
                 pert_labels = torch.from_numpy(perturbation_indexes).long() if config.perturbation_input else None,
+                pert_labels_next = torch.from_numpy(next_genotype).long(),
                 perturbation = torch.from_numpy(perturbation_indexes_next).long() if next_cell_prediction else None,
                 pert_scale = torch.from_numpy(pert_scale).float() if reciprical_sampling else None,
                 time_step=0,
