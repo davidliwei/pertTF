@@ -31,6 +31,42 @@ import matplotlib.pyplot as plt
 
 from perttf.model.train_data_gen import prepare_data,prepare_dataloader
 from perttf.utils.set_optimizer import create_optimizer_dict
+
+
+def forward_pass(model, batch_data, device, config, vocab, has_lochness_next_pred = False):
+    input_gene_ids = batch_data["gene_ids"].to(device)
+    input_values = batch_data["values"].to(device)
+    target_values = batch_data["target_values"].to(device)
+    target_values_next = batch_data["target_values_next"].to(device)
+    batch_labels = batch_data["batch_labels"].to(device)
+    celltype_labels = batch_data["celltype_labels"].to(device) #added
+    perturbation_labels = batch_data["perturbation_labels"].to(device) #added
+
+    celltype_labels_next = batch_data["celltype_labels_next"].to(device) #added
+    perturbation_labels_next = batch_data["perturbation_labels_next"].to(device) #added
+
+
+    src_key_padding_mask = input_gene_ids.eq(vocab[config.pad_token])
+    with torch.cuda.amp.autocast(enabled=config.amp):
+        #import pdb; pdb.set_trace()
+
+        output_dict = model(
+            input_gene_ids,
+            input_values,
+            src_key_padding_mask=src_key_padding_mask,
+            batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
+            pert_labels = perturbation_labels if config.perturbation_input else None,
+            pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
+            MVC=config.GEPC,
+            ECS=config.ecs_thres > 0,
+            CLS=config.cell_type_classifier,
+            PERTPRED = config.perturbation_classifier_weight > 0,
+            PSPRED = config.ps_weight >0,
+        )
+        
+    return output_dict
+
+
 from perttf.utils.plot import process_and_log_umaps
 def train(model: nn.Module,
           loader: DataLoader,

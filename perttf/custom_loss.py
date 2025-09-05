@@ -1,8 +1,15 @@
 # Modified from scGPT
 import torch
 import torch.nn.functional as F
-
+from torch import nn
 from typing import Optional
+
+
+from scgpt.loss import (
+    masked_mse_loss,
+    masked_relative_error,
+    criterion_neg_log_bernoulli,
+)
 
 def semi_masked_mse_loss(
     input: torch.Tensor, target: torch.Tensor, mask: torch.Tensor, alpha = 0.7
@@ -165,3 +172,131 @@ def zinb_loss(y_true, mean, dispersion, pi_nonzero, eps=1e-8):
 
     return torch.mean(loss)
     
+
+def aggregate_losses(config, input_dict, output_dict, metric_prefix = 'train'):
+    criterion = masked_mse_loss
+    criterion_dab = nn.CrossEntropyLoss()
+    criterion_cls = nn.CrossEntropyLoss()
+    criterion_pert = nn.CrossEntropyLoss()
+    criterion_adv = nn.CrossEntropyLoss()  # consider using label smoothing
+    criterion_ps = nn.MSELoss() # this is the loss for predicting PS scores
+    #criterion_ps = nn.CrossEntropyLoss()
+
+    input_values = input_dict['input_values']
+    target_values = input_dict['target_values']
+    target_values_next = input_dict['target_values_next']
+    celltype_labels = input_dict['celltype_labels']
+    celltype_labels_next = input_dict['celltype_labels_next']
+    perturbation_labels = input_dict['perturbation_labels']
+    perturbation_labels_next = input_dict['perturbation_labels_next']
+    ps_score = input_dict['ps_score']
+    ps_score_next = input_dict['ps_score_next']
+    batch_labels = input_dict['batch_labels']
+
+    if hasattr(config, "pred_lochness_next"):
+        has_lochness_next_pred = True
+        ps_next_training_weight = config.pred_lochness_next
+    else:
+        has_lochness_next_pred = False
+        ps_next_training_weight = config.ps_weight * config.next_weight
+
+    masked_positions = input_values.eq(config.mask_value)  # the postions to predict
+    loss_dict = {}
+    loss_dict['loss_mse'] = criterion(
+        output_dict["mlm_output"], target_values, masked_positions
+    )
+    loss = config.this_weight * loss_dict['loss_mse']
+    metrics_to_log = {metric_prefix+"mse": loss['loss_mse'].item()}
+    # next value?
+    loss_dict['loss_mse_next'] = criterion(
+        output_dict["mlm_output"],
+        target_values_next, masked_positions
+    )
+    # disable now, target_values_next, target_values, 
+    #loss = loss + config.next_weight * loss_mse_next
+    metrics_to_log.update({metric_prefix+"mse_next": loss_dict['loss_mse_next'].item()})
+
+    if config.explicit_zero_prob:
+        loss_dict['loss_zero_log_prob'] = criterion_neg_log_bernoulli(
+            output_dict["mlm_zero_probs"], target_values, masked_positions
+        )
+        loss = loss + config.this_weight *loss_dict['loss_zero_log_prob']
+        metrics_to_log.update({metric_prefix+"nzlp": loss_dict['loss_zero_log_prob'].item()})
+        # added
+        loss['loss_zero_log_prob_next'] = criterion_neg_log_bernoulli(
+            output_dict["mlm_zero_probs"], target_values_next, masked_positions
+        )
+        #loss = loss + config.next_weight *loss_zero_log_prob_next
+        metrics_to_log.update({metric_prefix+"nzlp_next": loss_dict['loss_zero_log_prob_next'].item()})
+    if config.GEPC:
+        loss['loss_gepc'] = criterion(
+            output_dict["mvc_output"], target_values, masked_positions
+        )
+        loss = loss + config.this_weight *loss_dict['loss_gepc']
+        metrics_to_log.update({metric_prefix+"mvc": loss_dict['loss_gepc'].item()})
+        # added
+        loss_dict['loss_gepc_next'] = criterion(
+            output_dict["mvc_output_next"], target_values_next, masked_positions
+        )
+        loss = loss + config.next_weight * loss_dict['loss_gepc_next']
+        metrics_to_log.update({metric_prefix+"mvc_next": loss_dict['loss_gepc_next'].item()})
+    if config.GEPC and config.explicit_zero_prob:
+        loss_dict['loss_gepc_zero_log_prob'] = criterion_neg_log_bernoulli(
+            output_dict["mvc_zero_probs"], target_values, masked_positions
+        )
+        loss = loss + config.this_weight * loss_dict['loss_gepc_zero_log_prob'] 
+        metrics_to_log.update(
+            {metric_prefix+"/mvc_nzlp": loss_dict['loss_gepc_zero_log_prob'].item()}
+        )
+        # added
+        loss_dict['loss_gepc_zero_log_prob_next'] = criterion_neg_log_bernoulli(
+            output_dict["mvc_zero_probs_next"], target_values_next, masked_positions
+        )
+        loss = loss + config.next_weight * loss_dict['loss_gepc_zero_log_prob_next'] 
+        metrics_to_log.update(
+            {metric_prefix+"/mvc_nzlp_next": loss['loss_gepc_zero_log_prob_next'].item()}
+        )
+    if config.cell_type_classifier:
+        loss_dict['loss_cls'] = criterion_cls(output_dict["cls_output"], celltype_labels)
+        loss = loss + config.cell_type_classifier_weight * loss_dict['loss_cls']
+        metrics_to_log.update({metric_prefix+"/cls": loss_dict['loss_cls'].item()})
+        # add for next cls prediction
+        loss_dict['loss_cls_next'] = criterion_cls(output_dict["cls_output_next"], celltype_labels_next)
+        loss = loss + config.cell_type_classifier_weight * config.next_weight *  loss_dict['loss_cls_next']
+        metrics_to_log.update({metric_prefix+"/cls_next": loss_dict['loss_cls_next'].item()})
+
+        error_rate = 1 - (
+            (output_dict["cls_output"].argmax(1) == celltype_labels)
+            .sum()
+            .item()
+        ) / celltype_labels.size(0)
+
+    if config.perturbation_classifier_weight > 0:
+        loss_dict['loss_pert'] = criterion_pert(output_dict["pert_output"], perturbation_labels)
+        loss = loss + config.perturbation_classifier_weight * loss_dict['loss_pert']
+        metrics_to_log.update({metric_prefix+"/pert": loss_dict['loss_pert'].item()})
+        # add for next pert prediction
+        loss_dict['loss_pert_next'] = criterion_pert(output_dict["pert_output_next"], perturbation_labels_next)
+        loss = loss + config.perturbation_classifier_weight * config.next_weight * loss_dict['loss_pert_next']
+        metrics_to_log.update({metric_prefix+"/pert_next": loss_dict['loss_pert_next'].item()})
+
+    if config.ps_weight >0:
+        loss_dict["loss_ps"] = criterion_ps(output_dict["ps_output"], ps_score)
+        #import pdb; pdb.set_trace()
+        #print(f"loss_ps: {loss_ps}")
+        loss = loss + config.ps_weight * loss_dict["loss_ps"]
+        metrics_to_log.update({metric_prefix+"/ps": loss_dict["loss_ps"].item()})
+        loss_ps_next = criterion_ps(output_dict["ps_output_next"], ps_score_next)
+        loss = loss + ps_next_training_weight * loss_dict["loss_ps_next"]
+        metrics_to_log.update({metric_prefix+"/ps_next": loss_dict["loss_ps_next"].item()})
+
+    if config.ecs_thres > 0:
+        loss_dict["loss_ecs"] = config.ecs_weight  * output_dict["loss_ecs"]
+        loss = loss + loss_dict["loss_ecs"]
+        metrics_to_log.update({metric_prefix+"/ecs": loss_dict["loss_ecs"].item()})
+    if config.dab_weight > 0:
+        loss_dict["loss_dab"] = criterion_dab(output_dict["dab_output"], batch_labels)
+        loss = loss + config.dab_weight * loss_dict["loss_dab"]
+        metrics_to_log.update({metric_prefix+"/dab": loss_dict["loss_dab"].item()})
+
+    return loss, metrics_to_log

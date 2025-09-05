@@ -841,24 +841,24 @@ class ExprDecoder(nn.Module):
         super().__init__()
         d_in = d_model * 2 if use_batch_labels else d_model
         self.fc = nn.Sequential(
-            nn.Linear(d_in, 4*d_model),
+            nn.Linear(d_in, d_model),
             nn.LeakyReLU(),
-            nn.Linear(4*d_model, 4*d_model),
+            nn.Linear(d_model, d_model),
             nn.LeakyReLU(),
-            nn.Linear(4*d_model, 4*d_model),
+            nn.Linear(d_model, d_model),
             nn.LeakyReLU(),
-            nn.Linear(4*d_model, 1),
+            nn.Linear(d_model, 1),
             
         )
         self.pred_act = nn.ELU()
         self.explicit_zero_prob = explicit_zero_prob
         if explicit_zero_prob:
             self.zero_logit = nn.Sequential(
-                nn.Linear(d_in, 4*d_model),
+                nn.Linear(d_in, d_model),
                 nn.LeakyReLU(),
-                nn.Linear(4*d_model, 4*d_model),
+                nn.Linear(d_model, d_model),
                 nn.LeakyReLU(),
-                nn.Linear(4*d_model, 4*d_model),
+                nn.Linear(d_model, d_model),
                 nn.LeakyReLU(),
                 nn.Linear(d_model, 1),
             
@@ -943,7 +943,7 @@ class MVCDecoder(nn.Module):
             self.query_activation = nn.LeakyReLU()#query_activation()
             self.W = nn.Linear(d_model, d_in, bias=False)
             if explicit_zero_prob:  # by default, gene-wise prob rate
-                self.W_zero_logit = nn.Linear(4*d_model, d_in)
+                self.W_zero_logit = nn.Linear(d_model, d_in)
         elif arch_style == "concat query":
             self.gene2query = nn.Linear(d_model, 64)
             self.query_activation = query_activation()
