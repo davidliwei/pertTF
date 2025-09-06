@@ -345,7 +345,8 @@ def random_mask_value(
     mask_ratio: float = 0.15,
     mask_value: int = -1,
     pad_value: int = -2,
-    cls_value: int = -3
+    cls_value: int = -3,
+    rng: default_rng = None
 ) -> torch.Tensor:
     """
     Randomly mask a batch of data.
@@ -360,6 +361,7 @@ def random_mask_value(
     Returns:
         torch.Tensor: A tensor of masked data.
     """
+    rng = default_rng() or rng # much faster sampling without replacement
     if isinstance(values, torch.Tensor):
         # it is crutial to clone the tensor, otherwise it changes the original tensor
         values = values.clone().detach().numpy()
@@ -370,6 +372,6 @@ def random_mask_value(
         row = values[i]
         non_padding_idx = np.intersect1d(np.nonzero(row - pad_value), np.nonzero(row - cls_value)) # only mask non padding or cls positions
         n_mask = int(len(non_padding_idx) * mask_ratio)
-        mask_idx = np.random.choice(non_padding_idx, n_mask, replace=False)
+        mask_idx = rng.choice(non_padding_idx, n_mask, replace=False)
         row[mask_idx] = mask_value
     return torch.from_numpy(values).float()
