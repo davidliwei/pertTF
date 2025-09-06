@@ -185,11 +185,9 @@ class PerturbationTFModel(TransformerModel):
         self.genotype_encoder = self.pert_encoder # these two are default to be the same thing
         if self.pert_embed_dim != self.d_model or self.sep_genotype_embed:
             self.genotype_encoder = PertLabelEncoder(n_pert, self.d_model, padding_idx=self.pert_pad_id)
-            self.pert_exp_mode = 'concat'
-        if self.pert_exp_mode in ['sum', 'direct_sum']:
+            self.pert_exp_mode = 'concat' if self.pert_exp_mode == 'direct_sum' else self.pert_exp_mode
+        if self.pert_exp_mode in ['direct_sum']:
             self.pert_embed_dim = 0
-        print(self.pert_embed_dim)
-        print(self.pert_exp_mode)
         self.pert_exp_encoder = PertExpEncoder (d_model, d_pert_emb = self.pert_embed_dim) 
         
         # the following is the perturbation decoder
@@ -413,8 +411,8 @@ class PerturbationTFModel(TransformerModel):
                 dim=1,
             )
             if self.pert_exp_mode == 'sum': # transform the sum
-                tf_concat = cell_emb_orig + pert_emb_next
-                cell_emb_next=self.pert_exp_encoder(tf_concat)
+                #tf_concat = cell_emb_orig + pert_emb_next
+                cell_emb_next=self.pert_exp_encoder(tf_concat)+cell_emb_orig
             elif self.pert_exp_mode == 'direct_sum': # don't transform, just add
                 cell_emb_next=cell_emb_orig + pert_emb_next
             elif self.pert_exp_mode == 'concat':
@@ -627,8 +625,8 @@ class PerturbationTFModel(TransformerModel):
                     [cell_emb,pert_emb_next], dim=1,
                 )
                 if self.pert_exp_mode == 'sum':
-                    tf_concat = cell_emb + pert_emb_next
-                    cell_emb_next=self.pert_exp_encoder(tf_concat)
+                    #tf_concat = cell_emb + pert_emb_next
+                    cell_emb_next=self.pert_exp_encoder(tf_concat)+cell_emb
                 elif self.pert_exp_mode == 'direct_sum':
                     cell_emb_next = cell_emb + pert_emb_next
                 elif self.pert_exp_mode == 'concat':
