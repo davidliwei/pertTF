@@ -25,12 +25,12 @@ def generate_config(parameter_dict,
                                         "<eoc>"]
 
     parameter_dict['reciprical_sampling'] = parameter_dict.get('reciprical_sampling', False)
+        #mask_ratio = config.mask_ratio
+    if parameter_dict.get('CCE', False):
+       parameter_dict['reciprical_sampling'] = True
     parameter_dict['no_pert_for_perturb'] = True if parameter_dict['reciprical_sampling'] else parameter_dict.get('no_pert_for_perturb', False)
-    #mask_ratio = config.mask_ratio
-
     # n_input_bins = config.n_bins
     parameter_dict['max_seq_len'] = parameter_dict['n_hvg'] + 1
-
     use_wandb=True
     if use_wandb:
       run = wandb.init(

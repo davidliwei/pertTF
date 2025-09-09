@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 
 from perttf.model.train_data_gen import prepare_data,prepare_dataloader
 from perttf.utils.set_optimizer import create_optimizer_dict
-
+from perttf.custom_loss import perturb_embedding_loss, CCE_loss
 
 def forward_pass(model, batch_data, device, config, vocab, has_lochness_next_pred = False):
     input_gene_ids = batch_data["gene_ids"].to(device)
@@ -131,7 +131,9 @@ def train(model: nn.Module,
         celltype_labels_next = batch_data["celltype_labels_next"].to(device) #added
         perturbation_labels_next = batch_data["perturbation_labels_next"].to(device) #added
         perturbation = batch_data["perturbation"].to(device)
+        inv_perturbation = batch_data["inv_perturbation"].to(device) if batch_data["inv_perturbation"] is not None else None
         pert_scale = batch_data['pert_scale'].to(device)
+        inv_per_scale = batch_data['inv_pert_scale'].to(device)
         if config.ps_weight >0:
             ps_score = batch_data["ps"].to(device)
             ps_score_next = batch_data["ps_next"].to(device) #
@@ -146,21 +148,41 @@ def train(model: nn.Module,
                 src_key_padding_mask=src_key_padding_mask,
                 batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
                 pert_labels = perturbation_labels if config.perturbation_input else None,
+                pert_labels_next = perturbation_labels_next if config.perturbation_input else None,
                 perturbation = perturbation if (config.next_weight >0 or has_lochness_next_pred )  else None,
+                inv_perturbation = inv_perturbation if (config.get('reciprical_sampling', False)) else None,
                 pert_scale = pert_scale if (config.get('reciprical_sampling', False)) else None,
+                inv_pert_scale = inv_per_scale if (config.get('reciprical_sampling', False)) else None,
+                values_next = input_next_values if config.get('CCE', False) else None,
                 MVC=config.GEPC,
                 ECS=config.ecs_thres > 0,
                 CLS=config.cell_type_classifier,
+                CCE = config.CCE,
                 PERTPRED = config.perturbation_classifier_weight > 0,
                 PSPRED = config.ps_weight >0,
             )
-
+            #if batch == 0:
+               #for a in output_dict["contrastive_dict"]:
+                   #print(a)
+                   #print(output_dict["contrastive_dict"][a].shape)
+                   #print(output_dict["contrastive_dict"])
+            
             masked_positions = input_values.eq(config.mask_value)  # the postions to predict
             loss_mse = criterion(
                 output_dict["mlm_output"], target_values, masked_positions
             )
             loss = config.this_weight * loss_mse
-            metrics_to_log = {"train/mse": loss_mse.item()}
+            if "contrastive_dict" in output_dict:
+                loss_cce = CCE_loss(
+                    output_dict["contrastive_dict"]['cell1_emb'],
+                    output_dict["contrastive_dict"]['cell1_emb_next'],
+                    output_dict["contrastive_dict"]['cell2_emb'],
+                    output_dict["contrastive_dict"]['cell2_emb_next'],
+                    input_labels = celltype_labels*1000+perturbation_labels,
+                    pert_labels = celltype_labels_next*1000+perturbation_labels_next
+                    ) 
+                loss = loss+50*loss_cce
+            metrics_to_log = {"train/cce": loss_cce.item()}
             # next value?
             loss_mse_next = criterion(
                 output_dict["mlm_output"],
@@ -252,7 +274,8 @@ def train(model: nn.Module,
                 loss_dab = criterion_dab(output_dict["dab_output"], batch_labels)
                 loss = loss + config.dab_weight * loss_dab
                 metrics_to_log.update({"train/dab": loss_dab.item()})
-
+            #if config.CCE and epoch < 150:
+             #   loss = loss_cce
         model.zero_grad()
         #print(f"loss: {loss}")
         #import pdb; pdb.set_trace()
@@ -435,7 +458,8 @@ def evaluate(model: nn.Module,
     total_ps = 0.0
     total_ps_next = 0.0
     total_num = 0
-
+    total_mvc = 0
+    total_mvc_next = 0
     if hasattr(config, "pred_lochness_next"):
         has_lochness_next_pred = True
         ps_next_training_weight = config.pred_lochness_next
@@ -487,6 +511,18 @@ def evaluate(model: nn.Module,
                 loss_mse_next = criterion(output_values, target_values_next, masked_positions)
                 #print(f"target_values_next_shape: {target_values_next.shape}")
                 #print(target_values_next * masked_positions)
+                if config.GEPC:
+                    loss_gepc = criterion(
+                        output_dict["mvc_output"], target_values, masked_positions
+                    )
+                    loss = loss + config.this_weight *loss_gepc
+                    # added
+                    loss_gepc_next = criterion(
+                        output_dict["mvc_output_next"], target_values_next, masked_positions
+                    )
+                    loss = loss + config.next_weight * loss_gepc_next
+                
+
                 if config.dab_weight > 0:
                     loss_dab = criterion_dab(output_dict["dab_output"], batch_labels)
                 if config.cell_type_classifier: #added
@@ -504,6 +540,8 @@ def evaluate(model: nn.Module,
 
             total_loss += loss.item() * len(input_gene_ids)
             total_loss_next += loss_mse_next.item() * len(input_gene_ids)
+            total_mvc = loss_gepc.item()
+            total_mvc_next = loss_gepc_next.item()
             total_error += masked_relative_error(output_values, target_values, masked_positions).item() * len(input_gene_ids)
             total_error_next += masked_relative_error(output_values, target_values_next, masked_positions).item() * len(input_gene_ids)
             if config.dab_weight > 0:
@@ -520,8 +558,11 @@ def evaluate(model: nn.Module,
 
     wandb.log(
         {
+
             "valid/mse": total_loss / total_num,
             "valid/mse_next": total_loss_next / total_num,
+            "valid/mvc": total_mvc,
+            "valid/mvc_next": total_mvc_next,
             "valid/mre": total_error / total_num,
             "valid/mre_next": total_error_next / total_num,
             "valid/dab": total_dab / total_num,
@@ -534,7 +575,19 @@ def evaluate(model: nn.Module,
         },
     )
 
-    return total_loss / total_num, total_loss_next / total_num, total_error / total_num, total_error_next / total_num, total_dab / total_num, total_cls / total_num, total_pert / total_num, total_ps / total_num, total_ps_next / total_num
+    return (
+        total_loss / total_num, 
+        total_loss_next / total_num, 
+        total_mvc,
+        total_mvc_next,
+        total_error / total_num, 
+        total_error_next / total_num, 
+        total_dab / total_num, 
+        total_cls / total_num, 
+        total_pert / total_num,
+        total_ps / total_num, 
+        total_ps_next / total_num
+    )
 
 def eval_testdata(
     model: nn.Module,
@@ -834,7 +887,7 @@ def wrapper_train(model, config, data_gen,
                 logger = logger,
                 device = device
             )
-        val_loss, val_loss_next, val_mre, val_mre_next, val_dab, val_cls, val_pert, val_ps, val_ps_next = evaluate(
+        val_loss, val_loss_next, val_mvc, val_mvc_next, val_mre, val_mre_next, val_dab, val_cls, val_pert, val_ps, val_ps_next = evaluate(
             model,
             loader=valid_loader,
             config=config,
@@ -847,15 +900,15 @@ def wrapper_train(model, config, data_gen,
             logger.info("-" * 89)
             logger.info(
                 f"| end of epoch {epoch:3d} | time: {elapsed:5.2f}s | "
-                f"valid loss/mse {val_loss:5.4f} | mre {val_mre:5.4f} | "
-                f"valid loss/mse_next {val_loss_next:5.4f} | mre_next {val_mre_next:5.4f} | "
+                f"valid loss/mse {val_loss:5.4f} | mvc {val_mvc:5.4f} | "
+                f"valid loss/mse_next {val_loss_next:5.4f} | mvc_next {val_mvc_next:5.4f} | "
                 f"valid dab {val_dab:5.4f} | valid cls {val_cls:5.4f} | valid pert {val_pert:5.4f} |"
                 f"valid ps {val_ps:5.4f} | valid ps_next {val_ps_next:5.4f} |"
             )
             logger.info("-" * 89)
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        loss = val_loss + val_loss_next + val_mvc + val_mvc_next + val_cls + val_pert
+        if loss < best_val_loss:
+            best_val_loss = loss
             best_model = copy.deepcopy(model)
             best_model_epoch = epoch
             if logger is not None:

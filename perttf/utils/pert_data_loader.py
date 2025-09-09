@@ -237,7 +237,7 @@ class PertTFDataset(Dataset):
         curr_gene = self.adata.var.index
         current_expr = self.adata.layers[binned_layer_key][current_cell_global_idx]
         if issparse(current_expr):
-            current_expr = current_expr.toarray().flatten()+1
+            current_expr = current_expr.toarray().flatten()
 
         # 3. Sample a perturbation outcome for the current cell
         next_cell_id, next_cell_genotype = self._sample_next_cell(current_cell_idx, current_cell_celltype,  current_cell_genotype)
@@ -249,7 +249,7 @@ class PertTFDataset(Dataset):
         next_gene = self.adata.var.index
 
         if issparse(next_expr):
-            next_expr = next_expr.toarray().flatten()+1
+            next_expr = next_expr.toarray().flatten()
 
         # 5. Get labels and PS scores
         cell_label = self.cell_type_to_index[current_cell_celltype]
@@ -265,19 +265,22 @@ class PertTFDataset(Dataset):
         # TODO: this section maybe should be in the sampling function
         # Introduce the actual perturbation that is used to achieve the perturbed outcome
         pert_scale  = np.array([1], dtype=np.float32) # vector to scale perturbation embeddings (TODO: make this learnable, i.e. 2*sigmoid-1)
+        inv_pert_scale = np.array([1], dtype=np.float32)
         if current_cell_genotype == next_cell_genotype: # e.g. PDX1 -> PDX1 
             if self.no_pert_for_perturb: # e.g. PDX1 -> PDX1: perturbation = WT
                 perturbation = self.genotype_to_index['WT']
             else: # e.g. PDX1 -> PDX1: perturbation = PDX1 (original definition of perturbation)
                 perturbation = pert_label_next
+            inv_perturbation = perturbation 
         else:
             if current_cell_genotype == 'WT': # e.g. WT -> PDX1: perturbation = PDX1 (always the case for WT cells)
                 perturbation = pert_label_next
-            elif self.reciprical_sampling: # e.g. PDX1 -> WT: perturbation = PDX1;
-                perturbation = self.genotype_to_index['-'+current_cell_genotype] if self.reciprical_genotype else self.genotype_to_index[current_cell_genotype]
-                pert_scale = np.array([-1], dtype=np.float32) # "turning PDX1 back to WT, so take negative"
-
-
+                inv_perturbation = self.genotype_to_index['-'+next_cell_genotype] if self.reciprical_genotype else pert_label_next
+                inv_pert_scale = pert_scale if self.reciprical_genotype else np.array([-1], dtype=np.float32)
+            elif self.reciprical_sampling: # e.g. PDX1 -> WT: perturbation = PDX1, only when reciprical_sampling is turned on
+                perturbation = self.genotype_to_index['-'+current_cell_genotype] if self.reciprical_genotype else pert_label
+                inv_perturbation = pert_label
+                pert_scale = pert_scale if self.reciprical_genotype else np.array([-1], dtype=np.float32) # "turning PDX1 back to WT, so take negative"
 
         #ps_scores = np.array([self.adata.obs.at[current_cell_idx, ps] for ps in self.ps_columns]).astype(np.float32) if self.ps_columns else np.array([0.0], dtype=np.float32)
         ps_scores = self.ps_matrix[current_cell_global_idx]
@@ -306,7 +309,9 @@ class PertTFDataset(Dataset):
             "celltype_labels_next": cell_label_next,
             "perturbation_labels_next": pert_label_next,
             'perturbation': perturbation,
+            'inv_perturbation': inv_perturbation,
             'pert_scale': pert_scale,
+            'inv_pert_scale': inv_pert_scale,
             "ps": ps_scores,
             "ps_next": ps_scores_next,
             "index": current_cell_global_idx,
