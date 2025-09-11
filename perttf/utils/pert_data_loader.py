@@ -45,7 +45,9 @@ class PertTFDataset(Dataset):
     """
     def __init__(self, adata: AnnData, indices: np.ndarray = None, 
                  cell_type_to_index: dict = None, genotype_to_index: dict = None, expr_layer: str = 'X_binned',
-                 ps_columns: list = None, ps_columns_perturbed_genes: list = None, next_cell_pred: str = "identity", only_sample_wt_pert: bool = False):
+                 ps_columns: list = None, ps_columns_perturbed_genes: list = None, next_cell_pred: str = "identity", 
+                 additional_ps_dict: dict = None, 
+                 only_sample_wt_pert: bool = False):
         """
         The PertTFDataset serves to interface with pytorch Dataloaders 
         Its main function is to subset and extract single samples from a single Anndata object that is in-memory
@@ -60,6 +62,7 @@ class PertTFDataset(Dataset):
             ps_columns (list, optional): List of columns in obs to use for 'ps' scores.
             ps_columns_perturbed_genes (list, optional): List of perturbed genes for ps_columns. Only active if next_cell_red is "lochness". Have to be have the same length as ps_columns.
             next_cell_pred (str): The mode for next cell prediction ("identity" or "pert" or "lochness").
+            additional_ps_dict (dict): a dictionary {gene_name:ps} the pass the additional ps score for other genes to the training.
             only_sample_wt_pert: only random sample next cell for wild type cells
         """
         self.adata = adata
@@ -90,6 +93,16 @@ class PertTFDataset(Dataset):
                 print('Specified perturbed genes for PS column after filtering:' + ','.join(ps_columns_perturbed_genes))
                 raise ValueError("The ps_columns_perturbed_genes must be specified and has to have equal length as ps_matrix")
             self.ps_columns_perturbed_genes = ps_columns_perturbed_genes
+            if additional_ps_dict is None:
+                self.additional_ps_dict={}
+                self.additional_ps_names=[]
+            else:
+                self.additional_ps_dict = additional_ps_dict
+                self.additional_ps_names = list(additional_ps_dict.keys())
+                # sanity check: whether the gene keys are part of the genotype_to_index
+                for x in self.additional_ps_names:
+                    if x not in self.genotype_to_index:
+                        raise ValueError(f"The gene name {x} provided in additional_ps_dict is not included in the pre-defined genotype.")
 
     def _check_anndata_content(self):
         assert 'genotype' in self.adata.obs.columns and 'celltype' in self.adata.obs.columns, 'no genotype or celltype column found in anndata'
@@ -224,10 +237,16 @@ class PertTFDataset(Dataset):
 
         if self.next_cell_pred == "lochness":
             #pert_label = self.genotype_to_index[current_cell_obs['genotype']]
-            random_pert_ind = random.randint(0, len(self.ps_columns_perturbed_genes)-1)
-            pert_label_next = self.genotype_to_index[self.ps_columns_perturbed_genes[random_pert_ind]] # this is the randomly assigned perturbations
-            ps_scores_next = np.array([ps_scores[random_pert_ind]], dtype=np.float32)  # note that the target prediction is not the PS of NEXT cell, but the current cell
-
+            selection_pool_length = len(self.ps_columns_perturbed_genes) + len(self.additional_ps_names)
+            random_pert_ind = random.randint(0, selection_pool_length-1)
+            if random_pert_ind < len(self.ps_columns_perturbed_genes): # falls within the provided ps
+                pert_label_next = self.genotype_to_index[self.ps_columns_perturbed_genes[random_pert_ind]] # this is the randomly assigned perturbations
+                ps_scores_next = np.array([ps_scores[random_pert_ind]], dtype=np.float32)  # note that the target prediction is not the PS of NEXT cell, but the current cell
+            else: # falls within additional ps scores defined in additional_ps_dict
+                selected_gene = self.additional_ps_names[random_pert_ind - len(self.ps_columns_perturbed_genes)] 
+                pert_label_next = self.genotype_to_index[selected_gene]
+                ps_scores_next = np.array([self.additional_ps_dict[pert_label_next]], dtype=np.float32) 
+        
         return {
             "expr": current_expr,
             "expr_next": next_expr,
@@ -341,6 +360,7 @@ class PertTFUniDataManager:
                  genotype_to_index: dict = None, 
                  expr_layer: str = 'X_binned',
                  next_cell_pred_type: str = "identity", 
+                 additional_ps_dict: dict = None, 
                  only_sample_wt_pert: bool = False):
         
         self.adata = adata
@@ -348,6 +368,7 @@ class PertTFUniDataManager:
         self.config = config
         self.ps_columns = ps_columns # perhaps this can incorporated into config
         self.ps_columns_perturbed_genes = ps_columns_perturbed_genes
+        self.additional_ps_dict = additional_ps_dict
         self.expr_layer = expr_layer
         self.only_sample_wt_pert = config.get('only_sample_wt_pert', only_sample_wt_pert)
         self.next_cell_pred_type = config.get('next_cell_pred_type', next_cell_pred_type)
@@ -407,7 +428,8 @@ class PertTFUniDataManager:
         perttf_dataset = PertTFDataset(
             self.adata, indices=indices, cell_type_to_index=self.cell_type_to_index, genotype_to_index=self.genotype_to_index,
             ps_columns=self.ps_columns, ps_columns_perturbed_genes = self.ps_columns_perturbed_genes, 
-            next_cell_pred=self.next_cell_pred_type , expr_layer=self.expr_layer, only_sample_wt_pert=self.only_sample_wt_pert
+            next_cell_pred=self.next_cell_pred_type ,    additional_ps_dict = self.additional_ps_dict,  
+            expr_layer=self.expr_layer, only_sample_wt_pert=self.only_sample_wt_pert
         )
         return perttf_dataset
 
