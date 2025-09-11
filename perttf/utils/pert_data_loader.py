@@ -245,7 +245,7 @@ class PertTFDataset(Dataset):
             else: # falls within additional ps scores defined in additional_ps_dict
                 selected_gene = self.additional_ps_names[random_pert_ind - len(self.ps_columns_perturbed_genes)] 
                 pert_label_next = self.genotype_to_index[selected_gene]
-                ps_scores_next = np.array([self.additional_ps_dict[pert_label_next]], dtype=np.float32) 
+                ps_scores_next = np.array([self.additional_ps_dict[selected_gene]], dtype=np.float32) 
         
         return {
             "expr": current_expr,
