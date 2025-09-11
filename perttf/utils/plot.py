@@ -81,7 +81,7 @@ def process_and_log_umaps(adata_t, config, epoch: int, eval_key: str, save_dir: 
                     str(save_path), caption=f"{eval_key}_{res_key} epoch {epoch}"
                 )
         
-        # Handle Pathway Score (PS) plotting
+        # Handle Loness score plotting
         if config.ps_weight > 0:
             loness_columns = [x for x in adata_t.obs if x.startswith('lonESS')]
             for lon_c in loness_columns:
