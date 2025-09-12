@@ -798,7 +798,7 @@ def wrapper_train(model, config, data_gen,
             
             for eval_dict_key, eval_adata in eval_adata_dict.items():
                 # Step 1: Get AnnData with embeddings from the main process
-                results = multi_process_eval_testdata(
+                results = eval_testdata(
                     #best_model,
                     model, # use current model
                     adata_t = eval_adata, #adata_t=data_gen['adata_sorted'], # if config.per_seq_batch_sample else adata,

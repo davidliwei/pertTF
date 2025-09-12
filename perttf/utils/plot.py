@@ -20,7 +20,7 @@ def process_and_log_umaps(adata_t, config, epoch: int, eval_key: str, save_dir: 
         results = {}
         metrics_to_log = {"epoch": epoch}
 
-        if config.next_cell_pred_type != 'None':
+        if config.next_cell_pred_type == 'pert':
             sc.pp.neighbors(adata_t, use_rep="X_scGPT_next")
             sc.tl.umap(adata_t, min_dist=0.3)
             if config.cell_type_classifier:
