@@ -50,6 +50,7 @@ class FlashTransformerEncoderLayerVarlen(nn.Module):
         dtype=None,
         norm_scheme="post",  # "pre" or "post"
         causal=False,
+        bias = True,
         use_flash_attn = True
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -66,8 +67,8 @@ class FlashTransformerEncoderLayerVarlen(nn.Module):
         self.self_attn = Empty() # Dummy code because TransformerEncoder expects self.self_attn.batch_first
         self.self_attn.batch_first = batch_first
         # Linear projections for Q, K, V
-        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=False, **factory_kwargs)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=bias, **factory_kwargs)
+        self.out_proj = nn.Linear(d_model, d_model, bias=bias, **factory_kwargs)
         
         # Feedforward network
         self.linear1 = nn.Linear(d_model, dim_feedforward, **factory_kwargs)
@@ -131,7 +132,7 @@ class FlashTransformerEncoderLayerVarlen(nn.Module):
             # Repack for flash_attn_qkvpacked_func
             qkv_for_flash = torch.stack([q, k, v], dim=4)  # (batch, seq_len, nhead, head_dim, 3)
             #print(qkv_for_flash.shape)
-            qkv_for_flash = qkv_for_flash.permute(0, 1, 4, 2, 3)  # (batch, seq_len, nhead, 3, head_dim)
+            qkv_for_flash = qkv_for_flash.permute(0, 1, 4, 2, 3)  # (batch, seq_len, 3, nheads, head_dim)
             #print(qkv_for_flash.shape)
             if self.flash_version == '3':
                 attn_output = flash_attn_qkvpacked_func(

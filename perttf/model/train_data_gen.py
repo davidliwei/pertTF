@@ -292,8 +292,9 @@ def produce_training_datasets(adata_input, config,
     """
     test_manager = PertTFUniDataManager(adata_input, 
                                      config, 
-                                     ps_columns=ps_columns, 
+                                     ps_columns=ps_columns, vocab=vocab,
                                      ps_columns_perturbed_genes=ps_columns_perturbed_genes, additional_ps_dict = additional_ps_dict,
+
                                      celltype_to_index = cell_type_to_index, 
                                      genotype_to_index= genotype_to_index, 
                                      expr_layer= input_layer_key)

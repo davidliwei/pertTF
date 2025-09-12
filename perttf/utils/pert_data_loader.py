@@ -13,6 +13,7 @@ from torch import nn, Tensor
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from anndata import AnnData
+import anndata
 from scipy.sparse import issparse
 #from torchtext.vocab import Vocab
 #from torchtext._torchtext import (
@@ -74,14 +75,13 @@ class PertTFDataset(Dataset):
         # Mappings
         self.cell_type_to_index = cell_type_to_index if cell_type_to_index is not None else {t: i for i, t in enumerate(self.adata.obs['celltype'].unique())}
         self.genotype_to_index = genotype_to_index if genotype_to_index is not None else {t: i for i, t in enumerate(self.adata.obs['genotype'].unique())}
-        self.ps_columns = ps_columns or []
-
+        self.ps_columns = ps_columns or [] 
+        self.ps_columns = list(self.ps_columns) # must be a list 
         # For efficient next-cell sampling, pre-compute a dictionary of valid choices
         # IMPORTANT: This dictionary only contains cells from the current data split (train/valid)
         # to prevent data leakage.
         self.next_cell_dict = self._create_next_cell_pool()
         self.only_sample_wt_pert = only_sample_wt_pert
-
         if self.next_cell_pred == "lochness":
             if ps_columns is None:
                 raise ValueError("PS columns must be provided for lochness prediction")
@@ -93,6 +93,7 @@ class PertTFDataset(Dataset):
                 print('Specified perturbed genes for PS column after filtering:' + ','.join(ps_columns_perturbed_genes))
                 raise ValueError("The ps_columns_perturbed_genes must be specified and has to have equal length as ps_matrix")
             self.ps_columns_perturbed_genes = ps_columns_perturbed_genes
+
             if additional_ps_dict is None:
                 self.additional_ps_dict={}
                 self.additional_ps_names=[]
@@ -103,6 +104,10 @@ class PertTFDataset(Dataset):
                 for x in self.additional_ps_names:
                     if x not in self.genotype_to_index:
                         raise ValueError(f"The gene name {x} provided in additional_ps_dict is not included in the pre-defined genotype.")
+
+        # store the ps_matrix as numpy array for fast retrival during training
+        self.ps_matrix = self.adata.obs[self.ps_columns].values.astype(np.float32) if self.ps_columns else np.zeros((self.adata.shape[0],1), dtype=np.float32)
+
 
     def _check_anndata_content(self):
         assert 'genotype' in self.adata.obs.columns and 'celltype' in self.adata.obs.columns, 'no genotype or celltype column found in anndata'
@@ -127,8 +132,10 @@ class PertTFDataset(Dataset):
             next_pert_list = []
             next_cell_global_idx_list = []
             for i in self.indices:
-                current_cell_obs = self.adata.obs.iloc[i]
-                next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_obs)
+                current_cell_idx = self.adata.obs.index[i]
+                current_cell_celltype = self.adata.obs.at[current_cell_idx, 'celltype']
+                current_cell_genotype = self.adata.obs.at[current_cell_idx, 'genotype']
+                next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_idx, current_cell_celltype, current_cell_genotype)
                 next_cell_id_list.append(next_cell_id)
                 next_pert_list.append(next_pert_label_str)
                 next_cell_global_idx_list.append(self.adata.obs.index.get_loc(next_cell_id))
@@ -159,11 +166,15 @@ class PertTFDataset(Dataset):
                     next_cell_dict[cell_type][genotype] = included_cells_indices
         return next_cell_dict
 
-    def _sample_next_cell(self, current_cell_obs):
+    def _sample_next_cell(self,  current_cell_idx, current_cell_celltype, current_cell_genotype):
         """Samples a 'next cell' for a given current cell."""
-        current_cell_id = current_cell_obs.name
-        current_cell_type = current_cell_obs['celltype']
-        current_genotype = current_cell_obs['genotype']
+        #current_cell_id = current_cell_obs.name
+        #current_cell_type = current_cell_obs['celltype']
+        #current_genotype = current_cell_obs['genotype']
+
+        current_cell_id = current_cell_idx
+        current_cell_type = current_cell_celltype
+        current_genotype = current_cell_genotype
 
         if self.next_cell_pred == "identity" or self.next_cell_pred == "lochness":
             return current_cell_id, current_genotype
@@ -196,20 +207,22 @@ class PertTFDataset(Dataset):
         # 1. Get the index for the current cell
         current_cell_global_idx = self.indices[idx]
 
-        current_cell_obs = self.adata.obs.iloc[current_cell_global_idx]
-        
+        #current_cell_obs = self.adata.obs.iloc[current_cell_global_idx] # too slow
+
+        current_cell_idx = self.adata.obs.index[current_cell_global_idx]
+        current_cell_celltype = self.adata.obs.at[current_cell_idx, 'celltype']
+        current_cell_genotype = self.adata.obs.at[current_cell_idx, 'genotype']
+        current_cell_batch_label = self.adata.obs.at[current_cell_idx, 'batch_id']
+
         # 2. Get expression data for the current cell
         binned_layer_key = self.expr_layer
-
         curr_gene = self.adata.var.index
-
-
         current_expr = self.adata.layers[binned_layer_key][current_cell_global_idx]
         if issparse(current_expr):
             current_expr = current_expr.toarray().flatten()
 
         # 3. Sample the next cell and its metadata
-        next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_obs)
+        next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_idx, current_cell_celltype,  current_cell_genotype)
         next_cell_global_idx = self.adata.obs.index.get_loc(next_cell_id)
         
         # 4. Get expression data for the next cell
@@ -221,20 +234,21 @@ class PertTFDataset(Dataset):
             next_expr = next_expr.toarray().flatten()
 
         # 5. Get labels and PS scores
-        cell_label = self.cell_type_to_index[current_cell_obs['celltype']]
-        pert_label = self.genotype_to_index[current_cell_obs['genotype']]
+        cell_label = self.cell_type_to_index[current_cell_celltype]
+        pert_label = self.genotype_to_index[current_cell_genotype]
         
 
-        batch_label = current_cell_obs['batch_id']
+        batch_label = current_cell_batch_label
 
         # Next cell labels are the same for cell type, but perturbation can change
         cell_label_next = cell_label
         pert_label_next = self.genotype_to_index[next_pert_label_str]
 
                 
-        ps_scores = current_cell_obs[self.ps_columns].values.astype(np.float32) if self.ps_columns else np.array([0.0], dtype=np.float32)
-        ps_scores_next = self.adata.obs.loc[next_cell_id, self.ps_columns].values.astype(np.float32) if self.ps_columns else np.array([0.0], dtype=np.float32)
-
+        #ps_scores = np.array([self.adata.obs.at[current_cell_idx, ps] for ps in self.ps_columns]).astype(np.float32) if self.ps_columns else np.array([0.0], dtype=np.float32)
+        ps_scores = self.ps_matrix[current_cell_global_idx]
+        #ps_scores_next = self.adata.obs.loc[next_cell_id, self.ps_columns].values.astype(np.float32) if self.ps_columns else np.array([0.0], dtype=np.float32)
+        ps_scores_next = self.ps_matrix[next_cell_global_idx]
         if self.next_cell_pred == "lochness":
             #pert_label = self.genotype_to_index[current_cell_obs['genotype']]
             selection_pool_length = len(self.ps_columns_perturbed_genes) + len(self.additional_ps_names)
@@ -261,7 +275,7 @@ class PertTFDataset(Dataset):
             "ps_next": ps_scores_next,
             "index": current_cell_global_idx,
             "next_index": next_cell_global_idx,
-            'name': current_cell_obs.name,
+            'name': current_cell_idx,
             'next_name': next_cell_id
         }
 
@@ -270,7 +284,7 @@ class PertBatchCollator:
     """
     A collate function for the DataLoader that tokenizes, pads, and masks batches on the fly.
     """
-    def __init__(self,  vocab: object, gene_ids: np.ndarray, full_tokenize: bool = False, **config):
+    def __init__(self, vocab: object, gene_ids: np.ndarray, full_tokenize: bool = False, **config):
         self.config = config
         self.vocab = vocab
         self.gene_ids = gene_ids
@@ -278,6 +292,7 @@ class PertBatchCollator:
         self.include_zero_gene = config.get('include_zero_gene', True)
         self.append_cls = config.get('append_cls', True)
         self.cls_value = config.get('cls_value', -3)
+        self.cls_token = config.get('cls_token', '<cls>')
         self.max_seq_len = config.get('max_seq_len', 3000)
         self.pad_token = config.get('pad_token', '<pad>')
         self.pad_value = config.get('pad_value', -2)
@@ -301,13 +316,13 @@ class PertBatchCollator:
 
         # TODO: These functions may need to be modified to accomodate inputs w differing number of genes in the future
         tokenized, gene_idx_list = tokenize_and_pad_batch(
-            np.array(expr_list), self.gene_ids, max_len=max_seq_len,
+            np.array(expr_list), self.gene_ids, max_len=max_seq_len,cls_token=self.cls_token,
             vocab=self.vocab, pad_token=self.pad_token, pad_value=self.pad_value,
             append_cls=self.append_cls, include_zero_gene=self.include_zero_gene, 
             cls_value=self.cls_value
         )
         tokenized_next, _ = tokenize_and_pad_batch(
-            np.array(expr_next_list), self.gene_ids, max_len=max_seq_len,
+            np.array(expr_next_list), self.gene_ids, max_len=max_seq_len, cls_token=self.cls_token,
             vocab=self.vocab, pad_token=self.pad_token, pad_value=self.pad_value,
             append_cls=self.append_cls, include_zero_gene=self.include_zero_gene, 
             sample_indices=gene_idx_list, cls_value=self.cls_value
@@ -362,8 +377,8 @@ class PertTFUniDataManager:
                  next_cell_pred_type: str = "identity", 
                  additional_ps_dict: dict = None, 
                  only_sample_wt_pert: bool = False):
-        
-        self.adata = adata
+        #assert not adata.is_view, "The provided anndata is likely a view of the original anndata, this is probably due to slicing the original annadata object, please use the .copy() method to provide a copy"
+        self.adata = adata.copy() # make a copy of the data so that no issues arise if adata is a anndata view
         self.indices = np.arange(self.adata.n_obs)
         self.config = config
         self.ps_columns = ps_columns # perhaps this can incorporated into config
@@ -380,15 +395,19 @@ class PertTFUniDataManager:
         
         # Create and store mappings and vocab as instance attributes
                 #self.num_batch_types = len(self.adata.obs["batch_id"].unique())
-        self.set_genotype_index(genotype_to_index= genotype_to_index)
-        self.set_celltype_index(celltype_to_index= celltype_to_index)
-        add_batch_info(self.adata)
-        self.num_batch_types = len(self.adata.obs["batch_id"].unique())
+
+        
         self.genes = self.adata.var.index.tolist()
         self.vocab = SimpleVocab(self.genes, config.special_tokens) if vocab is None else vocab
+        assert self.adata.var.index.isin(self.vocab.stoi).all(), 'Not all genes are in provided vocab, please prefiltered the Anndata first'
         self.vocab.set_default_index(self.vocab["<pad>"])
         self.gene_ids = np.array(self.vocab(self.genes), dtype=int)
 
+        self.set_genotype_index(genotype_to_index= genotype_to_index)
+        self.set_celltype_index(celltype_to_index= celltype_to_index)
+        
+        add_batch_info(self.adata)
+        self.num_batch_types = len(self.adata.obs["batch_id"].unique())
         # The collators can be created once and reused
         ## first collator is the training collator, with a context window set in config
         self.collator = PertBatchCollator(self.vocab, self.gene_ids, **config)
@@ -438,7 +457,7 @@ class PertTFUniDataManager:
         collator = self.collator if not full_token_collator else self.full_token_collator 
         loader = DataLoader(
             dataset, batch_size=self.config.batch_size, shuffle=True,
-            num_workers=4, collate_fn=collator, pin_memory=True
+            num_workers=8, collate_fn=collator, pin_memory=True
         )
         return loader
 
