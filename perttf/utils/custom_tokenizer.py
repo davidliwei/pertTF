@@ -9,7 +9,7 @@ from typing_extensions import Self
 import numpy as np
 import pandas as pd
 import torch
-
+from numpy.random import default_rng
 # from transformers.tokenization_utils import PreTrainedTokenizer
 # from transformers import AutoTokenizer, BertTokenizer
 import collections
@@ -19,30 +19,37 @@ class SimpleVocab:
     A simple, dependency-free vocabulary class to replace torchtext.vocab.Vocab.
     It handles string-to-index (stoi) and index-to-string (itos) mappings.
     """
-    def __init__(self, tokens: list, special_tokens: list = None):
+    def __init__(self, tokens: list = None, special_tokens: list = None, vocab_path:str = None):
         """
         Args:
             tokens (list): A list of tokens (e.g., gene names) to build the vocabulary from.
             special_tokens (list, optional): A list of special tokens like '<pad>' or '<cls>'.
                                               These will be added to the beginning of the vocabulary.
         """
-        self.special_tokens = special_tokens if special_tokens else []
+        if vocab_path is not None:
+            self.from_json(vocab_path, special_tokens)
+        elif tokens is not None:
+            self.special_tokens = special_tokens if special_tokens else []
+
+            # Combine special tokens and unique regular tokens
+            all_tokens = self.special_tokens + sorted(list(set(tokens)))
+            # Create integer-to-string mapping
+            self.itos = {i:t for i,t in enumerate(all_tokens)}
+            
+            # Create string-to-integer mapping
+            self.stoi = {token: i for i, token in self.itos.items()}
         
-        # Combine special tokens and unique regular tokens
-        all_tokens = self.special_tokens + sorted(list(set(tokens)))
-        
-        # Create integer-to-string mapping
-        self.itos = all_tokens
-        
-        # Create string-to-integer mapping
-        self.stoi = {token: i for i, token in enumerate(self.itos)}
-        
-        # Set a default index for out-of-vocabulary tokens
-        self._default_index = -1 # Uninitialized
-        if "<pad>" in self.stoi:
-            self.set_default_index(self.stoi["<pad>"])
-        elif "<unk>" in self.stoi:
-            self.set_default_index(self.stoi["<unk>"])
+            # Set a default index for out-of-vocabulary tokens
+            self._default_index = -1 # Uninitialized
+            if "<pad>" in self.stoi:
+                self.set_default_index(self.stoi["<pad>"])
+            elif "<unk>" in self.stoi:
+                self.set_default_index(self.stoi["<unk>"])
+        else:
+            self.itos = {}
+            self.stoi = {}
+            self.special_tokens = None
+            
 
     def __len__(self):
         """Returns the size of the vocabulary."""
@@ -53,8 +60,16 @@ class SimpleVocab:
         return self.stoi.get(token, self._default_index)
 
     def __call__(self, tokens: list) -> list:
-        """Allows callable lookup for a list of tokens (e.g., vocab(gene_list))."""
-        return [self[token] for token in tokens]
+        """
+        Converts a list or a NumPy array of tokens to their corresponding indices.
+        This method is optimized for NumPy arrays.
+        """
+        if isinstance(tokens, list) and tokens and isinstance(tokens[0], str):
+            return [self.stoi.get(token, self._default_index) for token in tokens]
+
+        if isinstance(tokens, list) and tokens and isinstance(tokens[0], list):
+            return [[self.stoi.get(token, self._default_index) for token in sublist] for sublist in tokens]
+
 
     def set_default_index(self, index: int):
         """Sets the index to return for out-of-vocabulary tokens."""
@@ -67,7 +82,25 @@ class SimpleVocab:
     def get_itos(self):
         """Returns the list of tokens in order of their index."""
         return self.itos
+    
+    def from_json(self, json_file: str, special_tokens: list = None):
+        with open(json_file) as f:
+            stoi = json.load(f)
+        self.special_tokens = [s for s in special_tokens if s in stoi] if special_tokens else []
+        self.stoi = stoi
+        self.itos = {i:t for i,t in enumerate(stoi)}
 
+        # Create sorted arrays for fast NumPy lookups
+        if "<pad>" in self.stoi:
+            self.set_default_index(self.stoi["<pad>"])
+        elif "<unk>" in self.stoi:
+            self.set_default_index(self.stoi["<unk>"])
+        
+
+    def append(self, token: str):
+        assert token not in self.stoi and token and type(token) == str, 'cannot append token, please check if token is str, not empty and new'
+        self.itos[len(self.itos)] = token
+        self.stoi[token] = len(self.itos)
 
 
 
@@ -142,10 +175,11 @@ def pad_batch(
     max_len: int,
     vocab: SimpleVocab,
     pad_token: str = "<pad>",
-    pad_value: int = 0,
+    pad_value: int = -2,
     cls_appended: bool = True,
     vocab_mod: SimpleVocab = None,
     sample_indices: List[np.ndarray] = None,
+    rng: default_rng = None
 ) -> Tuple[Dict[str, torch.Tensor], List[np.ndarray]]:
     """
     Pad a batch of data.
@@ -164,6 +198,7 @@ def pad_batch(
             - A dictionary of padded tensors for 'genes' and 'values'.
             - A list of numpy arrays with the indices used for each sample.
     """
+    rng = default_rng() if rng is None else rng # much faster sampling of genes
     max_ori_len = max(len(batch[i][0]) for i in range(len(batch)))
     max_len = min(max_ori_len, max_len)
 
@@ -186,10 +221,10 @@ def pad_batch(
             # Otherwise, perform random sampling
             else:
                 if not cls_appended:
-                    idx = np.random.choice(len(gene_ids), max_len, replace=False)
+                    idx = rng.choice(len(gene_ids), max_len, replace=False)
                 else:
                     # sample from non-CLS tokens and add CLS token back
-                    idx = np.random.choice(len(gene_ids) - 1, max_len - 1, replace=False)
+                    idx = rng.choice(len(gene_ids) - 1, max_len - 1, replace=False)
                     idx = idx + 1
                     idx = np.insert(idx, 0, 0)
             
@@ -309,8 +344,9 @@ def random_mask_value(
     values: Union[torch.Tensor, np.ndarray],
     mask_ratio: float = 0.15,
     mask_value: int = -1,
-    pad_value: int = 0,
-    cls_value: int = -3
+    pad_value: int = -2,
+    cls_value: int = -3,
+    rng: default_rng = None
 ) -> torch.Tensor:
     """
     Randomly mask a batch of data.
@@ -325,6 +361,7 @@ def random_mask_value(
     Returns:
         torch.Tensor: A tensor of masked data.
     """
+    rng = default_rng() or rng # much faster sampling without replacement
     if isinstance(values, torch.Tensor):
         # it is crutial to clone the tensor, otherwise it changes the original tensor
         values = values.clone().detach().numpy()
@@ -335,6 +372,6 @@ def random_mask_value(
         row = values[i]
         non_padding_idx = np.intersect1d(np.nonzero(row - pad_value), np.nonzero(row - cls_value)) # only mask non padding or cls positions
         n_mask = int(len(non_padding_idx) * mask_ratio)
-        mask_idx = np.random.choice(non_padding_idx, n_mask, replace=False)
+        mask_idx = rng.choice(non_padding_idx, n_mask, replace=False)
         row[mask_idx] = mask_value
     return torch.from_numpy(values).float()

@@ -170,10 +170,9 @@ class PerturbationTFModel(TransformerModel):
         # add perturbation encoder
         # variables are defined in super class
         d_model = self.d_model
-        self.pert_pad_id = kwargs.get("pert_pad_id", 2) 
-        pert_pad_id = self.pert_pad_id
+        self.pert_pad_id = kwargs.get("pert_pad_id", None) 
         #self.pert_encoder = nn.Embedding(3, d_model, padding_idx=pert_pad_id)
-        self.pert_encoder = PertLabelEncoder(n_pert, d_model, padding_idx=pert_pad_id)
+        self.pert_encoder = PertLabelEncoder(n_pert, d_model, padding_idx=self.pert_pad_id)
 
         self.pert_exp_encoder = PertExpEncoder (d_model) 
 
@@ -189,18 +188,19 @@ class PerturbationTFModel(TransformerModel):
         self.n_pert = n_pert
         self.n_cls = kwargs.get("n_cls", 1) 
         
-        if self.transformer_encoder is not None:
-            nlayers = self.transformer_encoder.num_layers
-        else:
-            nlayers = 2
+        
         if kwargs.get('use_fast_transformer', False):
+            nlayers = self.transformer_encoder.num_layers if self.transformer_encoder is not None else 2
+            d_hid = self.transformer_encoder.layers[0].linear1.out_features if self.transformer_encoder is not None else 32
+            nhead = self.transformer_encoder.layers[0].self_attn.num_heads if self.transformer_encoder is not None else 4
             try:
                 from perttf.model.modules import FlashTransformerEncoderLayerVarlen, SDPATransformerEncoderLayer
+                
                 encoder_layers = FlashTransformerEncoderLayerVarlen(
                     d_model,
-                    kwargs.get('nhead', 4),
-                    kwargs.get('d_hid', 32),
-                    kwargs.get('dropout', 0.4),
+                    kwargs.get('nhead', nhead),
+                    kwargs.get('d_hid', d_hid),
+                    kwargs.get('dropout', 0.1),
                     batch_first=True,
                     norm_scheme=self.norm_scheme,
                 )

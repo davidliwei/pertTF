@@ -20,7 +20,9 @@ def generate_config(parameter_dict,
 
     # settings for input and preprocessing
 
-    parameter_dict['special_tokens'] = [parameter_dict['pad_token'], "<cls>", "<eoc>"]
+    parameter_dict['special_tokens'] = [parameter_dict.get('pad_token', '<pad>'), 
+                                        parameter_dict.get('cls_token', '<cls>'), 
+                                        "<eoc>"]
 
 
     #mask_ratio = config.mask_ratio
