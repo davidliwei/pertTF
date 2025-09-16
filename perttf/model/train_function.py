@@ -578,7 +578,7 @@ def eval_testdata(
         else:
             next_cell_prediction = False
         if next_cell_prediction:
-            perturbation_labels_next = adata_t.obs["genotype"].tolist()  # make sure count from 0
+            perturbation_labels_next = adata_t.obs["genotype_next"].tolist()  # make sure count from 0
 
     if next_cell_prediction:
         perturbation_labels_next = np.array(perturbation_labels_next)
