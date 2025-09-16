@@ -108,7 +108,7 @@ def process_and_log_umaps(adata_t, config, epoch: int, eval_key: str, save_dir: 
         print(f"[Process {os.getpid()}] Finished processing for epoch {epoch}, key '{eval_key}'.")
 
         # added: write validation adata_t back to disk
-        adata_t.write_h5ad(save_dir / f'adata_last_validation_{eval_key}.h5ad')
+        # adata_t.write_h5ad(save_dir / f'adata_last_validation_{eval_key}.h5ad')
 
     except Exception as e:
         print(f"Error in background UMAP process: {e}")
