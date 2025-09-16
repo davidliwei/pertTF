@@ -165,7 +165,7 @@ class PerturbationTFModel(TransformerModel):
                  n_ps: int,
                  *args, **kwargs):
         self.pred_lochness_next = kwargs.pop("pred_lochness_next", False) # additional optional parameter to ask whether to predict lochness scores
-        
+        ps_decoder2_nlayer = kwargs.pop("ps_decoder2_nlayer",3) # additional parameter to specify ps_decoder2 nlayer
         super().__init__(*args, **kwargs)
         # add perturbation encoder
         # variables are defined in super class
@@ -218,7 +218,7 @@ class PerturbationTFModel(TransformerModel):
         else:
             self.ps_decoder = None
         if self.pred_lochness_next:
-            self.ps_decoder2 = PSDecoder(d_model, 1, nlayers = nlayers_pert, geneinput = True)
+            self.ps_decoder2 = PSDecoder(d_model, 1, nlayers = ps_decoder2_nlayer, geneinput = True)
         else:
             self.ps_decoder2 = None
 
