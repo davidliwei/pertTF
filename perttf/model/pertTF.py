@@ -17,7 +17,7 @@ import torch.distributed as dist
 import scgpt as scg
 from scgpt.model import TransformerModel
 from torch.nn import TransformerEncoder
-
+from perttf.model.modules import ExpressionActivate
 
 class PerturbationDecoder(nn.Module):
     """
@@ -167,6 +167,7 @@ class PerturbationTFModel(TransformerModel):
         self.pred_lochness_next = kwargs.pop("pred_lochness_next", False) # additional optional parameter to ask whether to predict lochness scores
         ps_decoder2_nlayer = kwargs.pop("ps_decoder2_nlayer",3) # additional parameter to specify ps_decoder2 nlayer
         super().__init__(*args, **kwargs)
+        self.expr_act = ExpressionActivate(activation = 'linear')
         # add perturbation encoder
         # variables are defined in super class
         d_model = self.d_model
@@ -374,9 +375,9 @@ class PerturbationTFModel(TransformerModel):
         # zero_probs is actually non-zero probability for the Bernoulli
         if self.explicit_zero_prob and do_sample:
             bernoulli = Bernoulli(probs=mlm_output["zero_probs"])
-            output["mlm_output"] = bernoulli.sample() * mlm_output["pred"]
+            output["mlm_output"] = bernoulli.sample() * self.expr_act(mlm_output["pred"])
         else:
-            output["mlm_output"] = mlm_output["pred"]  # (batch, seq_len)
+            output["mlm_output"] = self.expr_act(mlm_output["pred"])  # (batch, seq_len)
         if self.explicit_zero_prob:
             output["mlm_zero_probs"] = mlm_output["zero_probs"]
 
@@ -453,13 +454,13 @@ class PerturbationTFModel(TransformerModel):
             )
             if self.explicit_zero_prob and do_sample:
                 bernoulli = Bernoulli(probs=mvc_output["zero_probs"])
-                output["mvc_output"] = bernoulli.sample() * mvc_output["pred"]
+                output["mvc_output"] = bernoulli.sample() * self.expr_act(mvc_output["pred"])
 
                 bernoulli_n = Bernoulli(probs=mvc_output_next["zero_probs"])
-                output["mvc_output_next"] = bernoulli.sample() * mvc_output_next["pred"]
+                output["mvc_output_next"] = bernoulli_n.sample() * self.expr_act(mvc_output_next["pred"])
             else:
-                output["mvc_output"] = mvc_output["pred"]  # (batch, seq_len)
-                output["mvc_output_next"] = mvc_output_next["pred"]  # (batch, seq_len)
+                output["mvc_output"] = self.expr_act(mvc_output["pred"])  # (batch, seq_len)
+                output["mvc_output_next"] = self.expr_act(mvc_output_next["pred"]) # (batch, seq_len)
             if self.explicit_zero_prob:
                 output["mvc_zero_probs"] = mvc_output["zero_probs"]
                 output["mvc_zero_probs_next"] = mvc_output_next["zero_probs"]
@@ -676,9 +677,9 @@ class PerturbationTFModel(TransformerModel):
                 else:
                     mvc_output_next = mvc_output
 
-                mlm_pred, mlm_zero_probs = mlm_output['pred'], mlm_output['zero_probs'] if self.explicit_zero_prob else 1
-                mvc_pred, mvc_zero_probs = mvc_output['pred'], mvc_output['zero_probs'] if self.explicit_zero_prob else 1
-                mvc_pred_next, mvc_zero_probs_next = mvc_output_next['pred'], mvc_output_next['zero_probs'] if self.explicit_zero_prob else 1
+                mlm_pred, mlm_zero_probs =  self.expr_act(mlm_output['pred']), mlm_output['zero_probs'] if self.explicit_zero_prob else 1
+                mvc_pred, mvc_zero_probs =  self.expr_act(mvc_output['pred']), mvc_output['zero_probs'] if self.explicit_zero_prob else 1
+                mvc_pred_next, mvc_zero_probs_next =  self.expr_act(mvc_output_next['pred']), mvc_output_next['zero_probs'] if self.explicit_zero_prob else 1
                 if output_to_cpu:
                     mlm_pred, mlm_zero_probs = mlm_pred.cpu(), mlm_zero_probs.cpu() if self.explicit_zero_prob else 1
                     mvc_pred, mvc_zero_probs =  mvc_pred.cpu(), mvc_zero_probs.cpu() if self.explicit_zero_prob else 1
@@ -694,9 +695,9 @@ class PerturbationTFModel(TransformerModel):
 
 
         if predict_expr:
-            expr_dict['mlm_expr'] = (mlm_outputs, mlm_zero_outputs)
-            expr_dict['mvc_expr'] = (mvc_outputs, mvc_zero_outputs)
-            expr_dict['mvc_next_expr'] = (mvc_next_outputs, mvc_next_zero_outputs)
+            expr_dict['mlm_expr'] = (mlm_outputs[:,1:], mlm_zero_outputs[:,1:])
+            expr_dict['mvc_expr'] = (mvc_outputs[:,1:], mvc_zero_outputs[:,1:])
+            expr_dict['mvc_next_expr'] = (mvc_next_outputs[:,1:], mvc_next_zero_outputs[:,1:])
 
         return outputs, outputs_next, pert_outputs, cls_outputs, ps_outputs, ps_outputs_next, expr_dict
 

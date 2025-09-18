@@ -508,6 +508,7 @@ def eval_testdata(
     epoch = 0,
     eval_key = "", # titles for evaluation
     make_plots = True,
+    mask = False,
     predict_expr = False
 ) -> Optional[Dict]: # Returns a dictionary containing the AnnData object
     """
@@ -613,7 +614,15 @@ def eval_testdata(
 
 
         all_gene_ids, all_values = tokenized_all["genes"], tokenized_all["values"]
-
+        input_values = all_values.float()
+        if mask:
+            masked_values = random_mask_value(
+                all_values, mask_ratio=config.mask_ratio,
+                mask_value=config.mask_value, pad_value=config.pad_value,
+                cls_value= config.cls_value
+            )
+            input_values = masked_values.float()
+        masked_positions = input_values.eq(config.mask_value).cpu().numpy().astype(np.int0)
         if next_layer_key in adata_t.layers:
             tokenized_all_next, _ = tokenize_and_pad_batch(
                 all_counts_next,
@@ -627,17 +636,18 @@ def eval_testdata(
                 sample_indices=gene_idx_list
             )
             all_gene_ids_next, all_values_next = tokenized_all_next["genes"], tokenized_all_next["values"]
-
+        
         src_key_padding_mask = all_gene_ids.eq(vocab[config.pad_token])
         with torch.no_grad(), torch.cuda.amp.autocast(enabled=config.amp):
-            #cell_embeddings = model.encode_batch(all_gene_ids,all_values.float(),
-            #    src_key_padding_mask=src_key_padding_mask,
-            #    batch_size=config.batch_size,
-            #    batch_labels=torch.from_numpy(batch_ids).long() if config.use_batch_label else None, # if config.DSBN else None,
-            #    time_step=0,
-            #    return_np=True,
-            #)
-            cell_embeddings, cell_embeddings_next, pert_preds, cls_preds, ps_preds, ps_preds_next, expr_dict = model.encode_batch_with_perturb(all_gene_ids,all_values.float(),
+            (cell_embeddings, 
+             cell_embeddings_next, 
+             pert_preds, 
+             cls_preds, 
+             ps_preds, 
+             ps_preds_next, 
+             expr_dict) = model.encode_batch_with_perturb(
+                all_gene_ids,
+                input_values,
                 src_key_padding_mask=src_key_padding_mask,
                 batch_size=config.batch_size,
                 batch_labels=torch.from_numpy(batch_ids).long() if config.use_batch_label else None, # if config.DSBN else None,
@@ -693,6 +703,8 @@ def eval_testdata(
 
         X_pert_cls_probs = np.exp(cls_preds) / np.sum(np.exp(cls_preds), axis=1, keepdims=True)
         adata_t.obsm['X_cls_pred_probs'] = X_pert_cls_probs
+        adata_t.obsm['mask'] = masked_positions
+        adata_t.obsm['gene_ids'] = np.array(gene_idx_list)
         label_predictions_cls = np.argmax(X_pert_cls_probs, axis=1)
         index_to_celltype = {v: k for k, v in cell_type_to_index.items()}
         predicted_celltypes = [index_to_celltype[i] for i in label_predictions_cls]

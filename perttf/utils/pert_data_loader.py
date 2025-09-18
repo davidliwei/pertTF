@@ -298,6 +298,10 @@ class PertBatchCollator:
         self.pad_value = config.get('pad_value', -2)
         self.mask_ratio = config.get('mask_ratio', 0.15)
         self.mask_value = config.get('mask_value', -1)
+        self.nonzero_prop = config.get('nonzero_prop', 0.7)
+        self.simple_sampling = config.get('simple_sampling', True)
+        self.fix_nonzero_prop = config.get('fix_nonzero_prop', False)
+        
 
     def __call__(self, batch: list) -> dict:
         """
@@ -319,13 +323,15 @@ class PertBatchCollator:
             np.array(expr_list), self.gene_ids, max_len=max_seq_len,cls_token=self.cls_token,
             vocab=self.vocab, pad_token=self.pad_token, pad_value=self.pad_value,
             append_cls=self.append_cls, include_zero_gene=self.include_zero_gene, 
-            cls_value=self.cls_value
+            cls_value=self.cls_value, simple_sampling = self.simple_sampling,
+            fix_nonzero_prop=self.fix_nonzero_prop, nonzero_prop=self.nonzero_prop
         )
         tokenized_next, _ = tokenize_and_pad_batch(
             np.array(expr_next_list), self.gene_ids, max_len=max_seq_len, cls_token=self.cls_token,
             vocab=self.vocab, pad_token=self.pad_token, pad_value=self.pad_value,
             append_cls=self.append_cls, include_zero_gene=self.include_zero_gene, 
-            sample_indices=gene_idx_list, cls_value=self.cls_value
+            sample_indices=gene_idx_list, cls_value=self.cls_value, simple_sampling = self.simple_sampling,
+            fix_nonzero_prop=self.fix_nonzero_prop, nonzero_prop=self.nonzero_prop
         )
         
         # 3. Apply random masking for this batch
