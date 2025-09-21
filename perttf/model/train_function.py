@@ -174,7 +174,7 @@ def train(model: nn.Module,
             loss = config.this_weight * loss_mse
             metrics_to_log = {"train/mse": loss_mse.item()}
             if "contrastive_dict" in output_dict:
-                """
+                
                 loss_cce = CCE_loss(
                     output_dict["contrastive_dict"]['cell1_emb'],
                     output_dict["contrastive_dict"]['cell1_emb_next'],
@@ -198,8 +198,8 @@ def train(model: nn.Module,
                         celltype_labels*1000+perturbation_labels
                         
                     ]))
-
-                loss = loss+50*loss_cce
+                """
+                loss = loss+loss_cce
                 metrics_to_log["train/cce"] =  loss_cce.item()
             # next value?
             loss_mse_next = criterion(

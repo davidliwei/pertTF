@@ -345,84 +345,7 @@ def hard_triplet_loss(embeddings: torch.Tensor, labels: torch.Tensor, margin: fl
     return loss.mean()
 
 
-def CCE_loss(
-    input_emb: torch.Tensor,
-    input_to_pert_emb: torch.Tensor,
-    pert_emb: torch.Tensor,
-    pert_to_input_emb: torch.Tensor,
-    lambda_fwd: float = 10.0,
-    lambda_rev: float = 10.0,
-    # Optional arguments for triplet loss on all 4 embeddings
-    input_labels: torch.Tensor = None,
-    pert_labels: torch.Tensor = None,
-    lambda_triplet: float = 1.0,
-    triplet_margin: float = 0.5
-) -> torch.Tensor:
-    """
-    Calculates the contrastive losses between cell embedding and perturbed cell embeddings.
 
-    This loss combins up to three components:
-    2. Forward Consistency Loss (MSE): Enforces that the predicted perturbed
-       embedding is close to the true perturbed embedding.
-    3. Reverse Consistency Loss (MSE): Enforces cycle consistency.
-    4. Triplet Loss (Optional): Stacks all 4 embeddings and uses labels to structure the space.
-
-    Args:
-        decoded_expression (torch.Tensor): The final output from the decoder.
-        true_expression (torch.Tensor): The ground truth expression.
-        input_emb (torch.Tensor): The embedding of the original input cell.
-        pert_to_input_emb (torch.Tensor): The reverse-perturbed embedding.
-        input_to_pert_emb (torch.Tensor): The predicted perturbed embedding.
-        pert_emb (torch.Tensor): The true embedding of the perturbed cell.
-        lambda_fwd (float): Weight for the forward consistency loss.
-        lambda_rev (float): Weight for the reverse consistency loss.
-        input_labels (torch.Tensor, optional): Labels for the input cells.
-        pert_labels (torch.Tensor, optional): Labels for the perturbed cells.
-        lambda_triplet (float): Weight for the triplet loss.
-        triplet_margin (float): Margin for the triplet loss.
-
-    Returns:
-        torch.Tensor: A single scalar value representing the total loss.
-    """
-
-
-
-    # Base total loss
-    total_loss = perturb_embedding_loss(input_emb, input_to_pert_emb, pert_emb, pert_to_input_emb, input_labels, pert_labels, lambda_fwd, lambda_rev)
-
-    # 4. Optional Triplet Loss on stacked embeddings
-    if input_labels is not None and pert_labels is not None:
-        # Stack all four embeddings into a single large batch
-        # New batch size will be 4 * original_batch_size
-       # mask = input_labels != pert_labels
-       # mask = mask.unsqueeze(1)
-       #loss_fwd_consistency = loss_fwd_consistency / F.mse_loss(input_to_pert_emb*mask, input_emb*mask) 
-       # loss_rev_consistency = loss_rev_consistency / F.mse_loss(pert_to_input_emb*mask, pert_emb*mask) 
-
-        stacked_embeddings = torch.cat([
-            input_emb,
-            input_to_pert_emb,
-            pert_emb,
-            pert_to_input_emb,
-            
-        ], dim=0)
-
-        # Create corresponding labels for the stacked embeddings
-        # input_emb and pert_to_input_emb share the input_labels
-        # input_to_pert_emb and pert_emb share the pert_labels
-        stacked_labels = torch.cat([
-            input_labels,
-            pert_labels,
-            pert_labels,
-            input_labels
-            
-        ], dim=0)
-        
-        loss_triplet = all_triplet_loss(stacked_embeddings, stacked_labels, margin=triplet_margin)
-        #print(loss_triplet)
-        total_loss += lambda_triplet * loss_triplet
-
-    return total_loss
 
 
 
@@ -556,105 +479,8 @@ def aggregate_losses(config, input_dict, output_dict, loss= 0, metric_prefix = '
     return loss, metrics_to_log
 
 
-
-class SupConLoss(nn.Module):
-    """Supervised Contrastive Learning: https://arxiv.org/pdf/2004.11362.pdf.
-    It also supports the unsupervised contrastive loss in SimCLR"""
-    def __init__(self, temperature=0.07, contrast_mode='all',
-                 base_temperature=0.07):
-        super(SupConLoss, self).__init__()
-        self.temperature = temperature
-        self.contrast_mode = contrast_mode
-        self.base_temperature = base_temperature
-
-    def forward(self, features, labels=None, mask=None):
-        """Compute loss for model. If both `labels` and `mask` are None,
-        it degenerates to SimCLR unsupervised loss:
-        https://arxiv.org/pdf/2002.05709.pdf
-
-        Args:
-            features: hidden vector of shape [bsz, n_views, ...].
-            labels: ground truth of shape [bsz].
-            mask: contrastive mask of shape [bsz, bsz], mask_{i,j}=1 if sample j
-                has the same class as sample i. Can be asymmetric.
-        Returns:
-            A loss scalar.
-        """
-        device = (torch.device('cuda')
-                  if features.is_cuda
-                  else torch.device('cpu'))
-
-        if len(features.shape) < 3:
-            raise ValueError('`features` needs to be [bsz, n_views, ...],'
-                             'at least 3 dimensions are required')
-        if len(features.shape) > 3:
-            features = features.view(features.shape[0], features.shape[1], -1)
-
-        batch_size = features.shape[0]
-        if labels is not None and mask is not None:
-            raise ValueError('Cannot define both `labels` and `mask`')
-        elif labels is None and mask is None:
-            mask = torch.eye(batch_size, dtype=torch.float32).to(device)
-        elif labels is not None:
-            labels = labels.contiguous().view(-1, 1)
-            if labels.shape[0] != batch_size:
-                raise ValueError('Num of labels does not match num of features')
-            mask = torch.eq(labels, labels.T).float().to(device)
-        else:
-            mask = mask.float().to(device)
-
-        contrast_count = features.shape[1]
-        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
-        if self.contrast_mode == 'one':
-            anchor_feature = features[:, 0]
-            anchor_count = 1
-        elif self.contrast_mode == 'all':
-            anchor_feature = contrast_feature
-            anchor_count = contrast_count
-        else:
-            raise ValueError('Unknown mode: {}'.format(self.contrast_mode))
-
-        # compute logits
-        anchor_dot_contrast = torch.div(
-            torch.matmul(anchor_feature, contrast_feature.T),
-            self.temperature)
-        # for numerical stability
-        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
-        logits = anchor_dot_contrast - logits_max.detach()
-
-        # tile mask
-        mask = mask.repeat(anchor_count, contrast_count)
-        # mask-out self-contrast cases
-        logits_mask = torch.scatter(
-            torch.ones_like(mask),
-            1,
-            torch.arange(batch_size * anchor_count).view(-1, 1).to(device),
-            0
-        )
-        mask = mask * logits_mask
-
-        # compute log_prob
-        exp_logits = torch.exp(logits) * logits_mask
-        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
-
-        # compute mean of log-likelihood over positive
-        # modified to handle edge cases when there is no positive pair
-        # for an anchor point. 
-        # Edge case e.g.:- 
-        # features of shape: [4,1,...]
-        # labels:            [0,1,1,2]
-        # loss before mean:  [nan, ..., ..., nan] 
-        mask_pos_pairs = mask.sum(1)
-        mask_pos_pairs = torch.where(mask_pos_pairs < 1e-6, 1, mask_pos_pairs)
-        mean_log_prob_pos = (mask * log_prob).sum(1) / mask_pos_pairs
-
-        # loss
-        loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
-        loss = loss.view(anchor_count, batch_size).mean()
-
-        return loss
     
-def SUPCON_loss(features, labels=None, mask=None, contrast_mode = 'all', temperature = 0.5, base_temperature = 0.5):
+def SUPCON_loss(features, labels=None, mask=None, contrast_mode = 'all', temperature = 0.07, base_temperature = 0.5):
     """Compute loss for model. If both `labels` and `mask` are None,
     it degenerates to SimCLR unsupervised loss:
     https://arxiv.org/pdf/2002.05709.pdf
@@ -678,6 +504,7 @@ def SUPCON_loss(features, labels=None, mask=None, contrast_mode = 'all', tempera
         features = features.view(features.shape[0], features.shape[1], -1)
 
     batch_size = features.shape[0]
+    dim = features.shape[-1]
     if labels is not None and mask is not None:
         raise ValueError('Cannot define both `labels` and `mask`')
     elif labels is None and mask is None:
@@ -704,7 +531,7 @@ def SUPCON_loss(features, labels=None, mask=None, contrast_mode = 'all', tempera
     # compute logits
     anchor_dot_contrast = torch.div(
         torch.matmul(anchor_feature, contrast_feature.T),
-        temperature)
+        temperature*dim)
     # for numerical stability
     logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
     logits = anchor_dot_contrast - logits_max.detach()
@@ -740,3 +567,83 @@ def SUPCON_loss(features, labels=None, mask=None, contrast_mode = 'all', tempera
     loss = loss.view(anchor_count, batch_size).mean()
 
     return loss
+
+
+def CCE_loss(
+    input_emb: torch.Tensor,
+    input_to_pert_emb: torch.Tensor,
+    pert_emb: torch.Tensor,
+    pert_to_input_emb: torch.Tensor,
+    lambda_fwd: float = 10.0,
+    lambda_rev: float = 10.0,
+    # Optional arguments for triplet loss on all 4 embeddings
+    input_labels: torch.Tensor = None,
+    pert_labels: torch.Tensor = None,
+    lambda_triplet: float = 1.0,
+    triplet_margin: float = 0.5
+) -> torch.Tensor:
+    """
+    Calculates the contrastive losses between cell embedding and perturbed cell embeddings.
+
+    This loss combins up to three components:
+    2. Forward Consistency Loss (MSE): Enforces that the predicted perturbed
+       embedding is close to the true perturbed embedding.
+    3. Reverse Consistency Loss (MSE): Enforces cycle consistency.
+    4. Triplet Loss (Optional): Stacks all 4 embeddings and uses labels to structure the space.
+
+    Args:
+        decoded_expression (torch.Tensor): The final output from the decoder.
+        true_expression (torch.Tensor): The ground truth expression.
+        input_emb (torch.Tensor): The embedding of the original input cell.
+        pert_to_input_emb (torch.Tensor): The reverse-perturbed embedding.
+        input_to_pert_emb (torch.Tensor): The predicted perturbed embedding.
+        pert_emb (torch.Tensor): The true embedding of the perturbed cell.
+        lambda_fwd (float): Weight for the forward consistency loss.
+        lambda_rev (float): Weight for the reverse consistency loss.
+        input_labels (torch.Tensor, optional): Labels for the input cells.
+        pert_labels (torch.Tensor, optional): Labels for the perturbed cells.
+        lambda_triplet (float): Weight for the triplet loss.
+        triplet_margin (float): Margin for the triplet loss.
+
+    Returns:
+        torch.Tensor: A single scalar value representing the total loss.
+    """
+
+
+
+    # Base total loss
+    total_loss = perturb_embedding_loss(input_emb, input_to_pert_emb, pert_emb, pert_to_input_emb, input_labels, pert_labels, lambda_fwd, lambda_rev)
+
+    # 4. Optional Triplet Loss on stacked embeddings
+    if input_labels is not None and pert_labels is not None:
+        # Stack all four embeddings into a single large batch
+        # New batch size will be 4 * original_batch_size
+       # mask = input_labels != pert_labels
+       # mask = mask.unsqueeze(1)
+       #loss_fwd_consistency = loss_fwd_consistency / F.mse_loss(input_to_pert_emb*mask, input_emb*mask) 
+       # loss_rev_consistency = loss_rev_consistency / F.mse_loss(pert_to_input_emb*mask, pert_emb*mask) 
+
+        stacked_embeddings = torch.cat([
+            input_emb,
+            input_to_pert_emb,
+            pert_emb,
+            pert_to_input_emb,
+            
+        ], dim=0).unsqueeze(1)
+
+        # Create corresponding labels for the stacked embeddings
+        # input_emb and pert_to_input_emb share the input_labels
+        # input_to_pert_emb and pert_emb share the pert_labels
+        stacked_labels = torch.cat([
+            input_labels,
+            pert_labels,
+            pert_labels,
+            input_labels
+            
+        ], dim=0)
+        
+        loss_triplet = SUPCON_loss(features = stacked_embeddings, labels = stacked_labels)
+        #print(loss_triplet)
+        total_loss += lambda_triplet * loss_triplet
+
+    return total_loss
