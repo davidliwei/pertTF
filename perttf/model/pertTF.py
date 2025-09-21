@@ -420,7 +420,7 @@ class PerturbationTFModel(TransformerModel):
             cell2_next = None
             if inv_perturbation is not None:
                 inv_pert_emb_next = self.pert_encoder(inv_perturbation)
-                inv_pert_emb_next = pert_emb_next * inv_pert_scale if inv_pert_scale is not None else pert_emb_next
+                inv_pert_emb_next = inv_pert_emb_next * inv_pert_scale if inv_pert_scale is not None else inv_pert_emb_next
                 cell2_next = self.pert_exp_encoder(cell2, inv_pert_emb_next)
 
             output["contrastive_dict"] = dict(
