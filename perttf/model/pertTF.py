@@ -509,7 +509,8 @@ class PerturbationTFModel(TransformerModel):
         output_to_cpu: bool = True,
         time_step: Optional[int] = None,
         return_np: bool = False,
-        predict_expr = False
+        predict_expr = False,
+        mvc_src: Tensor = None # optional MVC tensor of gene ids for MVC decoder
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         revised scgpt.TransformerModel.encode_batch but with additional perturbation
@@ -561,10 +562,11 @@ class PerturbationTFModel(TransformerModel):
         
         expr_dict = {}
         if predict_expr:
-            shape_expr = (N, src.size(1))
-            mlm_outputs, mlm_zero_outputs = array_func(shape_expr, dtype=float32_), array_func(shape_expr, dtype=float32_)
-            mvc_outputs, mvc_zero_outputs = array_func(shape_expr, dtype=float32_), array_func(shape_expr, dtype=float32_)
-            mvc_next_outputs, mvc_next_zero_outputs = array_func(shape_expr, dtype=float32_), array_func(shape_expr, dtype=float32_)
+            mlm_expr_shape = (N, src.size(1)) 
+            mvc_expr_shape = (N, src.size(1)) if mvc_src is None else (N, mvc_src.size(1))
+            mlm_outputs, mlm_zero_outputs = array_func(mlm_expr_shape, dtype=float32_), array_func(mlm_expr_shape, dtype=float32_)
+            mvc_outputs, mvc_zero_outputs = array_func(mvc_expr_shape, dtype=float32_), array_func(mvc_expr_shape, dtype=float32_)
+            mvc_next_outputs, mvc_next_zero_outputs = array_func(mvc_expr_shape, dtype=float32_), array_func(mvc_expr_shape, dtype=float32_)
 
         for i in trange(0, N, batch_size):
             src_d = src[i : i + batch_size].to(device)
@@ -660,19 +662,20 @@ class PerturbationTFModel(TransformerModel):
                 ),
                 # else transformer_output + batch_emb.unsqueeze(1),
                 )
+                cur_gene_token_embs = self.encoder(mvc_src_d) if mvc_src_d is not None else self.cur_gene_token_embs
                 mvc_output = self.mvc_decoder(
                                 cell_emb if not self.use_batch_labels
                                 else torch.cat([cell_emb, batch_emb], 
                                 dim=1
                                 ), # else cell_emb + batch_emb,
-                            self.cur_gene_token_embs,)
+                            cur_gene_token_embs,)
                 if pert_labels_next_d is not None:
                     mvc_output_next = self.mvc_decoder(
                                 cell_emb_next if not self.use_batch_labels
                                 else torch.cat([cell_emb_next, batch_emb], 
                                 dim=1
                                 ), # else cell_emb + batch_emb,
-                            self.cur_gene_token_embs,)
+                            cur_gene_token_embs,)
                 else:
                     mvc_output_next = mvc_output
 

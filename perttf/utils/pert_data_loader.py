@@ -473,12 +473,12 @@ class PertTFUniDataManager:
         loader = self._create_loaders_from_dataset(data, full_token)
         return data, loader
 
-    def get_train_valid_loaders(self, test_size: float = 0.1, train_indices = None, valid_indices = None, full_token_validate  = False):
+    def get_train_valid_loaders(self, test_size: float = 0.1, train_indices = None, valid_indices = None, full_token_validate  = False, random_state = None):
         """Provides a single, standard train/validation split."""
         print(f"Creating a single train/validation split (test_size={test_size})...")
         if train_indices is None or valid_indices is None:
             indices = np.arange(self.adata.n_obs)
-            train_indices, valid_indices = train_test_split(indices, test_size=test_size, shuffle=True)
+            train_indices, valid_indices = train_test_split(indices, test_size=test_size, shuffle=True, random_state=random_state)
         else:
             assert len(set(train_indices).intersection(valid_indices)) == 0, 'training data and validation data are not separate'
             print('overiding random train/valid split with provided indices')
