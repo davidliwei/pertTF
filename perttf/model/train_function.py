@@ -699,6 +699,7 @@ def eval_testdata(
                         else:
                             perturbation_labels_next.append(curr)
                 pert_scale = np.array([np.array([-1.0]) if perturbed and adata_t.obs.genotype.iloc[i] != 'WT' else np.array([1.0]) for i, perturbed in enumerate(adata_t.obs.genotype != adata_t.obs.genotype_next)])
+    
     next_genotype = np.array([genotype_to_index[genotype] for genotype in adata_t.obs["genotype_next"].tolist()])
     if config.next_cell_pred_type ==  'lochness':
         if hasattr(config, "pred_lochness_next") and config.pred_lochness_next >0:
@@ -723,7 +724,13 @@ def eval_testdata(
 
     batch_ids = np.array(batch_ids)
 
-
+    if not config.simple_sampling:
+        max_seq_len = 10000
+        cls_gene_ids = np.insert(gene_ids, 0, vocab[config.cls_token]) # default should always be to insert a cls token at the front
+        full_gene_ids = torch.stack([torch.from_numpy(cls_gene_ids).long() for i in range(adata_t.shape[0])], dim = 0)
+    else:
+        max_seq_len = config.max_seq_len
+        full_gene_ids = None
     # Evaluate cls cell embeddings
     if "cls" in include_types:
         if logger is not None:
@@ -731,12 +738,15 @@ def eval_testdata(
         tokenized_all, gene_idx_list= tokenize_and_pad_batch(
             all_counts,
             gene_ids,
-            max_len=config.max_seq_len,
+            max_len=max_seq_len,
             vocab=vocab,
             pad_token=config.pad_token,
             pad_value=config.pad_value,
             append_cls=True,  # append <cls> token at the beginning
             include_zero_gene=True,
+            simple_sampling = config.simple_sampling,
+            nonzero_prop = config.nonzero_prop,
+            fix_nonzero_prop =  config.fix_nonzero_prop
         )
 
 
@@ -754,13 +764,16 @@ def eval_testdata(
             tokenized_all_next, _ = tokenize_and_pad_batch(
                 all_counts_next,
                 gene_ids,
-                max_len=config.max_seq_len,
+                max_len=max_seq_len,
                 vocab=vocab,
                 pad_token=config.pad_token,
                 pad_value=config.pad_value,
                 append_cls=True,  # append <cls> token at the beginning
                 include_zero_gene=True,
-                sample_indices=gene_idx_list
+                sample_indices=gene_idx_list,
+                simple_sampling = config.simple_sampling,
+                nonzero_prop = config.nonzero_prop,
+                fix_nonzero_prop =  config.fix_nonzero_prop
             )
             all_gene_ids_next, all_values_next = tokenized_all_next["genes"], tokenized_all_next["values"]
         
@@ -784,7 +797,8 @@ def eval_testdata(
                 pert_scale = torch.from_numpy(pert_scale).float() if reciprical_sampling else None,
                 time_step=0,
                 return_np=True,
-                predict_expr = predict_expr
+                predict_expr = predict_expr,
+                mvc_src = full_gene_ids
             )
 
         cell_embeddings = cell_embeddings / np.linalg.norm(

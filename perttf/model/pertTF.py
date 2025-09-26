@@ -189,7 +189,7 @@ class PerturbationTFModel(TransformerModel):
         self.pert_exp_mode = kwargs.pop("pert_exp_mode", 'concat')
         self.pert_exp_mode = self.pert_exp_mode if self.pert_exp_mode in ['concat', 'sum', 'direct_sum'] else 'concat'
         super().__init__(*args, **kwargs)
-        self.expr_act = ExpressionActivate(activation = 'linear')
+        self.expr_act = ExpressionActivate(activation = 'elu')
         # add perturbation encoder
         # variables are defined in super class
         d_model = self.d_model
@@ -514,19 +514,20 @@ class PerturbationTFModel(TransformerModel):
 
     def encode_batch_with_perturb(
         self,
-        src: Tensor,
-        values: Tensor,
-        src_key_padding_mask: Tensor,
-        batch_size: int,
-        batch_labels: Optional[Tensor] = None,
+        src: Tensor, # gene_ids matching values
+        values: Tensor, # values of expression
+        src_key_padding_mask: Tensor, # padding 
+        batch_size: int, # batch size to run inference
+        batch_labels: Optional[Tensor] = None, 
         pert_labels: Optional[Tensor] = None, # the current perturbation label
         pert_labels_next: Optional[Tensor] = None, # the next perturbation label
         perturbation: Optional[Tensor] = None, # the perturbation induced
-        pert_scale: Optional[Tensor] = None,
+        pert_scale: Optional[Tensor] = None, # scale multiplier for perturbation 
         output_to_cpu: bool = True,
         time_step: Optional[int] = None,
         return_np: bool = False,
-        predict_expr = False
+        predict_expr = False,
+        mvc_src: Tensor = None # optional MVC tensor of gene ids for MVC decoder
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         revised scgpt.TransformerModel.encode_batch but with additional perturbation
@@ -578,10 +579,11 @@ class PerturbationTFModel(TransformerModel):
         
         expr_dict = {}
         if predict_expr:
-            shape_expr = (N, src.size(1))
-            mlm_outputs, mlm_zero_outputs = array_func(shape_expr, dtype=float32_), array_func(shape_expr, dtype=float32_)
-            mvc_outputs, mvc_zero_outputs = array_func(shape_expr, dtype=float32_), array_func(shape_expr, dtype=float32_)
-            mvc_next_outputs, mvc_next_zero_outputs = array_func(shape_expr, dtype=float32_), array_func(shape_expr, dtype=float32_)
+            mlm_expr_shape = (N, src.size(1)) 
+            mvc_expr_shape = (N, src.size(1)) if mvc_src is None else (N, mvc_src.size(1))
+            mlm_outputs, mlm_zero_outputs = array_func(mlm_expr_shape, dtype=float32_), array_func(mlm_expr_shape, dtype=float32_)
+            mvc_outputs, mvc_zero_outputs = array_func(mvc_expr_shape, dtype=float32_), array_func(mvc_expr_shape, dtype=float32_)
+            mvc_next_outputs, mvc_next_zero_outputs = array_func(mvc_expr_shape, dtype=float32_), array_func(mvc_expr_shape, dtype=float32_)
 
         for i in trange(0, N, batch_size):
             src_d = src[i : i + batch_size].to(device)
@@ -592,6 +594,7 @@ class PerturbationTFModel(TransformerModel):
             pert_labels_next_d = pert_labels_next[i : i + batch_size].to(device) if pert_labels_next is not None else None
             perturbation_d = perturbation[i : i + batch_size].to(device) if perturbation is not None else None
             pert_scale_d = pert_scale[i : i + batch_size].to(device) if pert_scale is not None else None
+            mvc_src_d = mvc_src[i:i+batch_size].to(device) if mvc_src is not None else None
             raw_output = self._encode(
                 src_d,
                 values_d,
@@ -677,22 +680,23 @@ class PerturbationTFModel(TransformerModel):
                 ),
                 # else transformer_output + batch_emb.unsqueeze(1),
                 )
+                cur_gene_token_embs = self.encoder(mvc_src_d) if mvc_src_d is not None else self.cur_gene_token_embs
                 mvc_output = self.mvc_decoder(
                                 cell_emb if not self.use_batch_labels
                                 else torch.cat([cell_emb, batch_emb], 
                                 dim=1
                                 ), # else cell_emb + batch_emb,
-                            self.cur_gene_token_embs,)
+                            cur_gene_token_embs,)
                 if pert_labels_next_d is not None:
                     mvc_output_next = self.mvc_decoder(
                                 cell_emb_next if not self.use_batch_labels
                                 else torch.cat([cell_emb_next, batch_emb], 
                                 dim=1
                                 ), # else cell_emb + batch_emb,
-                            self.cur_gene_token_embs,)
+                            cur_gene_token_embs,)
                 else:
                     mvc_output_next = mvc_output
-
+                
                 mlm_pred, mlm_zero_probs =  self.expr_act(mlm_output['pred']), mlm_output['zero_probs'] if self.explicit_zero_prob else 1
                 mvc_pred, mvc_zero_probs =  self.expr_act(mvc_output['pred']), mvc_output['zero_probs'] if self.explicit_zero_prob else 1
                 mvc_pred_next, mvc_zero_probs_next =  self.expr_act(mvc_output_next['pred']), mvc_output_next['zero_probs'] if self.explicit_zero_prob else 1

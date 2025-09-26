@@ -122,7 +122,7 @@ def tokenize_batch(
     return_pt: bool = True,
     append_cls: bool = True,
     include_zero_gene: bool = False,
-    cls_id: int = "<cls>",
+    cls_id: int = 1,
     cls_value: int = -3,
     mod_type: np.ndarray = None,
     cls_id_mod_type: int = None,

@@ -293,12 +293,13 @@ def produce_training_datasets(adata_input, config,
     test_manager = PertTFUniDataManager(adata_input, 
                                      config, 
                                      ps_columns=ps_columns, vocab=vocab,
-                                     ps_columns_perturbed_genes=ps_columns_perturbed_genes, additional_ps_dict = additional_ps_dict,
-
+                                     ps_columns_perturbed_genes=ps_columns_perturbed_genes, 
+                                     additional_ps_dict = additional_ps_dict,
                                      celltype_to_index = cell_type_to_index, 
                                      genotype_to_index= genotype_to_index, 
                                      expr_layer= input_layer_key)
-    t_data, t_loader, v_data, v_loader, data_info = test_manager.get_train_valid_loaders(test_size=train_val_split, train_indices=train_indices, valid_indices=valid_indices, full_token_validate=full_token_validate)             
+    random_state = config.get('seed', None)
+    t_data, t_loader, v_data, v_loader, data_info = test_manager.get_train_valid_loaders(test_size=train_val_split, train_indices=train_indices, valid_indices=valid_indices, full_token_validate=full_token_validate, random_state = random_state)             
     data_info['train_loader'] = t_loader
     data_info['valid_loader'] = v_loader
     data_info['train_data'] = t_data

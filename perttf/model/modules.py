@@ -59,7 +59,7 @@ class ExpressionActivate(nn.Module):
 
             # 2. Apply a non-negative activation to the energy logit.
             # Softplus ensures the magnitude component is always positive.
-            activated_energy = F.softplus(energy_logit)+1000
+            activated_energy = F.softplus(energy_logit)
 
             # 3. Apply softmax to the rest of the vector to get a probability distribution.
             distribution = F.softmax(distribution_logits, dim=-1) 
