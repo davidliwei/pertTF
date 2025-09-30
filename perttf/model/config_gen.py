@@ -25,10 +25,16 @@ def generate_config(parameter_dict,
                                         "<eoc>"]
 
     parameter_dict['reciprical_sampling'] = parameter_dict.get('reciprical_sampling', False)
-        #mask_ratio = config.mask_ratio
-    if parameter_dict.get('CCE', False):
-       parameter_dict['reciprical_sampling'] = True
+    #mask_ratio = config.mask_ratio
     parameter_dict['no_pert_for_perturb'] = True if parameter_dict['reciprical_sampling'] else parameter_dict.get('no_pert_for_perturb', False)
+    parameter_dict['simple_sampling']  = parameter_dict.get('simple_sampling', False)
+    parameter_dict['fix_nonzero_prop'] = parameter_dict.get('fix_nonzero_prop', False)
+    parameter_dict['nonzero_prop'] = parameter_dict.get('nonzero_prop', 0.9)
+    parameter_dict['pert_exp_mode'] =  parameter_dict.get('pert_exp_mode', 'concat')
+    parameter_dict['reciprical_genotype'] =  parameter_dict.get('reciprical_genotype', False)
+    if parameter_dict['next_cell_pred_type'] == 'identity':
+      parameter_dict['next_weight'] = 0
+
     # n_input_bins = config.n_bins
     parameter_dict['max_seq_len'] = parameter_dict['n_hvg'] + 1
     use_wandb=True

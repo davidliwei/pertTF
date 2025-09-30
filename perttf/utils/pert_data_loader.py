@@ -359,16 +359,18 @@ class PertBatchCollator:
         # during validation and predictions, this window may be around all genes with expression
         max_seq_len = self.max_seq_len if not self.full_tokenize else len(self.gene_ids) + self.append_cls
 
+
         # TODO: These functions may need to be modified to accomodate inputs w differing number of genes in the future
+        expr_mat, expr_mat_next = np.array(expr_list), np.array(expr_next_list)
         tokenized, gene_idx_list = tokenize_and_pad_batch(
-            np.array(expr_list), self.gene_ids, max_len=max_seq_len,cls_token=self.cls_token,
+            expr_mat, self.gene_ids, max_len=max_seq_len,cls_token=self.cls_token,
             vocab=self.vocab, pad_token=self.pad_token, pad_value=self.pad_value,
             append_cls=self.append_cls, include_zero_gene=self.include_zero_gene, 
             cls_value=self.cls_value, simple_sampling = self.simple_sampling,
             fix_nonzero_prop=self.fix_nonzero_prop, nonzero_prop=self.nonzero_prop
         )
         tokenized_next, _ = tokenize_and_pad_batch(
-            np.array(expr_next_list), self.gene_ids, max_len=max_seq_len, cls_token=self.cls_token,
+            expr_mat_next, self.gene_ids, max_len=max_seq_len, cls_token=self.cls_token,
             vocab=self.vocab, pad_token=self.pad_token, pad_value=self.pad_value,
             append_cls=self.append_cls, include_zero_gene=self.include_zero_gene, 
             sample_indices=gene_idx_list, cls_value=self.cls_value, simple_sampling = self.simple_sampling,
@@ -389,6 +391,7 @@ class PertBatchCollator:
         )
 
         # 4. Collate all other labels into tensors
+        full_gene_id = torch.from_numpy(self.gene_ids).long()
         collated_batch = {
             "gene_ids": tokenized["genes"],
             "next_gene_ids": tokenized_next["genes"],
@@ -396,6 +399,9 @@ class PertBatchCollator:
             "values_next": masked_values_next,
             "target_values": tokenized["values"],
             "target_values_next": tokenized_next["values"],
+            "full_expr": torch.Tensor(expr_mat),
+            "full_expr_next": torch.Tensor(expr_mat_next),
+            "full_gene_ids": torch.stack([full_gene_id for i in range(len(batch))], dim = 0)
         }
         
         # Stack scalar or vector labels from each item in the batch
