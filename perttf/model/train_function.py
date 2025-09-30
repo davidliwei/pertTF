@@ -27,9 +27,9 @@ from scgpt.model import TransformerModel, AdversarialDiscriminator
 
 import matplotlib.pyplot as plt
 
-from perttf.model.train_data_gen import prepare_data,prepare_dataloader
+from perttf.model.train_data_gen import prepare_data, prepare_dataloader
 from perttf.utils.set_optimizer import create_optimizer_dict
-from perttf.custom_loss import perturb_embedding_loss, CCE_loss, SUPCON_loss, criterion_neg_log_bernoulli, masked_mse_loss
+from perttf.custom_loss import perturb_embedding_loss, SUPCON_loss, criterion_neg_log_bernoulli, masked_mse_loss
 from perttf.utils.plot import process_and_log_umaps
 
 
@@ -185,13 +185,15 @@ def train(model: nn.Module,
                 pert_labels = celltype_labels_next*celltype_mark+perturbation_labels_next*genotype_mark
                 loss_cce = 0
                 if len(output_dict["contrastive_dict"]) == 4:
-                    loss_cce = CCE_loss(
+                    loss_cce = perturb_embedding_loss(
                         output_dict["contrastive_dict"]['orig_emb0'],
                         output_dict["contrastive_dict"]['next_emb0'],
                         output_dict["contrastive_dict"]['next_emb1'],
                         output_dict["contrastive_dict"]['orig_emb1'],
                         input_labels = input_labels,
-                        pert_labels = pert_labels
+                        pert_labels = pert_labels,
+                        lambda_fwd=10,
+                        lambda_rev=10
                     ) 
                 contr_keys = list(output_dict["contrastive_dict"].keys())
                 emb_list = [output_dict["contrastive_dict"][k] for k in contr_keys]
