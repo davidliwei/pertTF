@@ -166,11 +166,11 @@ class PerturbationTFModel(TransformerModel):
                  *args, **kwargs):
         self.pred_lochness_next = kwargs.pop("pred_lochness_next", False) # additional optional parameter to ask whether to predict lochness scores
         ps_decoder2_nlayer = kwargs.pop("ps_decoder2_nlayer",3) # additional parameter to specify ps_decoder2 nlayer
+        self.pert_pad_id = kwargs.pop("pert_pad_id", None) # get the pert_pad_id
         super().__init__(*args, **kwargs)
         # add perturbation encoder
         # variables are defined in super class
         d_model = self.d_model
-        self.pert_pad_id = kwargs.get("pert_pad_id", None) 
         #self.pert_encoder = nn.Embedding(3, d_model, padding_idx=pert_pad_id)
         self.pert_encoder = PertLabelEncoder(n_pert, d_model, padding_idx=self.pert_pad_id)
 
@@ -290,6 +290,7 @@ class PerturbationTFModel(TransformerModel):
         PERTPRED: bool = False,
         do_sample: bool = False,
         PSPRED: bool = False,
+        mvc_src: Tensor = None 
     ) -> Mapping[str, Tensor]:
         """
         Args:
@@ -332,6 +333,7 @@ class PerturbationTFModel(TransformerModel):
         #)
 
         # or, rewrite the forward function
+        
         transformer_output_0 = self._encode(
             src, values, src_key_padding_mask, batch_labels,
             input_pert_flags= pert_labels, # Do we use pert_flags for transformer input?
@@ -359,6 +361,7 @@ class PerturbationTFModel(TransformerModel):
         transformer_output=transformer_output_0
             
         output = {}
+        output["contrastive_dict"] = {}
         mlm_output = self.decoder(
             transformer_output
             if not self.use_batch_labels
@@ -381,7 +384,7 @@ class PerturbationTFModel(TransformerModel):
             output["mlm_zero_probs"] = mlm_output["zero_probs"]
 
         cell_emb_orig = self._get_cell_emb_from_layer(transformer_output, values)        
-        
+        output["contrastive_dict"]['orig_emb0'] = cell_emb_orig
         #  concatenate cell embedding with perturbation embedding to generate next cell embedding
         if pert_labels_next is not None: #and False:
             #import pdb; pdb.set_trace()
@@ -442,14 +445,14 @@ class PerturbationTFModel(TransformerModel):
                 if not self.use_batch_labels
                 else torch.cat([cell_emb, batch_emb], dim=1),
                 # else cell_emb + batch_emb,
-                self.cur_gene_token_embs,
+                cur_gene_token_embs,
             )
             mvc_output_next = self.mvc_decoder(
                 cell_emb_next
                 if not self.use_batch_labels
                 else torch.cat([cell_emb_next, batch_emb], dim=1),
                 # else cell_emb + batch_emb,
-                self.cur_gene_token_embs, # is it working well??
+                cur_gene_token_embs, # is it working well??
             )
             if self.explicit_zero_prob and do_sample:
                 bernoulli = Bernoulli(probs=mvc_output["zero_probs"])

@@ -24,7 +24,11 @@ def generate_config(parameter_dict,
                                         parameter_dict.get('cls_token', '<cls>'), 
                                         "<eoc>"]
 
-
+    parameter_dict['simple_sampling']  = parameter_dict.get('simple_sampling', False)
+    parameter_dict['fix_nonzero_prop'] = parameter_dict.get('fix_nonzero_prop', False)
+    parameter_dict['nonzero_prop'] = parameter_dict.get('nonzero_prop', 0.9)
+    if parameter_dict['next_cell_pred_type'] == 'identity':
+      parameter_dict['next_weight'] = 0
     #mask_ratio = config.mask_ratio
 
     # n_input_bins = config.n_bins

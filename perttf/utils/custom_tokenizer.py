@@ -109,7 +109,7 @@ def weighted_sample(val, max_size, rng = default_rng(), simple = True, non_zero_
     nzero = np.where(val!=0)[0]
     zero = np.where(val==0)[0]
     non_zero_size = min(round(max_size*non_zero_proportion), len(nzero))
-    zero_size = max_size - non_zero_size if not fixed_ratio else round(non_zero_size*(1-non_zero_proportion)/non_zero_proportion)
+    zero_size = max_size - non_zero_size if not fixed_ratio else min(max_size - non_zero_size, round(non_zero_size*(1-non_zero_proportion)/non_zero_proportion))
     nz_inds= np.random.choice(len(nzero),size = non_zero_size, replace = False)
     z_inds= np.random.choice(len(zero),size = zero_size, replace = False)
     return np.concatenate([nzero[nz_inds], zero[z_inds]])
@@ -252,7 +252,7 @@ def pad_batch(
             used_indices_list.append(idx)
         else:
             # If no sampling was needed, all original indices were used
-            used_indices_list.append(np.arange(len(gene_ids)))
+            used_indices_list.append(gene_ids)
 
     max_ori_len = max(len(new_batch[i][0]) for i in range(len(new_batch)))
     max_len = min(max_ori_len, max_len)
@@ -289,7 +289,6 @@ def pad_batch(
         values_list.append(values)
         if mod_types is not None:
             mod_types_list.append(mod_types)
-
     batch_padded = {
         "genes": torch.stack(gene_ids_list, dim=0),
         "values": torch.stack(values_list, dim=0),
