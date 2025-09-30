@@ -269,8 +269,8 @@ class PertTFDataset(Dataset):
         if current_cell_genotype == next_cell_genotype: # e.g. PDX1 -> PDX1 
             if self.no_pert_for_perturb: # e.g. PDX1 -> PDX1: perturbation = WT
                 perturbation = self.genotype_to_index['WT']
-            else: # e.g. PDX1 -> PDX1: perturbation = PDX1 (original definition of perturbation)
-                perturbation = pert_label_next
+            else: # e.g. PDX1 -> PDX1: perturbation = PDX1 (original definition of perturbation, also the case in identity and lochness)
+                perturbation = pert_label_next 
             inv_perturbation = perturbation 
         else:
             if current_cell_genotype == 'WT': # e.g. WT -> PDX1: perturbation = PDX1 (always the case for WT cells)
@@ -297,6 +297,7 @@ class PertTFDataset(Dataset):
                 selected_gene = self.additional_ps_names[random_pert_ind - len(self.ps_columns_perturbed_genes)] 
                 pert_label_next = self.genotype_to_index[selected_gene]
                 ps_scores_next = np.array([self.additional_ps_dict[selected_gene]], dtype=np.float32) 
+            perturbation = pert_label_next
         
         return {
             "expr": current_expr,
