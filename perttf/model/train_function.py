@@ -30,9 +30,9 @@ from scgpt.model import TransformerModel, AdversarialDiscriminator
 
 import matplotlib.pyplot as plt
 
-from perttf.model.train_data_gen import prepare_data,prepare_dataloader
+from perttf.model.train_data_gen import prepare_data, prepare_dataloader
 from perttf.utils.set_optimizer import create_optimizer_dict
-from perttf.custom_loss import perturb_embedding_loss, CCE_loss, SUPCON_loss, criterion_neg_log_bernoulli, masked_mse_loss
+from perttf.custom_loss import perturb_embedding_loss, SUPCON_loss, criterion_neg_log_bernoulli, masked_mse_loss
 from perttf.utils.plot import process_and_log_umaps
 from perttf.utils.misc import init_plot_worker
 def train(model: nn.Module,
@@ -134,33 +134,32 @@ def train(model: nn.Module,
             )
             loss = config.this_weight * loss_mse
             metrics_to_log = {"train/mse": loss_mse.item()}
-            if "contrastive_dict" in output_dict:
-                
-                loss_cce = CCE_loss(
-                    output_dict["contrastive_dict"]['cell1_emb'],
-                    output_dict["contrastive_dict"]['cell1_emb_next'],
-                    output_dict["contrastive_dict"]['cell2_emb'],
-                    output_dict["contrastive_dict"]['cell2_emb_next'],
-                    input_labels = celltype_labels*1000+perturbation_labels,
-                    pert_labels = celltype_labels_next*1000+perturbation_labels_next
+
+            celltype_mark = 1000 if config.cell_type_classifier and config.cell_type_classifier_weight > 0 else 0
+            genotype_mark = 1 if config.perturbation_classifier_weight > 0 else 0
+            cce_weight = max(config.perturbation_classifier_weight*config.cell_type_classifier_weight, 50)
+            if config.CCE and (celltype_mark or genotype_mark) and len(output_dict["contrastive_dict"]) > 0: ## supervised contrastive loss plus a custom contrastive loss
+                input_labels = celltype_labels*celltype_mark+perturbation_labels*genotype_mark # make labels unique combination of celltype and genotype
+                pert_labels = celltype_labels_next*celltype_mark+perturbation_labels_next*genotype_mark
+                loss_cce = 0
+                if len(output_dict["contrastive_dict"]) == 4:
+                    loss_cce = perturb_embedding_loss(
+                        output_dict["contrastive_dict"]['orig_emb0'],
+                        output_dict["contrastive_dict"]['next_emb0'],
+                        output_dict["contrastive_dict"]['next_emb1'],
+                        output_dict["contrastive_dict"]['orig_emb1'],
+                        input_labels = input_labels,
+                        pert_labels = pert_labels,
+                        lambda_fwd=10,
+                        lambda_rev=10
                     ) 
-                """
-                loss_cce = SUPCON_loss(
-                    features = torch.concat([
-                    output_dict["contrastive_dict"]['cell1_emb'],
-                    output_dict["contrastive_dict"]['cell1_emb_next'],
-                    output_dict["contrastive_dict"]['cell2_emb'],
-                    output_dict["contrastive_dict"]['cell2_emb_next']
-                    ], dim = 0).unsqueeze(1), 
-                    labels = torch.concat([
-                        celltype_labels*1000+perturbation_labels,
-                        celltype_labels_next*1000+perturbation_labels_next,
-                        celltype_labels_next*1000+perturbation_labels_next,
-                        celltype_labels*1000+perturbation_labels
-                        
-                    ]))
-                """
-                loss = loss+loss_cce
+                contr_keys = list(output_dict["contrastive_dict"].keys())
+                emb_list = [output_dict["contrastive_dict"][k] for k in contr_keys]
+                lab_list = [input_labels if 'orig' in k else pert_labels for k in contr_keys]
+                loss_cce += SUPCON_loss(
+                    features = torch.concat(emb_list, dim = 0).unsqueeze(1), 
+                    labels = torch.concat(lab_list))
+                loss = loss+loss_cce*cce_weight
                 metrics_to_log["train/cce"] =  loss_cce.item()
             # next value?
             loss_mse_next = criterion(

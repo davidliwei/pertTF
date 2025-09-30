@@ -31,6 +31,7 @@ def generate_config(parameter_dict,
       parameter_dict['next_weight'] = 0
     #mask_ratio = config.mask_ratio
 
+        #mask_ratio = config.mask_ratio
     # n_input_bins = config.n_bins
     if parameter_dict['sampling_mode'] == 'hvg':
       parameter_dict['max_seq_len'] = parameter_dict['n_hvg'] + parameter_dict.get('non_hvg_size', 1000)+parameter_dict.get('append_cls', True)

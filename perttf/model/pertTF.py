@@ -413,7 +413,7 @@ class PerturbationTFModel(TransformerModel):
             cell1 = cell_emb
             cell1_next = cell_emb_next
             transformer_output2 = self._encode(
-                src,  values_next, src_key_padding_mask, batch_labels,
+                src, values_next, src_key_padding_mask, batch_labels,
                 input_pert_flags= pert_labels_next # Do we use pert_flags for transformer input?
             )
             cell2 = self._get_cell_emb_from_layer(transformer_output2)
@@ -486,6 +486,7 @@ class PerturbationTFModel(TransformerModel):
         if PSPRED and self.ps_decoder is not None:
             output["ps_output"] = self.ps_decoder(cell_emb)
             if self.pred_lochness_next:
+                tf_concat=torch.cat([cell_emb_orig, pert_emb_next],dim=1)
                 output["ps_output_next"] = self.ps_decoder2(tf_concat)  # this is the concatenation of cell embedding and predictive label (next)
             else:
                 output["ps_output_next"] = self.ps_decoder(cell_emb_next)  # (batch, n_cls)
