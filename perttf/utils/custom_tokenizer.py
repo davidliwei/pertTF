@@ -226,7 +226,7 @@ def pad_batch(
     values_list = []
     mod_types_list = []
     used_indices_list = []
-
+    new_batch = []
     for i in range(len(batch)):
         gene_ids, values, mod_types = batch[i]
 
@@ -248,11 +248,16 @@ def pad_batch(
             values = values[idx]
             if mod_types is not None:
                 mod_types = mod_types[idx]
+            new_batch.append((gene_ids, values, mod_types))
             used_indices_list.append(idx)
         else:
             # If no sampling was needed, all original indices were used
             used_indices_list.append(gene_ids)
 
+    max_ori_len = max(len(new_batch[i][0]) for i in range(len(new_batch)))
+    max_len = min(max_ori_len, max_len)
+    for i in range(len(new_batch)):
+        gene_ids, values, mod_types = new_batch[i]
         if len(gene_ids) < max_len:
             gene_ids = torch.cat(
                 [
