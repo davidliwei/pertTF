@@ -19,6 +19,7 @@ from scgpt.model import TransformerModel
 from torch.nn import TransformerEncoder
 
 
+
 class PerturbationDecoder(nn.Module):
     """
     Decoder for perturbation label prediction.
@@ -180,7 +181,6 @@ class PerturbationTFModel(TransformerModel):
         #n_pert = kwargs.get("n_perturb", 1) 
         #nlayers_pert = kwargs.get("nlayers_perturb", 3) 
         self.pert_decoder = PerturbationDecoder(d_model, n_pert, nlayers=nlayers_pert)
-
         # added: batch2 encoder, especially to model different cellular systems like cell line vs primary cells
         self.batch2_pad_id = None #kwargs.get("batch2_pad_id") if "batch2_pad_id" in kwargs else 2
         #self.batch2_encoder = nn.Embedding(2, d_model, padding_idx=self.batch2_pad_id)
@@ -361,6 +361,7 @@ class PerturbationTFModel(TransformerModel):
         transformer_output=transformer_output_0
             
         output = {}
+        output["contrastive_dict"] = {}
         mlm_output = self.decoder(
             transformer_output
             if not self.use_batch_labels
@@ -383,7 +384,7 @@ class PerturbationTFModel(TransformerModel):
             output["mlm_zero_probs"] = mlm_output["zero_probs"]
 
         cell_emb_orig = self._get_cell_emb_from_layer(transformer_output, values)        
-
+        output["contrastive_dict"]['orig_emb0'] = cell_emb_orig
         #  concatenate cell embedding with perturbation embedding to generate next cell embedding
         if pert_labels_next is not None: #and False:
             #import pdb; pdb.set_trace()
@@ -397,6 +398,7 @@ class PerturbationTFModel(TransformerModel):
             )
             #tf_concat = cell_emb_orig + pert_emb_next
             cell_emb_next=self.pert_exp_encoder(tf_concat)
+            output["contrastive_dict"]['next_emb0'] = cell_emb_next
         else:
             tf_concat = None # add a placeholder
             cell_emb_next=cell_emb_orig
@@ -409,26 +411,7 @@ class PerturbationTFModel(TransformerModel):
             output["cls_output"] = self.cls_decoder(cell_emb)  # (batch, n_cls)
             output["cls_output_next"] = self.cls_decoder(cell_emb_next)  # (batch, n_cls)
 
-        if CCE and values_next is not None:
-            cell1 = cell_emb
-            cell1_next = cell_emb_next
-            transformer_output2 = self._encode(
-                src, values_next, src_key_padding_mask, batch_labels,
-                input_pert_flags= pert_labels_next # Do we use pert_flags for transformer input?
-            )
-            cell2 = self._get_cell_emb_from_layer(transformer_output2)
-            cell2_next = None
-            if inv_perturbation is not None:
-                inv_pert_emb_next = self.pert_encoder(inv_perturbation)
-                inv_pert_emb_next = inv_pert_emb_next * inv_pert_scale if inv_pert_scale is not None else inv_pert_emb_next
-                cell2_next = self.pert_exp_encoder(cell2, inv_pert_emb_next)
-
-            output["contrastive_dict"] = dict(
-                cell1_emb = cell1,
-                cell1_emb_next = cell1_next,
-                cell2_emb = cell2,
-                cell2_emb_next = cell2_next
-            )
+        
            
         if MVC:
             mvc_output = self.mvc_decoder(
