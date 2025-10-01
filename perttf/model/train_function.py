@@ -20,18 +20,55 @@ from scipy.sparse import issparse
 
 import scgpt as scg
 from scgpt.loss import (
-    masked_mse_loss,
     masked_relative_error,
-    criterion_neg_log_bernoulli,
 )
 from perttf.utils.custom_tokenizer import tokenize_and_pad_batch, random_mask_value
 from scgpt.model import TransformerModel, AdversarialDiscriminator
 
 import matplotlib.pyplot as plt
 
-from perttf.model.train_data_gen import prepare_data,prepare_dataloader
+from perttf.model.train_data_gen import prepare_data, prepare_dataloader
 from perttf.utils.set_optimizer import create_optimizer_dict
+from perttf.custom_loss import cce_loss, criterion_neg_log_bernoulli, masked_mse_loss
 from perttf.utils.plot import process_and_log_umaps
+
+
+# function not used currently
+def forward_pass(model, batch_data, device, config, vocab, has_lochness_next_pred = False):
+    input_gene_ids = batch_data["gene_ids"].to(device)
+    input_values = batch_data["values"].to(device)
+    target_values = batch_data["target_values"].to(device)
+    target_values_next = batch_data["target_values_next"].to(device)
+    batch_labels = batch_data["batch_labels"].to(device)
+    celltype_labels = batch_data["celltype_labels"].to(device) #added
+    perturbation_labels = batch_data["perturbation_labels"].to(device) #added
+
+    celltype_labels_next = batch_data["celltype_labels_next"].to(device) #added
+    perturbation_labels_next = batch_data["perturbation_labels_next"].to(device) #added
+
+
+    src_key_padding_mask = input_gene_ids.eq(vocab[config.pad_token])
+    with torch.cuda.amp.autocast(enabled=config.amp):
+        #import pdb; pdb.set_trace()
+
+        output_dict = model(
+            input_gene_ids,
+            input_values,
+            src_key_padding_mask=src_key_padding_mask,
+            batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
+            pert_labels = perturbation_labels if config.perturbation_input else None,
+            pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
+            MVC=config.GEPC,
+            ECS=config.ecs_thres > 0,
+            CLS=config.cell_type_classifier,
+            PERTPRED = config.perturbation_classifier_weight > 0,
+            PSPRED = config.ps_weight >0,
+        )
+        
+    return output_dict
+
+
+
 def train(model: nn.Module,
           loader: DataLoader,
           config,
@@ -43,7 +80,7 @@ def train(model: nn.Module,
     """
     Train the model for one epoch.
     """
-    criterion = masked_mse_loss
+    criterion = masked_mse_loss 
     criterion_dab = nn.CrossEntropyLoss()
     criterion_cls = nn.CrossEntropyLoss()
     criterion_pert = nn.CrossEntropyLoss()
@@ -73,6 +110,7 @@ def train(model: nn.Module,
     scheduler_E=optim_dict["scheduler_E"]
     optimizer_D=optim_dict["optimizer_D"]
     scheduler_D=optim_dict["scheduler_D"]
+    clipper = optim_dict['clipper']
 
     # check ps_next_weight. The ps_next prediction is used for predicting the lochness score for a new gene from pert_next label
     if hasattr(config, "pred_lochness_next"):
@@ -86,15 +124,19 @@ def train(model: nn.Module,
     for batch, batch_data in enumerate(loader):
         input_gene_ids = batch_data["gene_ids"].to(device)
         input_values = batch_data["values"].to(device)
+        input_next_values = batch_data["values_next"].to(device)
         target_values = batch_data["target_values"].to(device)
         target_values_next = batch_data["target_values_next"].to(device)
         batch_labels = batch_data["batch_labels"].to(device)
         celltype_labels = batch_data["celltype_labels"].to(device) #added
         perturbation_labels = batch_data["perturbation_labels"].to(device) #added
-
         celltype_labels_next = batch_data["celltype_labels_next"].to(device) #added
         perturbation_labels_next = batch_data["perturbation_labels_next"].to(device) #added
-
+        perturbation = batch_data["perturbation"].to(device)
+        inv_perturbation = batch_data["inv_perturbation"].to(device) if batch_data["inv_perturbation"] is not None else None
+        pert_scale = batch_data['pert_scale'].to(device)
+        inv_per_scale = batch_data['inv_pert_scale'].to(device)
+        mvc_src = None if config.get('mvc_masked_train', True) else batch_data['full_gene_ids'].to(device)
         if config.ps_weight >0:
             ps_score = batch_data["ps"].to(device)
             ps_score_next = batch_data["ps_next"].to(device) #
@@ -109,20 +151,55 @@ def train(model: nn.Module,
                 src_key_padding_mask=src_key_padding_mask,
                 batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
                 pert_labels = perturbation_labels if config.perturbation_input else None,
-                pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
+                pert_labels_next = perturbation_labels_next if config.perturbation_input else None,
+                perturbation = perturbation if (config.next_weight >0 or has_lochness_next_pred )  else None,
+                inv_perturbation = inv_perturbation if (config.get('reciprical_sampling', False)) else None,
+                pert_scale = pert_scale if config.get('reciprical_sampling', False) else None,
+                inv_pert_scale = inv_per_scale if config.get('reciprical_sampling', False) else None,
+                values_next = input_next_values if config.get('CCE', False) and config.get('reciprical_sampling', False) else None,
                 MVC=config.GEPC,
                 ECS=config.ecs_thres > 0,
                 CLS=config.cell_type_classifier,
+                CCE = config.CCE,
                 PERTPRED = config.perturbation_classifier_weight > 0,
                 PSPRED = config.ps_weight >0,
+                mvc_src = mvc_src
             )
-
+            #if batch == 0:
+               #for a in output_dict["contrastive_dict"]:
+                   #print(a)
+                   #print(output_dict["contrastive_dict"][a].shape)
+                   #print(output_dict["contrastive_dict"])
+            
             masked_positions = input_values.eq(config.mask_value)  # the postions to predict
             loss_mse = criterion(
                 output_dict["mlm_output"], target_values, masked_positions
             )
             loss = config.this_weight * loss_mse
             metrics_to_log = {"train/mse": loss_mse.item()}
+
+            if config.CCE and len(output_dict["contrastive_dict"]) > 0:
+                cce_mode = config.get('cce_mode', 'cell+geno')
+                logit_norm = config.get('logit_norm', False)
+                if cce_mode == 'cell_geno': ## supervised contrastive loss plus a custom contrastive loss
+                    cce_weight = max(config.perturbation_classifier_weight*config.cell_type_classifier_weight, 1)
+                    input_labels = celltype_labels*1000+perturbation_labels # x1000 make labels unique combination of celltype and genotype
+                    pert_labels = celltype_labels_next*1000+perturbation_labels_next
+                    loss_cce = cce_loss(output_dict["contrastive_dict"], input_labels, pert_labels, logit_norm=logit_norm)
+                    metrics_to_log["train/cce"] = loss_cce.item()
+                    loss += loss_cce * cce_weight
+
+                if cce_mode == 'celltype' or cce_mode == 'cell+geno':
+                    loss_cce_celltype = cce_loss(output_dict["contrastive_dict"], celltype_labels, celltype_labels_next, logit_norm=logit_norm)
+                    metrics_to_log["train/cce_celltype"] = loss_cce_celltype.item()
+                    loss += loss_cce_celltype * max(config.cell_type_classifier_weight, 1)
+
+                if cce_mode == 'genotype' or cce_mode == 'cell+geno':
+                    loss_cce_genotype = cce_loss(output_dict["contrastive_dict"], perturbation_labels, perturbation_labels_next, logit_norm=logit_norm)
+                    metrics_to_log["train/cce_genotype"] = loss_cce_genotype.item()
+                    loss += loss_cce_genotype * max(config.perturbation_classifier_weight,1)
+                
+                
             # next value?
             loss_mse_next = criterion(
                 output_dict["mlm_output"],
@@ -145,33 +222,37 @@ def train(model: nn.Module,
                 #loss = loss + config.next_weight *loss_zero_log_prob_next
                 metrics_to_log.update({"train/nzlp_next": loss_zero_log_prob_next.item()})
             if config.GEPC:
+                mvc_target_values = target_values if config.get('mvc_masked_train', True) else batch_data["full_expr"].to(device)
+                mvc_target_values_next = target_values_next if config.get('mvc_masked_train', True) else batch_data["full_expr_next"].to(device)
+                mvc_masked_positions = masked_positions if config.get('mvc_masked_train', True) else None
                 loss_gepc = criterion(
-                    output_dict["mvc_output"], target_values, masked_positions
+                    output_dict["mvc_output"], mvc_target_values, mvc_masked_positions
                 )
                 loss = loss + config.this_weight *loss_gepc
                 metrics_to_log.update({"train/mvc": loss_gepc.item()})
                 # added
                 loss_gepc_next = criterion(
-                    output_dict["mvc_output_next"], target_values_next, masked_positions
+                    output_dict["mvc_output_next"], mvc_target_values_next, mvc_masked_positions
                 )
                 loss = loss + config.next_weight * loss_gepc_next
                 metrics_to_log.update({"train/mvc_next": loss_gepc_next.item()})
-            if config.GEPC and config.explicit_zero_prob:
-                loss_gepc_zero_log_prob = criterion_neg_log_bernoulli(
-                    output_dict["mvc_zero_probs"], target_values, masked_positions
-                )
-                loss = loss + config.this_weight *loss_gepc_zero_log_prob
-                metrics_to_log.update(
-                    {"train/mvc_nzlp": loss_gepc_zero_log_prob.item()}
-                )
-                # added
-                loss_gepc_zero_log_prob_next = criterion_neg_log_bernoulli(
-                    output_dict["mvc_zero_probs_next"], target_values_next, masked_positions
-                )
-                loss = loss + config.next_weight * loss_gepc_zero_log_prob_next
-                metrics_to_log.update(
-                    {"train/mvc_nzlp_next": loss_gepc_zero_log_prob_next.item()}
-                )
+                
+                if config.explicit_zero_prob:
+                    loss_gepc_zero_log_prob = criterion_neg_log_bernoulli(
+                        output_dict["mvc_zero_probs"], mvc_target_values, mvc_masked_positions
+                    )
+                    loss = loss + config.this_weight *loss_gepc_zero_log_prob
+                    metrics_to_log.update(
+                        {"train/mvc_nzlp": loss_gepc_zero_log_prob.item()}
+                    )
+                    # added
+                    loss_gepc_zero_log_prob_next = criterion_neg_log_bernoulli(
+                        output_dict["mvc_zero_probs_next"], mvc_target_values_next, mvc_masked_positions
+                    )
+                    loss = loss + config.next_weight * loss_gepc_zero_log_prob_next
+                    metrics_to_log.update(
+                        {"train/mvc_nzlp_next": loss_gepc_zero_log_prob_next.item()}
+                    )
             if config.cell_type_classifier:
                 loss_cls = criterion_cls(output_dict["cls_output"], celltype_labels)
                 loss = loss + config.cell_type_classifier_weight * loss_cls
@@ -214,12 +295,17 @@ def train(model: nn.Module,
                 loss_dab = criterion_dab(output_dict["dab_output"], batch_labels)
                 loss = loss + config.dab_weight * loss_dab
                 metrics_to_log.update({"train/dab": loss_dab.item()})
-
+            #if config.CCE and epoch < 150:
+             #   loss = loss_cce
         model.zero_grad()
         #print(f"loss: {loss}")
         #import pdb; pdb.set_trace()
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
+
+        if clipper is not None:
+            clipper.step(model)
+
         with warnings.catch_warnings(record=True) as w:
             warnings.filterwarnings("always")
             torch.nn.utils.clip_grad_norm_(
@@ -244,7 +330,8 @@ def train(model: nn.Module,
                 src_key_padding_mask=src_key_padding_mask,
                 batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
                 pert_labels = perturbation_labels if config.perturbation_input else None,
-                pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
+                perturbation = perturbation if (config.next_weight >0 or has_lochness_next_pred )  else None,
+                pert_scale = pert_scale if (config.get('reciprical_sampling', False)) else None,
                 MVC=config.GEPC,
                 ECS=config.ecs_thres > 0,
                 CLS=config.cell_type_classifier,
@@ -360,6 +447,8 @@ def define_wandb_metrcis():
     wandb.define_metric("valid/dab", summary="min", step_metric="epoch")
     wandb.define_metric("valid/cls", summary="min", step_metric="epoch")
     wandb.define_metric("valid/pert", summary="min", step_metric="epoch")
+    wandb.define_metric("valid/mvc", summary="min", step_metric="epoch")
+    wandb.define_metric("valid/mvc_next", summary="min", step_metric="epoch")
     wandb.define_metric("valid/ps", summary="min", step_metric="epoch")
     wandb.define_metric("valid/ps_next", summary="min", step_metric="epoch")
     wandb.define_metric("valid/sum_mse_dab", summary="min", step_metric="epoch")
@@ -396,7 +485,8 @@ def evaluate(model: nn.Module,
     total_ps = 0.0
     total_ps_next = 0.0
     total_num = 0
-
+    total_mvc = 0
+    total_mvc_next = 0
     if hasattr(config, "pred_lochness_next"):
         has_lochness_next_pred = True
         ps_next_training_weight = config.pred_lochness_next
@@ -416,8 +506,10 @@ def evaluate(model: nn.Module,
             perturbation_labels_next = batch_data["perturbation_labels_next"].to(device) #added
             ps_score = batch_data["ps"].to(device) #added
             ps_score_next = batch_data["ps_next"].to(device) #added
-            
+            perturbation = batch_data["perturbation"].to(device)
+            pert_scale =  batch_data["pert_scale"].to(device)
             src_key_padding_mask = input_gene_ids.eq(vocab[config.pad_token])
+            mvc_src = None if config.get('mvc_masked_train', True) else batch_data['full_gene_ids'].to(device)
             with torch.cuda.amp.autocast(enabled=config.amp):
                 output_dict = model(
                     input_gene_ids,
@@ -425,12 +517,14 @@ def evaluate(model: nn.Module,
                     src_key_padding_mask=src_key_padding_mask,
                     batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
                     pert_labels = perturbation_labels if config.perturbation_input else None,
-                    pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
+                    perturbation = perturbation if (config.next_weight >0 or has_lochness_next_pred )  else None,
+                    pert_scale = pert_scale if (config.get('reciprical_sampling', False)) else None,
                     MVC=config.GEPC,
                     ECS=config.ecs_thres > 0,
                     CLS=config.cell_type_classifier,
                     PERTPRED = config.perturbation_classifier_weight > 0,
                     PSPRED = config.ps_weight>0,
+                    mvc_src = mvc_src
                 )
                 output_values = output_dict["mlm_output"]
 
@@ -446,6 +540,20 @@ def evaluate(model: nn.Module,
                 loss_mse_next = criterion(output_values, target_values_next, masked_positions)
                 #print(f"target_values_next_shape: {target_values_next.shape}")
                 #print(target_values_next * masked_positions)
+                if config.GEPC:
+                    mvc_target_values = target_values if config.get('mvc_masked_train', True) else batch_data["full_expr"].to(device)
+                    mvc_target_values_next = target_values_next if config.get('mvc_masked_train', True) else batch_data["full_expr_next"].to(device)
+                    mvc_masked_positions = masked_positions if config.get('mvc_masked_train', True) else None
+
+                    loss_gepc = criterion(
+                        output_dict["mvc_output"], mvc_target_values, mvc_masked_positions
+                    )
+                    # added
+                    loss_gepc_next = criterion(
+                        output_dict["mvc_output_next"], mvc_target_values_next, mvc_masked_positions
+                    )
+                    
+
                 if config.dab_weight > 0:
                     loss_dab = criterion_dab(output_dict["dab_output"], batch_labels)
                 if config.cell_type_classifier: #added
@@ -463,6 +571,8 @@ def evaluate(model: nn.Module,
 
             total_loss += loss.item() * len(input_gene_ids)
             total_loss_next += loss_mse_next.item() * len(input_gene_ids)
+            total_mvc += loss_gepc.item() * len(input_gene_ids)
+            total_mvc_next += loss_gepc_next.item() * len(input_gene_ids)
             total_error += masked_relative_error(output_values, target_values, masked_positions).item() * len(input_gene_ids)
             total_error_next += masked_relative_error(output_values, target_values_next, masked_positions).item() * len(input_gene_ids)
             if config.dab_weight > 0:
@@ -479,8 +589,11 @@ def evaluate(model: nn.Module,
 
     wandb.log(
         {
+
             "valid/mse": total_loss / total_num,
             "valid/mse_next": total_loss_next / total_num,
+            "valid/mvc": total_mvc / total_num,
+            "valid/mvc_next": total_mvc_next / total_num,
             "valid/mre": total_error / total_num,
             "valid/mre_next": total_error_next / total_num,
             "valid/dab": total_dab / total_num,
@@ -493,7 +606,19 @@ def evaluate(model: nn.Module,
         },
     )
 
-    return total_loss / total_num, total_loss_next / total_num, total_error / total_num, total_error_next / total_num, total_dab / total_num, total_cls / total_num, total_pert / total_num, total_ps / total_num, total_ps_next / total_num
+    return (
+        total_loss / total_num, 
+        total_loss_next / total_num, 
+        total_mvc / total_num,
+        total_mvc_next / total_num,
+        total_error / total_num, 
+        total_error_next / total_num, 
+        total_dab / total_num, 
+        total_cls / total_num, 
+        total_pert / total_num,
+        total_ps / total_num, 
+        total_ps_next / total_num
+    )
 
 def eval_testdata(
     model: nn.Module,
@@ -508,7 +633,11 @@ def eval_testdata(
     epoch = 0,
     eval_key = "", # titles for evaluation
     make_plots = True,
-    predict_expr = False
+    mask = False,
+    predict_expr = False,
+    no_pert_for_perturb = False,
+    reciprical_sampling = False,
+    mvc_full_expr = False
 ) -> Optional[Dict]: # Returns a dictionary containing the AnnData object
     """
     Evaluate the model on test data and return an AnnData object with embeddings.
@@ -562,6 +691,7 @@ def eval_testdata(
     # evaluate the next prediction?
     next_cell_prediction = False
     perturbation_labels_next = None
+    pert_scale = None
     if config.next_cell_pred_type == "pert":
         if "genotype_next" in adata_t.obs.columns:
             # this is the pred_next  
@@ -572,6 +702,21 @@ def eval_testdata(
             next_cell_prediction = False
         if next_cell_prediction:
             perturbation_labels_next = adata_t.obs["genotype_next"].tolist()  # make sure count from 0
+            if no_pert_for_perturb and not reciprical_sampling:
+                perturbation_labels_next = ['WT' if perturbed else adata_t.obs.genotype_next.iloc[i] for i, perturbed in enumerate(adata_t.obs.genotype == adata_t.obs.genotype_next)]
+            if reciprical_sampling:
+                perturbation_labels_next = []
+                for i, (curr, next) in enumerate(zip(adata_t.obs.genotype.tolist(), adata_t.obs.genotype_next.tolist())):
+                    if curr == next:
+                        perturbation_labels_next.append('WT')
+                    else:
+                        if curr == 'WT':
+                            perturbation_labels_next.append(next)
+                        else:
+                            perturbation_labels_next.append(curr)
+                pert_scale = np.array([np.array([-1.0]) if perturbed and adata_t.obs.genotype.iloc[i] != 'WT' else np.array([1.0]) for i, perturbed in enumerate(adata_t.obs.genotype != adata_t.obs.genotype_next)])
+    
+    next_genotype = np.array([genotype_to_index[genotype] for genotype in adata_t.obs["genotype_next"].tolist()])
     if config.next_cell_pred_type ==  'lochness':
         if hasattr(config, "pred_lochness_next") and config.pred_lochness_next >0:
             next_cell_prediction = True
@@ -595,7 +740,13 @@ def eval_testdata(
 
     batch_ids = np.array(batch_ids)
 
-
+    if mvc_full_expr: # if we want to get full expression from mvc decoder
+        max_seq_len = config.max_seq_len if config.get('simple_sampling', True) else 10000
+        cls_gene_ids = np.insert(gene_ids, 0, vocab[config.cls_token]) # default should always be to insert a cls token at the front
+        full_gene_ids = torch.stack([torch.from_numpy(cls_gene_ids).long() for i in range(adata_t.shape[0])], dim = 0)
+    else:
+        max_seq_len = config.max_seq_len
+        full_gene_ids = None
     # Evaluate cls cell embeddings
     if "cls" in include_types:
         if logger is not None:
@@ -603,49 +754,67 @@ def eval_testdata(
         tokenized_all, gene_idx_list= tokenize_and_pad_batch(
             all_counts,
             gene_ids,
-            max_len=config.max_seq_len,
+            max_len=max_seq_len,
             vocab=vocab,
             pad_token=config.pad_token,
             pad_value=config.pad_value,
             append_cls=True,  # append <cls> token at the beginning
             include_zero_gene=True,
+            simple_sampling = config.get('simple_sampling', True),
+            nonzero_prop = config.get('nonzero_prop', 0.7),
+            fix_nonzero_prop =  config.get('fix_nonzero_prop', False)
         )
 
 
         all_gene_ids, all_values = tokenized_all["genes"], tokenized_all["values"]
-
+        input_values = all_values.float()
+        if mask:
+            masked_values = random_mask_value(
+                all_values, mask_ratio=config.mask_ratio,
+                mask_value=config.mask_value, pad_value=config.pad_value,
+                cls_value= config.cls_value
+            )
+            input_values = masked_values.float()
+        masked_positions = input_values.eq(config.mask_value).cpu().numpy().astype(np.int0)
         if next_layer_key in adata_t.layers:
             tokenized_all_next, _ = tokenize_and_pad_batch(
                 all_counts_next,
                 gene_ids,
-                max_len=config.max_seq_len,
+                max_len=max_seq_len,
                 vocab=vocab,
                 pad_token=config.pad_token,
                 pad_value=config.pad_value,
                 append_cls=True,  # append <cls> token at the beginning
                 include_zero_gene=True,
-                sample_indices=gene_idx_list
+                sample_indices=gene_idx_list,
+                simple_sampling = config.get('simple_sampling', True),
+                nonzero_prop = config.get('nonzero_prop', 0.7),
+                fix_nonzero_prop =  config.get('fix_nonzero_prop', False)
             )
             all_gene_ids_next, all_values_next = tokenized_all_next["genes"], tokenized_all_next["values"]
-
+        
         src_key_padding_mask = all_gene_ids.eq(vocab[config.pad_token])
         with torch.no_grad(), torch.cuda.amp.autocast(enabled=config.amp):
-            #cell_embeddings = model.encode_batch(all_gene_ids,all_values.float(),
-            #    src_key_padding_mask=src_key_padding_mask,
-            #    batch_size=config.batch_size,
-            #    batch_labels=torch.from_numpy(batch_ids).long() if config.use_batch_label else None, # if config.DSBN else None,
-            #    time_step=0,
-            #    return_np=True,
-            #)
-            cell_embeddings, cell_embeddings_next, pert_preds, cls_preds, ps_preds, ps_preds_next, expr_dict = model.encode_batch_with_perturb(all_gene_ids,all_values.float(),
+            (cell_embeddings, 
+             cell_embeddings_next, 
+             pert_preds, 
+             cls_preds, 
+             ps_preds, 
+             ps_preds_next, 
+             expr_dict) = model.encode_batch_with_perturb(
+                all_gene_ids,
+                input_values,
                 src_key_padding_mask=src_key_padding_mask,
                 batch_size=config.batch_size,
                 batch_labels=torch.from_numpy(batch_ids).long() if config.use_batch_label else None, # if config.DSBN else None,
                 pert_labels = torch.from_numpy(perturbation_indexes).long() if config.perturbation_input else None,
-                pert_labels_next = torch.from_numpy(perturbation_indexes_next).long() if next_cell_prediction else None,
+                pert_labels_next = torch.from_numpy(next_genotype).long(),
+                perturbation = torch.from_numpy(perturbation_indexes_next).long() if next_cell_prediction else None,
+                pert_scale = torch.from_numpy(pert_scale).float() if reciprical_sampling else None,
                 time_step=0,
                 return_np=True,
-                predict_expr = predict_expr
+                predict_expr = predict_expr,
+                mvc_src = full_gene_ids
             )
 
         cell_embeddings = cell_embeddings / np.linalg.norm(
@@ -693,6 +862,8 @@ def eval_testdata(
 
         X_pert_cls_probs = np.exp(cls_preds) / np.sum(np.exp(cls_preds), axis=1, keepdims=True)
         adata_t.obsm['X_cls_pred_probs'] = X_pert_cls_probs
+        adata_t.obsm['mask'] = masked_positions
+        adata_t.obsm['gene_ids'] = np.array(gene_idx_list)
         label_predictions_cls = np.argmax(X_pert_cls_probs, axis=1)
         index_to_celltype = {v: k for k, v in cell_type_to_index.items()}
         predicted_celltypes = [index_to_celltype[i] for i in label_predictions_cls]
@@ -762,7 +933,7 @@ def wrapper_train(model, config, data_gen,
                 logger = logger,
                 device = device
             )
-        val_loss, val_loss_next, val_mre, val_mre_next, val_dab, val_cls, val_pert, val_ps, val_ps_next = evaluate(
+        val_loss, val_loss_next, val_mvc, val_mvc_next, val_mre, val_mre_next, val_dab, val_cls, val_pert, val_ps, val_ps_next = evaluate(
             model,
             loader=valid_loader,
             config=config,
@@ -775,15 +946,15 @@ def wrapper_train(model, config, data_gen,
             logger.info("-" * 89)
             logger.info(
                 f"| end of epoch {epoch:3d} | time: {elapsed:5.2f}s | "
-                f"valid loss/mse {val_loss:5.4f} | mre {val_mre:5.4f} | "
-                f"valid loss/mse_next {val_loss_next:5.4f} | mre_next {val_mre_next:5.4f} | "
+                f"valid loss/mse {val_loss:5.4f} | mvc {val_mvc:5.4f} | "
+                f"valid loss/mse_next {val_loss_next:5.4f} | mvc_next {val_mvc_next:5.4f} | "
                 f"valid dab {val_dab:5.4f} | valid cls {val_cls:5.4f} | valid pert {val_pert:5.4f} |"
                 f"valid ps {val_ps:5.4f} | valid ps_next {val_ps_next:5.4f} |"
             )
             logger.info("-" * 89)
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        loss = val_loss + val_loss_next + val_mvc + val_mvc_next + val_cls + val_pert
+        if loss < best_val_loss:
+            best_val_loss = loss
             best_model = copy.deepcopy(model)
             best_model_epoch = epoch
             if logger is not None:
@@ -792,7 +963,8 @@ def wrapper_train(model, config, data_gen,
         #if epoch % config.save_eval_interval == 0 or epoch == config.epochs:
         if epoch % 2 == 1:
             logger.info(f"Saving model to {save_dir}")
-            torch.save(best_model.state_dict(), save_dir / f"model_e{epoch}.pt")
+            torch.save(best_model.state_dict(), save_dir / "best_model.pt")
+            torch.save(model.state_dict(), save_dir / f"model_e{epoch}.pt")
             save_dir2 = save_dir / f'e{epoch}_imgs'
             save_dir2.mkdir(parents=True, exist_ok=True)
             
@@ -809,6 +981,8 @@ def wrapper_train(model, config, data_gen,
                     logger=logger,
                     epoch=epoch,
                     eval_key=eval_dict_key,
+                    reciprical_sampling = config.get('reciprical_sampling', False),
+                    no_pert_for_perturb = config.get('no_pert_for_perturb', config.get('reciprical_sampling', False))
                 )
                 adata_with_embeddings = results
                 
