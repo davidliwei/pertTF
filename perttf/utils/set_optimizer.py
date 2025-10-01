@@ -15,9 +15,27 @@ def create_optimizer_dict(model, device, config, num_batch_types = -1):
     else:
         discriminator = None
 
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.lr, eps=1e-4 if config.amp else 1e-8
     )
+    
+    clipper = None
+    if config.get('grad_clip', None) == 'zclip':
+        try:
+            from zclip import ZClip
+            clipper = ZClip(mode="zscore", alpha=0.97, max_grad_norm=1)
+            print(f'auto gradient clipping using zclip')
+        except:
+            print('zclip is not installed')
+    elif config.get('grad_clip', None) == 'autoclip':
+        try:
+            from autoclip.torch import QuantileClip
+            optimizer = QuantileClip.as_optimizer(optimizer=optimizer, quantile=0.9, history_length=2000)
+            print(f'auto gradient clipping using autoclip')
+        except:
+            print('autoclip is not installed')
+
+
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, gamma=config.schedule_ratio)
 
     if DAB_separate_optim:
@@ -55,6 +73,7 @@ def create_optimizer_dict(model, device, config, num_batch_types = -1):
         "scheduler_E": scheduler_E,
         "optimizer_D": optimizer_D,
         "scheduler_D": scheduler_D,
-        'DAB_separate_optim': DAB_separate_optim
+        'DAB_separate_optim': DAB_separate_optim,
+        'clipper': clipper
     }
     return optimizer_dict

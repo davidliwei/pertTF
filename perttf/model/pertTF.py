@@ -19,6 +19,19 @@ from scgpt.model import TransformerModel
 from torch.nn import TransformerEncoder
 from perttf.model.modules import ExpressionActivate
 
+class LogitNorm(nn.Module):
+
+    def __init__(self, module ,t=1.0):
+        super(LogitNorm, self).__init__()
+        self.module = module
+        self.t = t
+
+    def forward(self, x):
+        x = self.module(x)
+        norms = torch.norm(x, p=2, dim=-1, keepdim=True) + 1e-7
+        logit_norm = torch.div(x, norms) / self.t
+        return logit_norm
+
 class PerturbationDecoder(nn.Module):
     """
     Decoder for perturbation label prediction.
@@ -189,6 +202,7 @@ class PerturbationTFModel(TransformerModel):
         self.pert_exp_mode = kwargs.pop("pert_exp_mode", 'concat')
         self.pert_exp_mode = self.pert_exp_mode if self.pert_exp_mode in ['concat', 'sum', 'direct_sum'] else 'concat'
         self.expr_activation = kwargs.pop('expr_activation', 'elu')
+        self.logit_norm = kwargs.pop('logit_norm', False)
         super().__init__(*args, **kwargs)
         self.expr_act = ExpressionActivate(activation = self.expr_activation)
         # add perturbation encoder
@@ -202,11 +216,14 @@ class PerturbationTFModel(TransformerModel):
             self.genotype_encoder = PertLabelEncoder(n_pert, self.d_model, padding_idx=self.pert_pad_id)
         self.pert_exp_encoder = PertExpEncoder(d_model, d_pert_emb = self.pert_embed_dim, mode = self.pert_exp_mode) 
         
+        
         # the following is the perturbation decoder
         #n_pert = kwargs.get("n_perturb", 1) 
         #nlayers_pert = kwargs.get("nlayers_perturb", 3) 
         self.pert_decoder = PerturbationDecoder(d_model, n_pert, nlayers=nlayers_pert)
-
+        if self.logit_norm: # this creates very different loss values
+            self.pert_decoder = LogitNorm(module = self.pert_decoder, t=0.1)
+            self.cls_decoder = LogitNorm(module = self.cls_decoder, t=0.1)
         # added: batch2 encoder, especially to model different cellular systems like cell line vs primary cells
         self.batch2_pad_id = None #kwargs.get("batch2_pad_id") if "batch2_pad_id" in kwargs else 2
         #self.batch2_encoder = nn.Embedding(2, d_model, padding_idx=self.batch2_pad_id)
