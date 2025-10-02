@@ -638,7 +638,7 @@ def eval_testdata(
     batch_ids = np.array(batch_ids)
 
     if mvc_full_expr: # if we want to get full expression from mvc decoder
-        max_seq_len = config.max_seq_len if config.get('simple_sampling', True) else 10000
+        max_seq_len = config.max_seq_len if config.get('sampling_mode', 'simple') else 10000
         cls_gene_ids = np.insert(gene_ids, 0, vocab[config.cls_token]) # default should always be to insert a cls token at the front
         full_gene_ids = torch.stack([torch.from_numpy(cls_gene_ids).long() for i in range(adata_t.shape[0])], dim = 0)
     else:
@@ -646,6 +646,13 @@ def eval_testdata(
         full_gene_ids = None
     # Evaluate cls cell embeddings
     if "cls" in include_types:
+        sampling_mode = config.get('sampling_mode', 'simple')
+        hvg_inds = None
+        if sampling_mode == 'hvg':
+            hvg_col = config.get('hvg_col', 'highly_variable')
+            assert hvg_col in adata_t.var.keys(), 'adata must have calculated HVGs or adata.var must have hvg_col'
+            hvg_inds = (np.where(adata_t.var[hvg_col])[0], np.where(~adata_t.var[hvg_col])[0])
+            max_seq_len = max(adata_t.var[hvg_col].sum()+config.get('non_hvg_size', 1000), max_seq_len)
         if logger is not None:
             logger.info("Evaluating cls cell embeddings")
         tokenized_all, gene_idx_list= tokenize_and_pad_batch(
@@ -657,9 +664,11 @@ def eval_testdata(
             pad_value=config.pad_value,
             append_cls=True,  # append <cls> token at the beginning
             include_zero_gene=True,
-            simple_sampling = config.get('simple_sampling', True),
+            sampling_mode = config.get('sampling_mode', 'simple'),
             nonzero_prop = config.get('nonzero_prop', 0.7),
-            fix_nonzero_prop =  config.get('fix_nonzero_prop', False)
+            fix_nonzero_prop =  config.get('fix_nonzero_prop', False),
+            hvg_inds = hvg_inds, 
+            non_hvg_size= config.get('non_hvg_size', 1000)
         )
 
 
@@ -676,9 +685,11 @@ def eval_testdata(
                 append_cls=True,  # append <cls> token at the beginning
                 include_zero_gene=True,
                 sample_indices=gene_idx_list,
-                simple_sampling = config.get('simple_sampling', True),
+                sampling_mode = config.get('sampling_mode', 'simple'),
                 nonzero_prop = config.get('nonzero_prop', 0.7),
-                fix_nonzero_prop =  config.get('fix_nonzero_prop', False)
+                fix_nonzero_prop =  config.get('fix_nonzero_prop', False),
+                hvg_inds = hvg_inds, 
+                non_hvg_size= config.get('non_hvg_size', 1000)
             )
             all_gene_ids_next, all_values_next = tokenized_all_next["genes"], tokenized_all_next["values"]
 
