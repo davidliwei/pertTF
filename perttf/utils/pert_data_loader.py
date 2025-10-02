@@ -326,10 +326,10 @@ class PertBatchCollator:
     """
     A collate function for the DataLoader that tokenizes, pads, and masks batches on the fly.
     """
-    def __init__(self, vocab: object, gene_ids: np.ndarray, full_tokenize: bool = False, **config):
+    def __init__(self, vocab: object, gene_ids: np.ndarray, full_tokenize: bool = False, hvg_inds = None, **config):
         self.config = config
         self.vocab = vocab
-        self.gene_ids = gene_ids
+        self.gene_ids = gene_ids # vector of gene ids
         self.full_tokenize = full_tokenize
         self.include_zero_gene = config.get('include_zero_gene', True)
         self.append_cls = config.get('append_cls', True)
@@ -341,9 +341,10 @@ class PertBatchCollator:
         self.mask_ratio = config.get('mask_ratio', 0.15)
         self.mask_value = config.get('mask_value', -1)
         self.nonzero_prop = config.get('nonzero_prop', 0.7)
-        self.simple_sampling = config.get('simple_sampling', True)
+        self.sampling_mode = config.get('sampling_mode', 'simple')
         self.fix_nonzero_prop = config.get('fix_nonzero_prop', False)
-        
+        self.non_hvg_size = config.get('non_hvg_size', 1000)
+        self.hvg_inds = hvg_inds
 
     def __call__(self, batch: list) -> dict:
         """
@@ -367,15 +368,18 @@ class PertBatchCollator:
             expr_mat, self.gene_ids, max_len=max_seq_len,cls_token=self.cls_token,
             vocab=self.vocab, pad_token=self.pad_token, pad_value=self.pad_value,
             append_cls=self.append_cls, include_zero_gene=self.include_zero_gene, 
-            cls_value=self.cls_value, simple_sampling = self.simple_sampling,
-            fix_nonzero_prop=self.fix_nonzero_prop, nonzero_prop=self.nonzero_prop
+            cls_value=self.cls_value, sampling_mode = self.sampling_mode,
+            fix_nonzero_prop=self.fix_nonzero_prop, nonzero_prop=self.nonzero_prop,
+            hvg_inds = self.hvg_inds, non_hvg_size= self.non_hvg_size
         )
         tokenized_next, _ = tokenize_and_pad_batch(
             expr_mat_next, self.gene_ids, max_len=max_seq_len, cls_token=self.cls_token,
             vocab=self.vocab, pad_token=self.pad_token, pad_value=self.pad_value,
             append_cls=self.append_cls, include_zero_gene=self.include_zero_gene, 
-            sample_indices=gene_idx_list, cls_value=self.cls_value, simple_sampling = self.simple_sampling,
-            fix_nonzero_prop=self.fix_nonzero_prop, nonzero_prop=self.nonzero_prop
+            sample_indices=gene_idx_list, 
+            cls_value=self.cls_value, sampling_mode = self.sampling_mode,
+            fix_nonzero_prop=self.fix_nonzero_prop, nonzero_prop=self.nonzero_prop,
+            hvg_inds = self.hvg_inds, non_hvg_size= self.non_hvg_size
         )
         
         # 3. Apply random masking for this batch
@@ -466,12 +470,21 @@ class PertTFUniDataManager:
 
         self.set_genotype_index(genotype_to_index= genotype_to_index)
         self.set_celltype_index(celltype_to_index= celltype_to_index)
+
+        self.hvg_inds = None
+        if config.get('sampling_mode', 'simple') == 'hvg':
+            self.hvg_col = config.get('hvg_col', 'highly_variable')
+            assert self.hvg_col in adata.var.keys(), 'adata must have calculated HVGs or adata.var must have hvg_col'
+            n_hvg = self.adata.var[self.hvg_col].sum()
+            self.config.update({'max_seq_len': n_hvg+config.get('non_hvg_size', 1000)+config.get('append_cls', True)}, allow_val_change=True)
+            print(f'sampling_mode is hvg, using {n_hvg} genes for training')
+            self.hvg_inds = (np.where(self.adata.var[self.hvg_col])[0], np.where(~self.adata.var[self.hvg_col])[0])
         
         add_batch_info(self.adata)
         self.num_batch_types = len(self.adata.obs["batch_id"].unique())
         # The collators can be created once and reused
         ## first collator is the training collator, with a context window set in config
-        self.collator = PertBatchCollator(self.vocab, self.gene_ids, **config)
+        self.collator = PertBatchCollator(self.vocab, self.gene_ids, hvg_inds = self.hvg_inds, **config)
         ## full collator may be used for validation or inference 
         ## This may be very slow for full gene set, scaling is roughly 2x context length -> 3.6x time, 3-4x more memory
         self.full_token_collator = PertBatchCollator( self.vocab, self.gene_ids, full_tokenize=True, **config)
