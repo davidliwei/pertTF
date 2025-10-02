@@ -804,16 +804,31 @@ def wrapper_train(model, config, data_gen,
     # later, use the following to load json file
     #config_data = json.load(open(save_dir / 'config.json', 'r'))
     train_loader, valid_loader = data_gen['train_loader'], data_gen['valid_loader']
+    executor = ProcessPoolExecutor(
+        max_workers=4,
+        initializer=init_plot_worker,
+        mp_context=multiprocessing.get_context('forkserver') 
+        )
     evaltest_processes = []
 
     for epoch in range(1, config.epochs + 1):
         epoch_start_time = time.time()
         remaining_processes = []
         for p in evaltest_processes:
-            if p.is_alive():
-                remaining_processes.append(p)
+            if p.done():
+                try:
+                    result = p.result()
+                    metrics_to_log = result['metrics']
+                    for key, img_path in result['images'].items():
+                        metrics_to_log[key]= wandb.Image(img_path)  
+                    if metrics_to_log:
+                        wandb.log(metrics_to_log)
+                    logger.info(f'Finished {result["eval_dict_key"]} UMAP for epoch {result["epoch"]}')
+                except Exception as e:
+                    logger.warning(f'UMAP process failed for epoch {result["epoch"]} due to: {e}')
             else:
-                p.join()  # Joins the process to release resources
+                remaining_processes.append(p)
+         # Joins the process to release resources
         evaltest_processes = remaining_processes
         logger.info(f"Active UMAP processes: {len( evaltest_processes)}")
 
@@ -888,15 +903,16 @@ def wrapper_train(model, config, data_gen,
                 
                 # Pass data_gen['ps_names'] if it exists, otherwise None
                 ps_names = data_gen.get('ps_names', None)
-                
-                p = multiprocessing.Process(
-                    target=process_and_log_umaps,
-                    args=(adata_with_embeddings, config, epoch, eval_dict_key, save_dir2, ps_names)
+                #p = multiprocessing.Process(
+                 #   target=process_and_log_umaps,
+                  #  args=(adata_with_embeddings, config, epoch, eval_dict_key, save_dir2, ps_names)
+                #)
+                #p.start()           
+                p = executor.submit(
+                    process_and_log_umaps,
+                    adata_with_embeddings, SimpleNamespace(**config) , epoch, eval_dict_key, save_dir2, ps_names
                 )
-                p.start()
                 evaltest_processes.append(p)
-
-        
 
             #metrics_to_log["test/best_model_epoch"] = best_model_epoch
             wandb.log({"test/best_model_epoch":best_model_epoch})
