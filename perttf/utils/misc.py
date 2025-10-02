@@ -79,6 +79,7 @@ def init_plot_worker():
     import os
     import sys
     import warnings
+    warnings.filterwarnings('ignore', category=UserWarning)
     # Set environment in each worker
     conda_lib = os.path.join(sys.prefix, 'lib')
     os.environ['LD_LIBRARY_PATH'] = f"{conda_lib}:{os.environ.get('LD_LIBRARY_PATH', '')}"

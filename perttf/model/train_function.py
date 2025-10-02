@@ -5,7 +5,7 @@ import warnings
 from pathlib import Path
 import copy
 import numpy as np
-
+import pandas as pd
 from typing import Dict, Mapping, Optional, Tuple, Any, Union
 from typing import List, Tuple
 
@@ -744,22 +744,24 @@ def eval_testdata(
 
     batch_ids = np.array(batch_ids)
 
-    if mvc_full_expr: # if we want to get full expression from mvc decoder
-        max_seq_len = config.max_seq_len if config.get('sampling_mode', 'simple') else 10000
-        cls_gene_ids = np.insert(gene_ids, 0, vocab[config.cls_token]) # default should always be to insert a cls token at the front
-        full_gene_ids = torch.stack([torch.from_numpy(cls_gene_ids).long() for i in range(adata_t.shape[0])], dim = 0)
-    else:
-        max_seq_len = config.max_seq_len
-        full_gene_ids = None
     # Evaluate cls cell embeddings
     if "cls" in include_types:
         sampling_mode = config.get('sampling_mode', 'simple')
+        full_gene_ids = None
         hvg_inds = None
+        if mvc_full_expr: # if we want to get full expression from mvc decoder
+            max_seq_len = config.max_seq_len if sampling_mode == 'simple' else 10000
+            cls_gene_ids = np.insert(gene_ids, 0, vocab[config.cls_token]) # default should always be to insert a cls token at the front
+            full_gene_ids = torch.stack([torch.from_numpy(cls_gene_ids).long() for i in range(adata_t.shape[0])], dim = 0)
+        else:
+            max_seq_len = config.max_seq_len
+        
         if sampling_mode == 'hvg':
             hvg_col = config.get('hvg_col', 'highly_variable')
             assert hvg_col in adata_t.var.keys(), 'adata must have calculated HVGs or adata.var must have hvg_col'
             hvg_inds = (np.where(adata_t.var[hvg_col])[0], np.where(~adata_t.var[hvg_col])[0])
             max_seq_len = max(adata_t.var[hvg_col].sum()+config.get('non_hvg_size', 1000), max_seq_len)
+       
         if logger is not None:
             logger.info("Evaluating cls cell embeddings")
         tokenized_all, gene_idx_list= tokenize_and_pad_batch(
@@ -883,6 +885,9 @@ def eval_testdata(
         index_to_celltype = {v: k for k, v in cell_type_to_index.items()}
         predicted_celltypes = [index_to_celltype[i] for i in label_predictions_cls]
         adata_t.obs['predicted_celltype'] = predicted_celltypes
+        adata_t.obs['genotype_id'] = adata_t.obs['genotype'].map(genotype_to_index).astype(pd.CategoricalDtype(categories=list(genotype_to_index.values())))
+        adata_t.obs['celltype_id'] = adata_t.obs['celltype'].map(cell_type_to_index).astype(pd.CategoricalDtype(categories=list(cell_type_to_index.values())))
+ 
     return adata_t
 
 
@@ -933,6 +938,7 @@ def wrapper_train(model, config, data_gen,
 
     for epoch in range(1, config.epochs + 1):
         epoch_start_time = time.time()
+        # Clean up background UMAP and metric calculations on past test-data eval
         remaining_processes = []
         for p in evaltest_processes:
             if p.done():
@@ -945,7 +951,7 @@ def wrapper_train(model, config, data_gen,
                         wandb.log(metrics_to_log)
                     logger.info(f'Finished {result["eval_dict_key"]} UMAP for epoch {result["epoch"]}')
                 except Exception as e:
-                    logger.warning(f'UMAP process failed for epoch {result["epoch"]} due to: {e}')
+                    logger.warning(f'UMAP process failed due to: {e}')
             else:
                 remaining_processes.append(p)
          # Joins the process to release resources
@@ -991,6 +997,8 @@ def wrapper_train(model, config, data_gen,
                 logger.info(f"Best model with score {best_val_loss:5.4f}")
 
         #if epoch % config.save_eval_interval == 0 or epoch == config.epochs:
+        expression_epoch = config.get('eval_expr_interval', 0)
+        predict_expr_tmp = True if expression_epoch and epoch % expression_epoch == 0 else False
         if epoch % 2 == 1:
             logger.info(f"Saving model to {save_dir}")
             torch.save(best_model.state_dict(), save_dir / "best_model.pt")
@@ -1012,7 +1020,9 @@ def wrapper_train(model, config, data_gen,
                     epoch=epoch,
                     eval_key=eval_dict_key,
                     reciprical_sampling = config.get('reciprical_sampling', False),
-                    no_pert_for_perturb = config.get('no_pert_for_perturb', config.get('reciprical_sampling', False))
+                    no_pert_for_perturb = config.get('no_pert_for_perturb', config.get('reciprical_sampling', False)),
+                    predict_expr = predict_expr_tmp,
+                    mvc_full_expr= predict_expr_tmp
                 )
                 adata_with_embeddings = results
                 
