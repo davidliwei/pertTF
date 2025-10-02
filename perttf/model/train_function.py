@@ -15,6 +15,9 @@ from torch.utils.data import Dataset, DataLoader
 from anndata import AnnData
 import scanpy as sc
 import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+from types import SimpleNamespace
+#multiprocessing.set_start_method('spawn', force=True)
 import wandb
 from scipy.sparse import issparse
 
@@ -31,6 +34,7 @@ from perttf.model.train_data_gen import prepare_data,prepare_dataloader
 from perttf.utils.set_optimizer import create_optimizer_dict
 from perttf.custom_loss import criterion_neg_log_bernoulli, masked_mse_loss
 from perttf.utils.plot import process_and_log_umaps
+from perttf.utils.misc import init_plot_worker
 def train(model: nn.Module,
           loader: DataLoader,
           config,
