@@ -906,8 +906,8 @@ def wrapper_train(model, config, data_gen,
                 logger.info(f"Best model with score {best_val_loss:5.4f}")
 
         #if epoch % config.save_eval_interval == 0 or epoch == config.epochs:
-        expression_epoch = config.get('eval_expr_interval', 0)
-        predict_expr_tmp = True if expression_epoch and epoch % expression_epoch == 0 else False
+        eval_expr_interval = abs(config.get('eval_expr_interval', 0))//2*2 # this must be even to match the save interval below
+        predict_expr_tmp = True if eval_expr_interval and epoch % eval_expr_interval == 1 and config.get('next_cell_pred_type') == 'pert' else False
         if epoch % 2 == 1:
             logger.info(f"Saving model to {save_dir}")
             torch.save(best_model.state_dict(), save_dir / "best_model.pt")
