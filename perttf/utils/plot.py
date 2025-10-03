@@ -119,17 +119,14 @@ def process_and_log_umaps(adata_t, config, epoch: int, eval_key: str, save_dir: 
         
         # Load the AnnData object from the provided path
         #adata_t 
-        print(adata_t.obs['celltype_id'].unique())
         # This block is moved directly from your original `eval_testdata` function
         results = {}
         metrics_to_log = {"epoch": epoch}
         if 'mvc_next_expr' in adata_t.obsm.keys():
-            print('start expression eval')
             adata_wt = adata_t[adata_t.obs.genotype == 'WT',:]
             mvc_pred = expression_correlation(adata_wt, expr_layer = 'next_expr', pred_layer = 'mvc_next_expr')
             metrics_to_log[f"test/{eval_key}_pred_next_corr"] = mvc_pred[0]
             metrics_to_log[f"test/{eval_key}_mean_expr_corr"] = mvc_pred[1]
-        print('start class eval')
         celltype_auc, celltype_aupr = get_classification_metrics(adata_t,
                                                                 true_label_col="celltype",
                                                                 true_label_col_id="celltype_id",
@@ -145,7 +142,6 @@ def process_and_log_umaps(adata_t, config, epoch: int, eval_key: str, save_dir: 
         metrics_to_log[f"test/{eval_key}_celltype_aupr"] = celltype_aupr 
         metrics_to_log[f"test/{eval_key}_genotype_auc"] = genotype_auc
         metrics_to_log[f"test/{eval_key}_genotype_aupr"] = genotype_aupr
-        print('start umap')
         if config.next_cell_pred_type == 'pert':
             sc.pp.neighbors(adata_t, use_rep="X_scGPT_next")
             sc.tl.umap(adata_t, min_dist=0.3)
