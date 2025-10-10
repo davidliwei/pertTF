@@ -73,3 +73,23 @@ def unbin_matrix(
             unbinned_matrix[i, binned_row == bin_idx] = rep_value
 
     return unbinned_matrix
+
+def init_plot_worker():
+    """Initialize each worker process"""
+    import os
+    import sys
+    import warnings
+    warnings.filterwarnings('ignore', category=UserWarning)
+    # Set environment in each worker
+    conda_lib = os.path.join(sys.prefix, 'lib')
+    os.environ['LD_LIBRARY_PATH'] = f"{conda_lib}:{os.environ.get('LD_LIBRARY_PATH', '')}"
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    import matplotlib
+    matplotlib.use('Agg')
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try: # supress that stupid scgpt warning for flash_attn
+            import scgpt
+        except Exception:
+            pass

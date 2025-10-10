@@ -5,7 +5,7 @@ import warnings
 from pathlib import Path
 import copy
 import numpy as np
-
+import pandas as pd
 from typing import Dict, Mapping, Optional, Tuple, Any, Union
 from typing import List, Tuple
 
@@ -15,6 +15,9 @@ from torch.utils.data import Dataset, DataLoader
 from anndata import AnnData
 import scanpy as sc
 import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+from types import SimpleNamespace
+#multiprocessing.set_start_method('spawn', force=True)
 import wandb
 from scipy.sparse import issparse
 
@@ -31,6 +34,7 @@ from perttf.model.train_data_gen import prepare_data, prepare_dataloader
 from perttf.utils.set_optimizer import create_optimizer_dict
 from perttf.custom_loss import cce_loss, criterion_neg_log_bernoulli, masked_mse_loss
 from perttf.utils.plot import process_and_log_umaps
+from perttf.utils.misc import init_plot_worker
 
 
 # function not used currently
@@ -740,15 +744,24 @@ def eval_testdata(
 
     batch_ids = np.array(batch_ids)
 
-    if mvc_full_expr: # if we want to get full expression from mvc decoder
-        max_seq_len = config.max_seq_len if config.get('simple_sampling', True) else 10000
-        cls_gene_ids = np.insert(gene_ids, 0, vocab[config.cls_token]) # default should always be to insert a cls token at the front
-        full_gene_ids = torch.stack([torch.from_numpy(cls_gene_ids).long() for i in range(adata_t.shape[0])], dim = 0)
-    else:
-        max_seq_len = config.max_seq_len
-        full_gene_ids = None
     # Evaluate cls cell embeddings
     if "cls" in include_types:
+        sampling_mode = config.get('sampling_mode', 'simple')
+        full_gene_ids = None
+        hvg_inds = None
+        if mvc_full_expr: # if we want to get full expression from mvc decoder
+            max_seq_len = config.max_seq_len if sampling_mode == 'simple' else 10000
+            cls_gene_ids = np.insert(gene_ids, 0, vocab[config.cls_token]) # default should always be to insert a cls token at the front
+            full_gene_ids = torch.stack([torch.from_numpy(cls_gene_ids).long() for i in range(adata_t.shape[0])], dim = 0)
+        else:
+            max_seq_len = config.max_seq_len
+        
+        if sampling_mode == 'hvg':
+            hvg_col = config.get('hvg_col', 'highly_variable')
+            assert hvg_col in adata_t.var.keys(), 'adata must have calculated HVGs or adata.var must have hvg_col'
+            hvg_inds = (np.where(adata_t.var[hvg_col])[0], np.where(~adata_t.var[hvg_col])[0])
+            max_seq_len = max(adata_t.var[hvg_col].sum()+config.get('non_hvg_size', 1000), max_seq_len)
+       
         if logger is not None:
             logger.info("Evaluating cls cell embeddings")
         tokenized_all, gene_idx_list= tokenize_and_pad_batch(
@@ -760,9 +773,11 @@ def eval_testdata(
             pad_value=config.pad_value,
             append_cls=True,  # append <cls> token at the beginning
             include_zero_gene=True,
-            simple_sampling = config.get('simple_sampling', True),
+            sampling_mode = config.get('sampling_mode', 'simple'),
             nonzero_prop = config.get('nonzero_prop', 0.7),
-            fix_nonzero_prop =  config.get('fix_nonzero_prop', False)
+            fix_nonzero_prop =  config.get('fix_nonzero_prop', False),
+            hvg_inds = hvg_inds, 
+            non_hvg_size= config.get('non_hvg_size', 1000)
         )
 
 
@@ -787,9 +802,11 @@ def eval_testdata(
                 append_cls=True,  # append <cls> token at the beginning
                 include_zero_gene=True,
                 sample_indices=gene_idx_list,
-                simple_sampling = config.get('simple_sampling', True),
+                sampling_mode = config.get('sampling_mode', 'simple'),
                 nonzero_prop = config.get('nonzero_prop', 0.7),
-                fix_nonzero_prop =  config.get('fix_nonzero_prop', False)
+                fix_nonzero_prop =  config.get('fix_nonzero_prop', False),
+                hvg_inds = hvg_inds, 
+                non_hvg_size= config.get('non_hvg_size', 1000)
             )
             all_gene_ids_next, all_values_next = tokenized_all_next["genes"], tokenized_all_next["values"]
         
@@ -868,6 +885,9 @@ def eval_testdata(
         index_to_celltype = {v: k for k, v in cell_type_to_index.items()}
         predicted_celltypes = [index_to_celltype[i] for i in label_predictions_cls]
         adata_t.obs['predicted_celltype'] = predicted_celltypes
+        adata_t.obs['genotype_id'] = adata_t.obs['genotype'].map(genotype_to_index).astype(pd.CategoricalDtype(categories=list(genotype_to_index.values())))
+        adata_t.obs['celltype_id'] = adata_t.obs['celltype'].map(cell_type_to_index).astype(pd.CategoricalDtype(categories=list(cell_type_to_index.values())))
+ 
     return adata_t
 
 
@@ -909,16 +929,32 @@ def wrapper_train(model, config, data_gen,
     # later, use the following to load json file
     #config_data = json.load(open(save_dir / 'config.json', 'r'))
     train_loader, valid_loader = data_gen['train_loader'], data_gen['valid_loader']
+    executor = ProcessPoolExecutor(
+        max_workers=4,
+        initializer=init_plot_worker,
+        mp_context=multiprocessing.get_context('forkserver') 
+        )
     evaltest_processes = []
 
     for epoch in range(1, config.epochs + 1):
         epoch_start_time = time.time()
+        # Clean up background UMAP and metric calculations on past test-data eval
         remaining_processes = []
         for p in evaltest_processes:
-            if p.is_alive():
-                remaining_processes.append(p)
+            if p.done():
+                try:
+                    result = p.result()
+                    metrics_to_log = result['metrics']
+                    for key, img_path in result['images'].items():
+                        metrics_to_log[key]= wandb.Image(img_path)  
+                    if metrics_to_log:
+                        wandb.log(metrics_to_log)
+                    logger.info(f'Finished {result["eval_dict_key"]} UMAP for epoch {result["epoch"]}')
+                except Exception as e:
+                    logger.warning(f'UMAP process failed due to: {e}')
             else:
-                p.join()  # Joins the process to release resources
+                remaining_processes.append(p)
+         # Joins the process to release resources
         evaltest_processes = remaining_processes
         logger.info(f"Active UMAP processes: {len( evaltest_processes)}")
 
@@ -961,6 +997,8 @@ def wrapper_train(model, config, data_gen,
                 logger.info(f"Best model with score {best_val_loss:5.4f}")
 
         #if epoch % config.save_eval_interval == 0 or epoch == config.epochs:
+        eval_expr_interval = abs(config.get('eval_expr_interval', 0))//2*2 # this must be even to match the save interval below
+        predict_expr_tmp = True if eval_expr_interval and epoch % eval_expr_interval == 1 and config.get('next_cell_pred_type') == 'pert' else False
         if epoch % 2 == 1:
             logger.info(f"Saving model to {save_dir}")
             torch.save(best_model.state_dict(), save_dir / "best_model.pt")
@@ -982,7 +1020,9 @@ def wrapper_train(model, config, data_gen,
                     epoch=epoch,
                     eval_key=eval_dict_key,
                     reciprical_sampling = config.get('reciprical_sampling', False),
-                    no_pert_for_perturb = config.get('no_pert_for_perturb', config.get('reciprical_sampling', False))
+                    no_pert_for_perturb = config.get('no_pert_for_perturb', config.get('reciprical_sampling', False)),
+                    predict_expr = predict_expr_tmp,
+                    mvc_full_expr= predict_expr_tmp
                 )
                 adata_with_embeddings = results
                 
@@ -995,15 +1035,16 @@ def wrapper_train(model, config, data_gen,
                 
                 # Pass data_gen['ps_names'] if it exists, otherwise None
                 ps_names = data_gen.get('ps_names', None)
-                
-                p = multiprocessing.Process(
-                    target=process_and_log_umaps,
-                    args=(adata_with_embeddings, config, epoch, eval_dict_key, save_dir2, ps_names)
+                #p = multiprocessing.Process(
+                 #   target=process_and_log_umaps,
+                  #  args=(adata_with_embeddings, config, epoch, eval_dict_key, save_dir2, ps_names)
+                #)
+                #p.start()           
+                p = executor.submit(
+                    process_and_log_umaps,
+                    adata_with_embeddings, SimpleNamespace(**config) , epoch, eval_dict_key, save_dir2, ps_names
                 )
-                p.start()
                 evaltest_processes.append(p)
-
-        
 
             #metrics_to_log["test/best_model_epoch"] = best_model_epoch
             wandb.log({"test/best_model_epoch":best_model_epoch})
