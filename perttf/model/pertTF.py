@@ -361,7 +361,6 @@ class PerturbationTFModel(TransformerModel):
         transformer_output=transformer_output_0
             
         output = {}
-        output["contrastive_dict"] = {}
         mlm_output = self.decoder(
             transformer_output
             if not self.use_batch_labels
@@ -384,7 +383,7 @@ class PerturbationTFModel(TransformerModel):
             output["mlm_zero_probs"] = mlm_output["zero_probs"]
 
         cell_emb_orig = self._get_cell_emb_from_layer(transformer_output, values)        
-        output["contrastive_dict"]['orig_emb0'] = cell_emb_orig
+
         #  concatenate cell embedding with perturbation embedding to generate next cell embedding
         if pert_labels_next is not None: #and False:
             #import pdb; pdb.set_trace()
