@@ -439,6 +439,7 @@ class PerturbationTFModel(TransformerModel):
             cos_sim = self.sim(cell1.unsqueeze(1), cell2.unsqueeze(0))  # (batch, batch)
             labels = torch.arange(cos_sim.size(0)).long().to(cell1.device)
             output["loss_cce"] = self.creterion_cce(cos_sim, labels)
+        cur_gene_token_embs = self.encoder(mvc_src) if mvc_src is not None else self.cur_gene_token_embs
         if MVC:
             mvc_output = self.mvc_decoder(
                 cell_emb
@@ -578,6 +579,7 @@ class PerturbationTFModel(TransformerModel):
             batch_labels_d = batch_labels[i : i + batch_size].to(device) if batch_labels is not None else None
             pert_labels_d = pert_labels[i : i + batch_size].to(device) if pert_labels is not None else None
             pert_labels_next_d = pert_labels_next[i : i + batch_size].to(device) if pert_labels_next is not None else None
+            mvc_src_d = mvc_src[i:i+batch_size].to(device) if mvc_src is not None else None
             raw_output = self._encode(
                 src_d,
                 values_d,

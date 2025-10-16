@@ -423,12 +423,13 @@ class PertTFUniDataManager:
         self.set_celltype_index(celltype_to_index= celltype_to_index)
 
         self.hvg_inds = None
+        n_hvg = config.get('n_hvg', 3000)
         if config.get('sampling_mode', 'simple') == 'hvg':
             self.hvg_col = config.get('hvg_col', 'highly_variable')
             assert self.hvg_col in adata.var.keys(), 'adata must have calculated HVGs or adata.var must have hvg_col'
-            n_hvg = self.adata.var[self.hvg_col].sum()
-            self.config.update({'max_seq_len': n_hvg+config.get('non_hvg_size', 1000)+config.get('append_cls', True)}, allow_val_change=True)
-            print(f'sampling_mode is hvg, using {n_hvg} genes for training')
+            n_hvg = min(self.adata.var[self.hvg_col].sum(), n_hvg)
+            self.config.update({'max_seq_len': n_hvg + config.get('non_hvg_size', 1000) + config.get('append_cls', True)}, allow_val_change=True)
+            print(f'sampling_mode is hvg, sampling {n_hvg} HVGs + {config.get("non_hvg_size", 1000)} non-HVGs for training')
             self.hvg_inds = (np.where(self.adata.var[self.hvg_col])[0], np.where(~self.adata.var[self.hvg_col])[0])
         
         add_batch_info(self.adata)

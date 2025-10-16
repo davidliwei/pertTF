@@ -103,23 +103,46 @@ class SimpleVocab:
         self.stoi[token] = len(self.itos)
 
 # Smarter sampling function to get more non-zero expression for each cell during sentence generation
-def weighted_sample(val, max_size, rng = default_rng(), mode = 'simple', non_zero_proportion = 0.7, fixed_ratio = False, hvg_inds = None, non_hvg_size = 1000):
+def weighted_sample(val, 
+                    max_size, 
+                    rng = default_rng(), 
+                    mode = 'simple', 
+                    non_zero_proportion = 0.7, 
+                    fixed_ratio = False, 
+                    hvg_nonhvg = None, 
+                    non_hvg_size = 1000):
+    
+    # for each cell, sample from the hvgs and non-hvgs seperately
+    hvg_size = max_size-non_hvg_size
     if mode == 'hvg':
-        assert hvg_inds is not None, 'hvg indices not given to sampling'
+        assert hvg_nonhvg is not None, 'hvg indices not given to sampling'
         # hvg_ids is a tuple, first element is hvg indices, second element is non-hvg_indices
         if non_hvg_size > 0:
-            non_hvgs= rng.choice(len(hvg_inds[1]), size = non_hvg_size, replace = False)
-            return np.concatenate([hvg_inds[0], hvg_inds[1][non_hvgs]])
+            non_hvgs= rng.choice(len(hvg_nonhvg[1]), size = non_hvg_size, replace = False)
+            samp_non_hvg_inds = hvg_nonhvg[1][non_hvgs]
         else:
-            return hvg_inds[0]
+            samp_non_hvg_inds = np.array([])
+        if hvg_size == len(hvg_nonhvg[0]):
+            samp_hvg_inds = hvg_nonhvg[0]
+        else:
+            hvgs = rng.choice(len(hvg_nonhvg[0]), size = hvg_size, replace = False)
+            samp_hvg_inds = hvg_nonhvg[0][hvgs]
+        return np.concatenate([samp_hvg_inds, samp_non_hvg_inds])
+
+    # for each cell, sample the expressed and zero genes seperately
     elif mode == 'expressed':
         nzero = np.where(val!=0)[0]
         zero = np.where(val==0)[0]
         non_zero_size = min(round(max_size*non_zero_proportion), len(nzero))
-        zero_size = max_size - non_zero_size if not fixed_ratio else min(max_size - non_zero_size, round(non_zero_size*(1-non_zero_proportion)/non_zero_proportion))
+        if fixed_ratio:
+            zero_size = min(max_size - non_zero_size, round(non_zero_size*(1-non_zero_proportion)/non_zero_proportion))
+        else:
+            zero_size = max_size - non_zero_size 
         nz_inds= rng.choice(len(nzero),size = non_zero_size, replace = False)
         z_inds= rng.choice(len(zero),size = zero_size, replace = False)
         return np.concatenate([nzero[nz_inds], zero[z_inds]])
+    
+    # randomly sample max_size number of genes for a cell
     else:
         return rng.choice(len(val),size = max_size, replace = False)
 
@@ -249,12 +272,12 @@ def pad_batch(
                 if not cls_appended:
                     idx = weighted_sample(values, max_len, rng=rng, mode = sampling_mode, 
                                             non_zero_proportion=nonzero_prop, fixed_ratio=fix_nonzero_prop, 
-                                            hvg_inds = hvg_inds, non_hvg_size = non_hvg_size)
+                                            hvg_nonhvg = hvg_inds, non_hvg_size = non_hvg_size)
                 else:
                     # sample from non-CLS tokens and add CLS token back
                     idx = weighted_sample(values[1:], max_len - 1, rng=rng, mode = sampling_mode, 
                                            non_zero_proportion=nonzero_prop, fixed_ratio=fix_nonzero_prop, 
-                                           hvg_inds = hvg_inds, non_hvg_size = non_hvg_size)
+                                           hvg_nonhvg = hvg_inds, non_hvg_size = non_hvg_size)
                     idx = idx + 1
                     idx = np.insert(idx, 0, 0)
             
@@ -268,6 +291,7 @@ def pad_batch(
             # If no sampling was needed, all original indices were used
             used_indices_list.append(gene_ids)
 
+    # reset max_len to minimize padding for batch
     max_ori_len = max(len(new_batch[i][0]) for i in range(len(new_batch)))
     max_len = min(max_ori_len, max_len)
     for i in range(len(new_batch)):
