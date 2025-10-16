@@ -103,25 +103,17 @@ class SimpleVocab:
         self.stoi[token] = len(self.itos)
 
 # Smarter sampling function to get more non-zero expression for each cell during sentence generation
-def weighted_sample(val, max_size, rng = default_rng(), mode = 'simple', non_zero_proportion = 0.7, fixed_ratio = False, hvg_inds = None, non_hvg_size = 1000):
-    if mode == 'hvg':
-        assert hvg_inds is not None, 'hvg indices not given to sampling'
-        # hvg_ids is a tuple, first element is hvg indices, second element is non-hvg_indices
-        if non_hvg_size > 0:
-            non_hvgs= rng.choice(len(hvg_inds[1]), size = non_hvg_size, replace = False)
-            return np.concatenate([hvg_inds[0], hvg_inds[1][non_hvgs]])
-        else:
-            return hvg_inds[0]
-    elif mode == 'expressed':
-        nzero = np.where(val!=0)[0]
-        zero = np.where(val==0)[0]
-        non_zero_size = min(round(max_size*non_zero_proportion), len(nzero))
-        zero_size = max_size - non_zero_size if not fixed_ratio else min(max_size - non_zero_size, round(non_zero_size*(1-non_zero_proportion)/non_zero_proportion))
-        nz_inds= rng.choice(len(nzero),size = non_zero_size, replace = False)
-        z_inds= rng.choice(len(zero),size = zero_size, replace = False)
-        return np.concatenate([nzero[nz_inds], zero[z_inds]])
-    else:
-        return rng.choice(len(val),size = max_size, replace = False)
+def weighted_sample(val, max_size, rng = default_rng(), simple = True, non_zero_proportion = 0.7, fixed_ratio = False):
+    if simple: # no weighted sampling
+        return rng.choice( len(val),size = max_size, replace = False)
+    nzero = np.where(val!=0)[0]
+    zero = np.where(val==0)[0]
+    non_zero_size = min(round(max_size*non_zero_proportion), len(nzero))
+    zero_size = max_size - non_zero_size if not fixed_ratio else min(max_size - non_zero_size, round(non_zero_size*(1-non_zero_proportion)/non_zero_proportion))
+    nz_inds= np.random.choice(len(nzero),size = non_zero_size, replace = False)
+    z_inds= np.random.choice(len(zero),size = zero_size, replace = False)
+    return np.concatenate([nzero[nz_inds], zero[z_inds]])
+
 
 # This function remains unchanged
 def tokenize_batch(
@@ -199,11 +191,9 @@ def pad_batch(
     vocab_mod: SimpleVocab = None,
     sample_indices: List[np.ndarray] = None,
     rng: default_rng = None,
-    sampling_mode: str = 'simple',
+    simple_sampling = True,
     nonzero_prop = 0.7,
     fix_nonzero_prop = False,
-    hvg_inds = None,
-    non_hvg_size = 0
 ) -> Tuple[Dict[str, torch.Tensor], List[np.ndarray]]:
     """
     Pad a batch of data.
@@ -247,14 +237,10 @@ def pad_batch(
             # Otherwise, perform random sampling
             else:
                 if not cls_appended:
-                    idx = weighted_sample(values, max_len, rng=rng, mode = sampling_mode, 
-                                            non_zero_proportion=nonzero_prop, fixed_ratio=fix_nonzero_prop, 
-                                            hvg_inds = hvg_inds, non_hvg_size = non_hvg_size)
+                    idx = weighted_sample(values, max_len, rng=rng, simple = simple_sampling, non_zero_proportion=nonzero_prop, fixed_ratio=fix_nonzero_prop)
                 else:
                     # sample from non-CLS tokens and add CLS token back
-                    idx = weighted_sample(values[1:], max_len - 1, rng=rng, mode = sampling_mode, 
-                                           non_zero_proportion=nonzero_prop, fixed_ratio=fix_nonzero_prop, 
-                                           hvg_inds = hvg_inds, non_hvg_size = non_hvg_size)
+                    idx = weighted_sample(values[1:], max_len - 1, rng=rng, simple = simple_sampling, non_zero_proportion=nonzero_prop, fixed_ratio=fix_nonzero_prop)
                     idx = idx + 1
                     idx = np.insert(idx, 0, 0)
             
@@ -329,11 +315,9 @@ def tokenize_and_pad_batch(
     mod_type: np.ndarray = None,
     vocab_mod: SimpleVocab = None,
     sample_indices: List[np.ndarray] = None,
-    sampling_mode: str = 'simple',
+    simple_sampling: bool = True,
     nonzero_prop: float = 0.7,
-    fix_nonzero_prop: bool = False,
-    hvg_inds = None,
-    non_hvg_size = 1000
+    fix_nonzero_prop: bool = False
 ) -> Tuple[Dict[str, torch.Tensor], List[np.ndarray]]:
     """
     Tokenize and pad a batch of data.
@@ -349,8 +333,6 @@ def tokenize_and_pad_batch(
             - The dictionary of padded data ('genes', 'values').
             - A list of the indices used for each sample.
     """
-    if hvg_inds is not None:
-        assert len(hvg_inds[0])+len(hvg_inds[1]) == len(gene_ids)
     cls_id = vocab[cls_token]
     cls_id_mod_type = None
     if mod_type is not None:
@@ -377,11 +359,9 @@ def tokenize_and_pad_batch(
         cls_appended=append_cls,
         vocab_mod=vocab_mod,
         sample_indices=sample_indices, # Pass the indices here
-        sampling_mode = sampling_mode,
+        simple_sampling = simple_sampling,
         nonzero_prop = nonzero_prop,
-        fix_nonzero_prop = fix_nonzero_prop,
-        hvg_inds = hvg_inds,
-        non_hvg_size = non_hvg_size # if this is set to True, the data may contain padding
+        fix_nonzero_prop = fix_nonzero_prop # if this is set to True, the data may contain padding
     )
     return batch_padded, used_indices
 
