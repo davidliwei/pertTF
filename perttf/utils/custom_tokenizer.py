@@ -118,11 +118,11 @@ def weighted_sample(val,
         assert hvg_nonhvg is not None, 'hvg indices not given to sampling'
         # hvg_ids is a tuple, first element is hvg indices, second element is non-hvg_indices
         if non_hvg_size > 0:
-            non_hvgs= rng.choice(len(hvg_nonhvg[1]), size = non_hvg_size, replace = False)
+            non_hvgs = rng.choice(len(hvg_nonhvg[1]), size = non_hvg_size, replace = False)
             samp_non_hvg_inds = hvg_nonhvg[1][non_hvgs]
         else:
             samp_non_hvg_inds = np.array([])
-        if hvg_size == len(hvg_nonhvg[0]):
+        if hvg_size >= len(hvg_nonhvg[0]):
             samp_hvg_inds = hvg_nonhvg[0]
         else:
             hvgs = rng.choice(len(hvg_nonhvg[0]), size = hvg_size, replace = False)

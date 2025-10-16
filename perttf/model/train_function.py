@@ -642,23 +642,23 @@ def eval_testdata(
     batch_ids = np.array(batch_ids)
 
     if mvc_full_expr: # if we want to get full expression from mvc decoder
-        max_seq_len = config.max_seq_len if config.get('sampling_mode', 'simple') else 10000
         cls_gene_ids = np.insert(gene_ids, 0, vocab[config.cls_token]) # default should always be to insert a cls token at the front
         full_gene_ids = torch.stack([torch.from_numpy(cls_gene_ids).long() for i in range(adata_t.shape[0])], dim = 0)
     else:
-        max_seq_len = config.max_seq_len
         full_gene_ids = None
     # Evaluate cls cell embeddings
     if "cls" in include_types:
         sampling_mode = config.get('sampling_mode', 'simple')
         hvg_inds = None
-        if sampling_mode == 'hvg':
+        max_seq_len = config.max_seq_len
+        if sampling_mode == 'expressed':
+            max_seq_len = 10000 #10k genes should include all expressed genes for most 10X data 
+        elif sampling_mode == 'hvg':
             hvg_col = config.get('hvg_col', 'highly_variable')
             assert hvg_col in adata_t.var.keys(), 'adata must have calculated HVGs or adata.var must have hvg_col'
             hvg_inds = (np.where(adata_t.var[hvg_col])[0], np.where(~adata_t.var[hvg_col])[0])
-            max_seq_len = max(adata_t.var[hvg_col].sum()+config.get('non_hvg_size', 1000), max_seq_len)
-        if logger is not None:
-            logger.info("Evaluating cls cell embeddings")
+            max_seq_len = adata_t.var[hvg_col].sum()+config.get('non_hvg_size', 1000)
+
         tokenized_all, gene_idx_list= tokenize_and_pad_batch(
             all_counts,
             gene_ids,
@@ -677,6 +677,8 @@ def eval_testdata(
 
 
         all_gene_ids, all_values = tokenized_all["genes"], tokenized_all["values"]
+        if logger is not None:
+            logger.info(f"Evaluating cls cell embeddings using {all_gene_ids.shape} for each cell")
 
         if next_layer_key in adata_t.layers:
             tokenized_all_next, _ = tokenize_and_pad_batch(

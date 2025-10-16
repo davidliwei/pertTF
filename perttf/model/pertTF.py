@@ -702,9 +702,9 @@ class PerturbationTFModel(TransformerModel):
 
 
         if predict_expr:
-            expr_dict['mlm_expr'] = (mlm_outputs, mlm_zero_outputs)
-            expr_dict['mvc_expr'] = (mvc_outputs, mvc_zero_outputs)
-            expr_dict['mvc_next_expr'] = (mvc_next_outputs, mvc_next_zero_outputs)
+            expr_dict['mlm_expr'] = (mlm_outputs[:,1:], mlm_zero_outputs[:,1:])
+            expr_dict['mvc_expr'] = (mvc_outputs[:,1:], mvc_zero_outputs[:,1:])
+            expr_dict['mvc_next_expr'] = (mvc_next_outputs[:,1:], mvc_next_zero_outputs[:,1:])
 
         return outputs, outputs_next, pert_outputs, cls_outputs, ps_outputs, ps_outputs_next, expr_dict
 
