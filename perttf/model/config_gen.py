@@ -24,25 +24,12 @@ def generate_config(parameter_dict,
                                         parameter_dict.get('cls_token', '<cls>'), 
                                         "<eoc>"]
 
-    parameter_dict['simple_sampling']  = parameter_dict.get('simple_sampling', False)
-    parameter_dict['fix_nonzero_prop'] = parameter_dict.get('fix_nonzero_prop', False)
-    parameter_dict['nonzero_prop'] = parameter_dict.get('nonzero_prop', 0.9)
 
-    parameter_dict['pert_exp_mode'] =  parameter_dict.get('pert_exp_mode', 'concat') 
-    parameter_dict['reciprical_sampling'] = parameter_dict.get('reciprical_sampling', False)
-    parameter_dict['no_pert_for_perturb'] = True if parameter_dict['reciprical_sampling'] else parameter_dict.get('no_pert_for_perturb', False)
-    parameter_dict['reciprical_genotype'] =  parameter_dict.get('reciprical_genotype', False)
-    
-    if parameter_dict['next_cell_pred_type'] == 'identity':
-      parameter_dict['next_weight'] = 0
-    if parameter_dict['next_cell_pred_type'] in ['identity', 'lochness']:
-      parameter_dict['reciprical_sampling'] = False
-      parameter_dict['no_pert_for_perturb'] = False
-      parameter_dict['reciprical_genotype'] =  False
+    #mask_ratio = config.mask_ratio
 
-        #mask_ratio = config.mask_ratio
     # n_input_bins = config.n_bins
     parameter_dict['max_seq_len'] = parameter_dict['n_hvg'] + 1
+
     use_wandb=True
     if use_wandb:
       run = wandb.init(
