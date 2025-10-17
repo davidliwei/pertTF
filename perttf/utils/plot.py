@@ -72,14 +72,14 @@ def process_and_log_umaps(adata_t, config, epoch: int, eval_key: str, save_dir: 
             "pred_celltype", "genotype_next", "next_umap_celltype",
             "next_umap_genotype", "next_umap_genotype_next"
         ]
+        saved_images = {}
         for res_key, res_img_val in results.items():
             if res_key in save_image_types:
                 save_path = save_dir / f"{eval_key}_embeddings_{res_key}_e{epoch}.png"
                 res_img_val.savefig(save_path, dpi=300, bbox_inches='tight')
                 plt.close(res_img_val) # Close the figure to free memory
-                metrics_to_log[f"test/{eval_key}_{res_key}"] = wandb.Image(
-                    str(save_path), caption=f"{eval_key}_{res_key} epoch {epoch}"
-                )
+                saved_images[f"test/{eval_key}_{res_key}"] = str(save_path)
+                #wandb.Image(str(save_path), caption=f"{eval_key}_{res_key} epoch {epoch}")
         
         # Handle Loness score plotting
         if config.ps_weight > 0:
@@ -102,11 +102,16 @@ def process_and_log_umaps(adata_t, config, epoch: int, eval_key: str, save_dir: 
                     plt.close(fig_lonc_pred)
 
         # Log all collected metrics to wandb
-        if metrics_to_log:
-            wandb.log(metrics_to_log)
+        #if metrics_to_log:
+            #wandb.log(metrics_to_log)
 
-        print(f"[Process {os.getpid()}] Finished processing for epoch {epoch}, key '{eval_key}'.")
-
+        return {
+            'images': saved_images,
+            'metrics': metrics_to_log,
+            'eval_dict_key': eval_key,
+            'epoch': epoch
+        }
+        
         # added: write validation adata_t back to disk
         # adata_t.write_h5ad(save_dir / f'adata_last_validation_{eval_key}.h5ad')
 

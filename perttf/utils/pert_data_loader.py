@@ -284,10 +284,10 @@ class PertBatchCollator:
     """
     A collate function for the DataLoader that tokenizes, pads, and masks batches on the fly.
     """
-    def __init__(self, vocab: object, gene_ids: np.ndarray, full_tokenize: bool = False, **config):
+    def __init__(self, vocab: object, gene_ids: np.ndarray, full_tokenize: bool = False, hvg_inds = None, **config):
         self.config = config
         self.vocab = vocab
-        self.gene_ids = gene_ids
+        self.gene_ids = gene_ids # vector of gene ids
         self.full_tokenize = full_tokenize
         self.include_zero_gene = config.get('include_zero_gene', True)
         self.append_cls = config.get('append_cls', True)
@@ -298,6 +298,11 @@ class PertBatchCollator:
         self.pad_value = config.get('pad_value', -2)
         self.mask_ratio = config.get('mask_ratio', 0.15)
         self.mask_value = config.get('mask_value', -1)
+        self.nonzero_prop = config.get('nonzero_prop', 0.7)
+        self.sampling_mode = config.get('sampling_mode', 'simple')
+        self.fix_nonzero_prop = config.get('fix_nonzero_prop', False)
+        self.non_hvg_size = config.get('non_hvg_size', 1000)
+        self.hvg_inds = hvg_inds
 
     def __call__(self, batch: list) -> dict:
         """
@@ -314,18 +319,25 @@ class PertBatchCollator:
         # during validation and predictions, this window may be around all genes with expression
         max_seq_len = self.max_seq_len if not self.full_tokenize else len(self.gene_ids) + self.append_cls
 
+
         # TODO: These functions may need to be modified to accomodate inputs w differing number of genes in the future
+        expr_mat, expr_mat_next = np.array(expr_list), np.array(expr_next_list)
         tokenized, gene_idx_list = tokenize_and_pad_batch(
-            np.array(expr_list), self.gene_ids, max_len=max_seq_len,cls_token=self.cls_token,
+            expr_mat, self.gene_ids, max_len=max_seq_len,cls_token=self.cls_token,
             vocab=self.vocab, pad_token=self.pad_token, pad_value=self.pad_value,
             append_cls=self.append_cls, include_zero_gene=self.include_zero_gene, 
-            cls_value=self.cls_value
+            cls_value=self.cls_value, sampling_mode = self.sampling_mode,
+            fix_nonzero_prop=self.fix_nonzero_prop, nonzero_prop=self.nonzero_prop,
+            hvg_inds = self.hvg_inds, non_hvg_size= self.non_hvg_size
         )
         tokenized_next, _ = tokenize_and_pad_batch(
-            np.array(expr_next_list), self.gene_ids, max_len=max_seq_len, cls_token=self.cls_token,
+            expr_mat_next, self.gene_ids, max_len=max_seq_len, cls_token=self.cls_token,
             vocab=self.vocab, pad_token=self.pad_token, pad_value=self.pad_value,
             append_cls=self.append_cls, include_zero_gene=self.include_zero_gene, 
-            sample_indices=gene_idx_list, cls_value=self.cls_value
+            sample_indices=gene_idx_list, 
+            cls_value=self.cls_value, sampling_mode = self.sampling_mode,
+            fix_nonzero_prop=self.fix_nonzero_prop, nonzero_prop=self.nonzero_prop,
+            hvg_inds = self.hvg_inds, non_hvg_size= self.non_hvg_size
         )
         
         # 3. Apply random masking for this batch
@@ -336,12 +348,16 @@ class PertBatchCollator:
         )
 
         # 4. Collate all other labels into tensors
+        full_gene_id = torch.from_numpy(self.gene_ids).long()
         collated_batch = {
             "gene_ids": tokenized["genes"],
             "next_gene_ids": tokenized_next["genes"],
             "values": masked_values,
             "target_values": tokenized["values"],
             "target_values_next": tokenized_next["values"],
+            "full_expr": torch.Tensor(expr_mat),
+            "full_expr_next": torch.Tensor(expr_mat_next),
+            "full_gene_ids": torch.stack([full_gene_id for i in range(len(batch))], dim = 0)
         }
         
         # Stack scalar or vector labels from each item in the batch
@@ -405,12 +421,22 @@ class PertTFUniDataManager:
 
         self.set_genotype_index(genotype_to_index= genotype_to_index)
         self.set_celltype_index(celltype_to_index= celltype_to_index)
+
+        self.hvg_inds = None
+        n_hvg = config.get('n_hvg', 3000)
+        if config.get('sampling_mode', 'simple') == 'hvg':
+            self.hvg_col = config.get('hvg_col', 'highly_variable')
+            assert self.hvg_col in adata.var.keys(), 'adata must have calculated HVGs or adata.var must have hvg_col'
+            n_hvg = min(self.adata.var[self.hvg_col].sum(), n_hvg)
+            self.config.update({'max_seq_len': n_hvg + config.get('non_hvg_size', 1000) + config.get('append_cls', True)}, allow_val_change=True)
+            print(f'sampling_mode is hvg, sampling {n_hvg} HVGs + {config.get("non_hvg_size", 1000)} non-HVGs for training')
+            self.hvg_inds = (np.where(self.adata.var[self.hvg_col])[0], np.where(~self.adata.var[self.hvg_col])[0])
         
         add_batch_info(self.adata)
         self.num_batch_types = len(self.adata.obs["batch_id"].unique())
         # The collators can be created once and reused
         ## first collator is the training collator, with a context window set in config
-        self.collator = PertBatchCollator(self.vocab, self.gene_ids, **config)
+        self.collator = PertBatchCollator(self.vocab, self.gene_ids, hvg_inds = self.hvg_inds, **config)
         ## full collator may be used for validation or inference 
         ## This may be very slow for full gene set, scaling is roughly 2x context length -> 3.6x time, 3-4x more memory
         self.full_token_collator = PertBatchCollator( self.vocab, self.gene_ids, full_tokenize=True, **config)
@@ -467,12 +493,12 @@ class PertTFUniDataManager:
         loader = self._create_loaders_from_dataset(data, full_token)
         return data, loader
 
-    def get_train_valid_loaders(self, test_size: float = 0.1, train_indices = None, valid_indices = None, full_token_validate  = False):
+    def get_train_valid_loaders(self, test_size: float = 0.1, train_indices = None, valid_indices = None, full_token_validate  = False, random_state = None):
         """Provides a single, standard train/validation split."""
         print(f"Creating a single train/validation split (test_size={test_size})...")
         if train_indices is None or valid_indices is None:
             indices = np.arange(self.adata.n_obs)
-            train_indices, valid_indices = train_test_split(indices, test_size=test_size, shuffle=True)
+            train_indices, valid_indices = train_test_split(indices, test_size=test_size, shuffle=True, random_state=random_state)
         else:
             assert len(set(train_indices).intersection(valid_indices)) == 0, 'training data and validation data are not separate'
             print('overiding random train/valid split with provided indices')

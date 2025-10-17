@@ -24,11 +24,18 @@ def generate_config(parameter_dict,
                                         parameter_dict.get('cls_token', '<cls>'), 
                                         "<eoc>"]
 
-
+    parameter_dict['sampling_mode']  = parameter_dict.get('sampling_mode', 'simple')
+    parameter_dict['fix_nonzero_prop'] = parameter_dict.get('fix_nonzero_prop', False)
+    parameter_dict['nonzero_prop'] = parameter_dict.get('nonzero_prop', 0.9)
+    if parameter_dict['next_cell_pred_type'] == 'identity':
+      parameter_dict['next_weight'] = 0
     #mask_ratio = config.mask_ratio
 
     # n_input_bins = config.n_bins
-    parameter_dict['max_seq_len'] = parameter_dict['n_hvg'] + 1
+    if parameter_dict['sampling_mode'] == 'hvg':
+      parameter_dict['max_seq_len'] = parameter_dict['n_hvg'] + parameter_dict.get('non_hvg_size', 1000)+parameter_dict.get('append_cls', True)
+    else:
+      parameter_dict['max_seq_len'] = parameter_dict['n_hvg'] + parameter_dict.get('append_cls', True)
 
     use_wandb=True
     if use_wandb:

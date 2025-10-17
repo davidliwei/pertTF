@@ -102,7 +102,49 @@ class SimpleVocab:
         self.itos[len(self.itos)] = token
         self.stoi[token] = len(self.itos)
 
+# Smarter sampling function to get more non-zero expression for each cell during sentence generation
+def weighted_sample(val, 
+                    max_size, 
+                    rng = default_rng(), 
+                    mode = 'simple', 
+                    non_zero_proportion = 0.7, 
+                    fixed_ratio = False, 
+                    hvg_nonhvg = None, 
+                    non_hvg_size = 1000):
+    
+    # for each cell, sample from the hvgs and non-hvgs seperately
+    hvg_size = max_size-non_hvg_size
+    if mode == 'hvg':
+        assert hvg_nonhvg is not None, 'hvg indices not given to sampling'
+        # hvg_ids is a tuple, first element is hvg indices, second element is non-hvg_indices
+        if non_hvg_size > 0:
+            non_hvgs = rng.choice(len(hvg_nonhvg[1]), size = non_hvg_size, replace = False)
+            samp_non_hvg_inds = hvg_nonhvg[1][non_hvgs]
+        else:
+            samp_non_hvg_inds = np.array([])
+        if hvg_size >= len(hvg_nonhvg[0]):
+            samp_hvg_inds = hvg_nonhvg[0]
+        else:
+            hvgs = rng.choice(len(hvg_nonhvg[0]), size = hvg_size, replace = False)
+            samp_hvg_inds = hvg_nonhvg[0][hvgs]
+        return np.concatenate([samp_hvg_inds, samp_non_hvg_inds])
 
+    # for each cell, sample the expressed and zero genes seperately
+    elif mode == 'expressed':
+        nzero = np.where(val!=0)[0]
+        zero = np.where(val==0)[0]
+        non_zero_size = min(round(max_size*non_zero_proportion), len(nzero))
+        if fixed_ratio:
+            zero_size = min(max_size - non_zero_size, round(non_zero_size*(1-non_zero_proportion)/non_zero_proportion))
+        else:
+            zero_size = max_size - non_zero_size 
+        nz_inds= rng.choice(len(nzero),size = non_zero_size, replace = False)
+        z_inds= rng.choice(len(zero),size = zero_size, replace = False)
+        return np.concatenate([nzero[nz_inds], zero[z_inds]])
+    
+    # randomly sample max_size number of genes for a cell
+    else:
+        return rng.choice(len(val),size = max_size, replace = False)
 
 # This function remains unchanged
 def tokenize_batch(
@@ -111,7 +153,7 @@ def tokenize_batch(
     return_pt: bool = True,
     append_cls: bool = True,
     include_zero_gene: bool = False,
-    cls_id: int = "<cls>",
+    cls_id: int = 1,
     cls_value: int = -3,
     mod_type: np.ndarray = None,
     cls_id_mod_type: int = None,
@@ -179,7 +221,12 @@ def pad_batch(
     cls_appended: bool = True,
     vocab_mod: SimpleVocab = None,
     sample_indices: List[np.ndarray] = None,
-    rng: default_rng = None
+    rng: default_rng = None,
+    sampling_mode: str = 'simple',
+    nonzero_prop = 0.7,
+    fix_nonzero_prop = False,
+    hvg_inds = None,
+    non_hvg_size = 0
 ) -> Tuple[Dict[str, torch.Tensor], List[np.ndarray]]:
     """
     Pad a batch of data.
@@ -199,6 +246,8 @@ def pad_batch(
             - A list of numpy arrays with the indices used for each sample.
     """
     rng = default_rng() if rng is None else rng # much faster sampling of genes
+    if sample_indices is not None:
+        assert len(sample_indices) == len(batch), 'if sample indices are provided, number of samples in batch must match number of sample indices'
     max_ori_len = max(len(batch[i][0]) for i in range(len(batch)))
     max_len = min(max_ori_len, max_len)
 
@@ -210,7 +259,7 @@ def pad_batch(
     values_list = []
     mod_types_list = []
     used_indices_list = []
-
+    new_batch = []
     for i in range(len(batch)):
         gene_ids, values, mod_types = batch[i]
 
@@ -221,10 +270,14 @@ def pad_batch(
             # Otherwise, perform random sampling
             else:
                 if not cls_appended:
-                    idx = rng.choice(len(gene_ids), max_len, replace=False)
+                    idx = weighted_sample(values, max_len, rng=rng, mode = sampling_mode, 
+                                            non_zero_proportion=nonzero_prop, fixed_ratio=fix_nonzero_prop, 
+                                            hvg_nonhvg = hvg_inds, non_hvg_size = non_hvg_size)
                 else:
                     # sample from non-CLS tokens and add CLS token back
-                    idx = rng.choice(len(gene_ids) - 1, max_len - 1, replace=False)
+                    idx = weighted_sample(values[1:], max_len - 1, rng=rng, mode = sampling_mode, 
+                                           non_zero_proportion=nonzero_prop, fixed_ratio=fix_nonzero_prop, 
+                                           hvg_nonhvg = hvg_inds, non_hvg_size = non_hvg_size)
                     idx = idx + 1
                     idx = np.insert(idx, 0, 0)
             
@@ -232,11 +285,17 @@ def pad_batch(
             values = values[idx]
             if mod_types is not None:
                 mod_types = mod_types[idx]
+            new_batch.append((gene_ids, values, mod_types))
             used_indices_list.append(idx)
         else:
             # If no sampling was needed, all original indices were used
-            used_indices_list.append(np.arange(len(gene_ids)))
+            used_indices_list.append(gene_ids)
 
+    # reset max_len to minimize padding for batch
+    max_ori_len = max(len(new_batch[i][0]) for i in range(len(new_batch)))
+    max_len = min(max_ori_len, max_len)
+    for i in range(len(new_batch)):
+        gene_ids, values, mod_types = new_batch[i]
         if len(gene_ids) < max_len:
             gene_ids = torch.cat(
                 [
@@ -268,7 +327,6 @@ def pad_batch(
         values_list.append(values)
         if mod_types is not None:
             mod_types_list.append(mod_types)
-
     batch_padded = {
         "genes": torch.stack(gene_ids_list, dim=0),
         "values": torch.stack(values_list, dim=0),
@@ -295,6 +353,11 @@ def tokenize_and_pad_batch(
     mod_type: np.ndarray = None,
     vocab_mod: SimpleVocab = None,
     sample_indices: List[np.ndarray] = None,
+    sampling_mode: str = 'simple',
+    nonzero_prop: float = 0.7,
+    fix_nonzero_prop: bool = False,
+    hvg_inds = None,
+    non_hvg_size = 1000
 ) -> Tuple[Dict[str, torch.Tensor], List[np.ndarray]]:
     """
     Tokenize and pad a batch of data.
@@ -310,6 +373,8 @@ def tokenize_and_pad_batch(
             - The dictionary of padded data ('genes', 'values').
             - A list of the indices used for each sample.
     """
+    if hvg_inds is not None:
+        assert len(hvg_inds[0])+len(hvg_inds[1]) == len(gene_ids)
     cls_id = vocab[cls_token]
     cls_id_mod_type = None
     if mod_type is not None:
@@ -335,7 +400,12 @@ def tokenize_and_pad_batch(
         pad_value,
         cls_appended=append_cls,
         vocab_mod=vocab_mod,
-        sample_indices=sample_indices,  # Pass the indices here
+        sample_indices=sample_indices, # Pass the indices here
+        sampling_mode = sampling_mode,
+        nonzero_prop = nonzero_prop,
+        fix_nonzero_prop = fix_nonzero_prop,
+        hvg_inds = hvg_inds,
+        non_hvg_size = non_hvg_size # if this is set to True, the data may contain padding
     )
     return batch_padded, used_indices
 
