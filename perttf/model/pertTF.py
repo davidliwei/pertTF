@@ -408,37 +408,28 @@ class PerturbationTFModel(TransformerModel):
         if CLS:
             output["cls_output"] = self.cls_decoder(cell_emb)  # (batch, n_cls)
             output["cls_output_next"] = self.cls_decoder(cell_emb_next)  # (batch, n_cls)
-        if CCE:
+
+        if CCE and values_next is not None:
             cell1 = cell_emb
+            cell1_next = cell_emb_next
             transformer_output2 = self._encode(
-                src, values, src_key_padding_mask, batch_labels
+                src,  values_next, src_key_padding_mask, batch_labels,
+                input_pert_flags= pert_labels_next # Do we use pert_flags for transformer input?
             )
             cell2 = self._get_cell_emb_from_layer(transformer_output2)
+            cell2_next = None
+            if inv_perturbation is not None:
+                inv_pert_emb_next = self.pert_encoder(inv_perturbation)
+                inv_pert_emb_next = pert_emb_next * inv_pert_scale if inv_pert_scale is not None else pert_emb_next
+                cell2_next = self.pert_exp_encoder(cell2, inv_pert_emb_next)
 
-            # Gather embeddings from all devices if distributed training
-            if dist.is_initialized() and self.training:
-                cls1_list = [
-                    torch.zeros_like(cell1) for _ in range(dist.get_world_size())
-                ]
-                cls2_list = [
-                    torch.zeros_like(cell2) for _ in range(dist.get_world_size())
-                ]
-                dist.all_gather(tensor_list=cls1_list, tensor=cell1.contiguous())
-                dist.all_gather(tensor_list=cls2_list, tensor=cell2.contiguous())
-
-                # NOTE: all_gather results have no gradients, so replace the item
-                # of the current rank with the original tensor to keep gradients.
-                # See https://github.com/princeton-nlp/SimCSE/blob/main/simcse/models.py#L186
-                cls1_list[dist.get_rank()] = cell1
-                cls2_list[dist.get_rank()] = cell2
-
-                cell1 = torch.cat(cls1_list, dim=0)
-                cell2 = torch.cat(cls2_list, dim=0)
-            # TODO: should detach the second run cls2? Can have a try
-            cos_sim = self.sim(cell1.unsqueeze(1), cell2.unsqueeze(0))  # (batch, batch)
-            labels = torch.arange(cos_sim.size(0)).long().to(cell1.device)
-            output["loss_cce"] = self.creterion_cce(cos_sim, labels)
-        cur_gene_token_embs = self.encoder(mvc_src) if mvc_src is not None else self.cur_gene_token_embs
+            output["contrastive_dict"] = dict(
+                cell1_emb = cell1,
+                cell1_emb_next = cell1_next,
+                cell2_emb = cell2,
+                cell2_emb_next = cell2_next
+            )
+           
         if MVC:
             mvc_output = self.mvc_decoder(
                 cell_emb

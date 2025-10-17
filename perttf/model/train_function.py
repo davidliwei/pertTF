@@ -32,7 +32,7 @@ import matplotlib.pyplot as plt
 
 from perttf.model.train_data_gen import prepare_data,prepare_dataloader
 from perttf.utils.set_optimizer import create_optimizer_dict
-from perttf.custom_loss import criterion_neg_log_bernoulli, masked_mse_loss
+from perttf.custom_loss import perturb_embedding_loss, CCE_loss, criterion_neg_log_bernoulli, masked_mse_loss
 from perttf.utils.plot import process_and_log_umaps
 from perttf.utils.misc import init_plot_worker
 def train(model: nn.Module,
@@ -117,17 +117,33 @@ def train(model: nn.Module,
                 MVC=config.GEPC,
                 ECS=config.ecs_thres > 0,
                 CLS=config.cell_type_classifier,
+                CCE = config.CCE,
                 PERTPRED = config.perturbation_classifier_weight > 0,
                 PSPRED = config.ps_weight >0,
                 mvc_src = mvc_src
             )
-
+            #if batch == 0:
+               #for a in output_dict["contrastive_dict"]:
+                   #print(a)
+                   #print(output_dict["contrastive_dict"][a].shape)
+                   #print(output_dict["contrastive_dict"])
+            
             masked_positions = input_values.eq(config.mask_value)  # the postions to predict
             loss_mse = criterion(
                 output_dict["mlm_output"], target_values, masked_positions
             )
             loss = config.this_weight * loss_mse
-            metrics_to_log = {"train/mse": loss_mse.item()}
+            if "contrastive_dict" in output_dict:
+                loss_cce = CCE_loss(
+                    output_dict["contrastive_dict"]['cell1_emb'],
+                    output_dict["contrastive_dict"]['cell1_emb_next'],
+                    output_dict["contrastive_dict"]['cell2_emb'],
+                    output_dict["contrastive_dict"]['cell2_emb_next'],
+                    input_labels = celltype_labels*1000+perturbation_labels,
+                    pert_labels = celltype_labels_next*1000+perturbation_labels_next
+                    ) 
+                loss = loss+50*loss_cce
+            metrics_to_log = {"train/cce": loss_cce.item()}
             # next value?
             loss_mse_next = criterion(
                 output_dict["mlm_output"],
@@ -223,7 +239,8 @@ def train(model: nn.Module,
                 loss_dab = criterion_dab(output_dict["dab_output"], batch_labels)
                 loss = loss + config.dab_weight * loss_dab
                 metrics_to_log.update({"train/dab": loss_dab.item()})
-
+            #if config.CCE and epoch < 150:
+             #   loss = loss_cce
         model.zero_grad()
         #print(f"loss: {loss}")
         #import pdb; pdb.set_trace()
@@ -510,6 +527,7 @@ def evaluate(model: nn.Module,
 
     wandb.log(
         {
+
             "valid/mse": total_loss / total_num,
             "valid/mse_next": total_loss_next / total_num,
             "valid/mvc": total_mvc / total_num,
