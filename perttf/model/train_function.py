@@ -32,7 +32,7 @@ import matplotlib.pyplot as plt
 
 from perttf.model.train_data_gen import prepare_data,prepare_dataloader
 from perttf.utils.set_optimizer import create_optimizer_dict
-from perttf.custom_loss import perturb_embedding_loss, CCE_loss, criterion_neg_log_bernoulli, masked_mse_loss
+from perttf.custom_loss import perturb_embedding_loss, CCE_loss, SUPCON_loss, criterion_neg_log_bernoulli, masked_mse_loss
 from perttf.utils.plot import process_and_log_umaps
 from perttf.utils.misc import init_plot_worker
 def train(model: nn.Module,
@@ -133,7 +133,9 @@ def train(model: nn.Module,
                 output_dict["mlm_output"], target_values, masked_positions
             )
             loss = config.this_weight * loss_mse
+            metrics_to_log = {"train/mse": loss_mse.item()}
             if "contrastive_dict" in output_dict:
+                """
                 loss_cce = CCE_loss(
                     output_dict["contrastive_dict"]['cell1_emb'],
                     output_dict["contrastive_dict"]['cell1_emb_next'],
@@ -142,8 +144,24 @@ def train(model: nn.Module,
                     input_labels = celltype_labels*1000+perturbation_labels,
                     pert_labels = celltype_labels_next*1000+perturbation_labels_next
                     ) 
+                """
+                loss_cce = SUPCON_loss(
+                    features = torch.concat([
+                    output_dict["contrastive_dict"]['cell1_emb'],
+                    output_dict["contrastive_dict"]['cell1_emb_next'],
+                    output_dict["contrastive_dict"]['cell2_emb'],
+                    output_dict["contrastive_dict"]['cell2_emb_next']
+                    ], dim = 0).unsqueeze(1), 
+                    labels = torch.concat([
+                        celltype_labels*1000+perturbation_labels,
+                        celltype_labels_next*1000+perturbation_labels_next,
+                        celltype_labels_next*1000+perturbation_labels_next,
+                        celltype_labels*1000+perturbation_labels
+                        
+                    ]))
+
                 loss = loss+50*loss_cce
-            metrics_to_log = {"train/cce": loss_cce.item()}
+                metrics_to_log["train/cce"] =  loss_cce.item()
             # next value?
             loss_mse_next = criterion(
                 output_dict["mlm_output"],
