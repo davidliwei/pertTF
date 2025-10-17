@@ -288,6 +288,7 @@ def pad_batch(
             new_batch.append((gene_ids, values, mod_types))
             used_indices_list.append(idx)
         else:
+            new_batch.append((gene_ids, values, mod_types))
             # If no sampling was needed, all original indices were used
             used_indices_list.append(gene_ids)
 
