@@ -122,12 +122,7 @@ def train(model: nn.Module,
                 PSPRED = config.ps_weight >0,
                 mvc_src = mvc_src
             )
-            #if batch == 0:
-               #for a in output_dict["contrastive_dict"]:
-                   #print(a)
-                   #print(output_dict["contrastive_dict"][a].shape)
-                   #print(output_dict["contrastive_dict"])
-            
+
             masked_positions = input_values.eq(config.mask_value)  # the postions to predict
             loss_mse = criterion(
                 output_dict["mlm_output"], target_values, masked_positions
@@ -252,8 +247,7 @@ def train(model: nn.Module,
                 loss_dab = criterion_dab(output_dict["dab_output"], batch_labels)
                 loss = loss + config.dab_weight * loss_dab
                 metrics_to_log.update({"train/dab": loss_dab.item()})
-            #if config.CCE and epoch < 150:
-             #   loss = loss_cce
+
         model.zero_grad()
         #print(f"loss: {loss}")
         #import pdb; pdb.set_trace()
@@ -541,7 +535,6 @@ def evaluate(model: nn.Module,
 
     wandb.log(
         {
-
             "valid/mse": total_loss / total_num,
             "valid/mse_next": total_loss_next / total_num,
             "valid/mvc": total_mvc / total_num,
