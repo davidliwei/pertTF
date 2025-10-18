@@ -76,7 +76,6 @@ def train(model: nn.Module,
     scheduler_E=optim_dict["scheduler_E"]
     optimizer_D=optim_dict["optimizer_D"]
     scheduler_D=optim_dict["scheduler_D"]
-    clipper = optim_dict['clipper']
 
     # check ps_next_weight. The ps_next prediction is used for predicting the lochness score for a new gene from pert_next label
     if hasattr(config, "pred_lochness_next"):
@@ -260,9 +259,6 @@ def train(model: nn.Module,
         #import pdb; pdb.set_trace()
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-
-        if clipper is not None:
-            clipper.step(model)
 
         with warnings.catch_warnings(record=True) as w:
             warnings.filterwarnings("always")

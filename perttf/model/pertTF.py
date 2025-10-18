@@ -411,8 +411,7 @@ class PerturbationTFModel(TransformerModel):
             output["cls_output"] = self.cls_decoder(cell_emb)  # (batch, n_cls)
             output["cls_output_next"] = self.cls_decoder(cell_emb_next)  # (batch, n_cls)
 
-        
-           
+        cur_gene_token_embs = self.encoder(mvc_src) if mvc_src is not None else self.cur_gene_token_embs
         if MVC:
             mvc_output = self.mvc_decoder(
                 cell_emb
