@@ -19,6 +19,7 @@ from scgpt.model import TransformerModel
 from torch.nn import TransformerEncoder
 
 
+
 class PerturbationDecoder(nn.Module):
     """
     Decoder for perturbation label prediction.
@@ -180,7 +181,6 @@ class PerturbationTFModel(TransformerModel):
         #n_pert = kwargs.get("n_perturb", 1) 
         #nlayers_pert = kwargs.get("nlayers_perturb", 3) 
         self.pert_decoder = PerturbationDecoder(d_model, n_pert, nlayers=nlayers_pert)
-
         # added: batch2 encoder, especially to model different cellular systems like cell line vs primary cells
         self.batch2_pad_id = None #kwargs.get("batch2_pad_id") if "batch2_pad_id" in kwargs else 2
         #self.batch2_encoder = nn.Embedding(2, d_model, padding_idx=self.batch2_pad_id)
@@ -361,6 +361,7 @@ class PerturbationTFModel(TransformerModel):
         transformer_output=transformer_output_0
             
         output = {}
+        output["contrastive_dict"] = {}
         mlm_output = self.decoder(
             transformer_output
             if not self.use_batch_labels
@@ -383,7 +384,7 @@ class PerturbationTFModel(TransformerModel):
             output["mlm_zero_probs"] = mlm_output["zero_probs"]
 
         cell_emb_orig = self._get_cell_emb_from_layer(transformer_output, values)        
-
+        output["contrastive_dict"]['orig_emb0'] = cell_emb_orig
         #  concatenate cell embedding with perturbation embedding to generate next cell embedding
         if pert_labels_next is not None: #and False:
             #import pdb; pdb.set_trace()
@@ -397,6 +398,7 @@ class PerturbationTFModel(TransformerModel):
             )
             #tf_concat = cell_emb_orig + pert_emb_next
             cell_emb_next=self.pert_exp_encoder(tf_concat)
+            output["contrastive_dict"]['next_emb0'] = cell_emb_next
         else:
             tf_concat = None # add a placeholder
             cell_emb_next=cell_emb_orig
@@ -408,36 +410,7 @@ class PerturbationTFModel(TransformerModel):
         if CLS:
             output["cls_output"] = self.cls_decoder(cell_emb)  # (batch, n_cls)
             output["cls_output_next"] = self.cls_decoder(cell_emb_next)  # (batch, n_cls)
-        if CCE:
-            cell1 = cell_emb
-            transformer_output2 = self._encode(
-                src, values, src_key_padding_mask, batch_labels
-            )
-            cell2 = self._get_cell_emb_from_layer(transformer_output2)
 
-            # Gather embeddings from all devices if distributed training
-            if dist.is_initialized() and self.training:
-                cls1_list = [
-                    torch.zeros_like(cell1) for _ in range(dist.get_world_size())
-                ]
-                cls2_list = [
-                    torch.zeros_like(cell2) for _ in range(dist.get_world_size())
-                ]
-                dist.all_gather(tensor_list=cls1_list, tensor=cell1.contiguous())
-                dist.all_gather(tensor_list=cls2_list, tensor=cell2.contiguous())
-
-                # NOTE: all_gather results have no gradients, so replace the item
-                # of the current rank with the original tensor to keep gradients.
-                # See https://github.com/princeton-nlp/SimCSE/blob/main/simcse/models.py#L186
-                cls1_list[dist.get_rank()] = cell1
-                cls2_list[dist.get_rank()] = cell2
-
-                cell1 = torch.cat(cls1_list, dim=0)
-                cell2 = torch.cat(cls2_list, dim=0)
-            # TODO: should detach the second run cls2? Can have a try
-            cos_sim = self.sim(cell1.unsqueeze(1), cell2.unsqueeze(0))  # (batch, batch)
-            labels = torch.arange(cos_sim.size(0)).long().to(cell1.device)
-            output["loss_cce"] = self.creterion_cce(cos_sim, labels)
         cur_gene_token_embs = self.encoder(mvc_src) if mvc_src is not None else self.cur_gene_token_embs
         if MVC:
             mvc_output = self.mvc_decoder(
@@ -495,6 +468,7 @@ class PerturbationTFModel(TransformerModel):
         if PSPRED and self.ps_decoder is not None:
             output["ps_output"] = self.ps_decoder(cell_emb)
             if self.pred_lochness_next:
+                tf_concat=torch.cat([cell_emb_orig, pert_emb_next],dim=1)
                 output["ps_output_next"] = self.ps_decoder2(tf_concat)  # this is the concatenation of cell embedding and predictive label (next)
             else:
                 output["ps_output_next"] = self.ps_decoder(cell_emb_next)  # (batch, n_cls)

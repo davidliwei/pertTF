@@ -30,9 +30,9 @@ from scgpt.model import TransformerModel, AdversarialDiscriminator
 
 import matplotlib.pyplot as plt
 
-from perttf.model.train_data_gen import prepare_data,prepare_dataloader
+from perttf.model.train_data_gen import prepare_data, prepare_dataloader
 from perttf.utils.set_optimizer import create_optimizer_dict
-from perttf.custom_loss import criterion_neg_log_bernoulli, masked_mse_loss
+from perttf.custom_loss import cce_loss, criterion_neg_log_bernoulli, masked_mse_loss
 from perttf.utils.plot import process_and_log_umaps
 from perttf.utils.misc import init_plot_worker
 def train(model: nn.Module,
@@ -117,6 +117,7 @@ def train(model: nn.Module,
                 MVC=config.GEPC,
                 ECS=config.ecs_thres > 0,
                 CLS=config.cell_type_classifier,
+                CCE = config.CCE,
                 PERTPRED = config.perturbation_classifier_weight > 0,
                 PSPRED = config.ps_weight >0,
                 mvc_src = mvc_src
@@ -128,6 +129,29 @@ def train(model: nn.Module,
             )
             loss = config.this_weight * loss_mse
             metrics_to_log = {"train/mse": loss_mse.item()}
+
+            if config.CCE and len(output_dict["contrastive_dict"]) > 0:
+                cce_mode = config.get('cce_mode', 'cell+geno')
+                logit_norm = config.get('logit_norm', False)
+                if cce_mode == 'cell_geno': ## supervised contrastive loss plus a custom contrastive loss
+                    cce_weight = max(config.perturbation_classifier_weight*config.cell_type_classifier_weight, 1)
+                    input_labels = celltype_labels*1000+perturbation_labels # x1000 make labels unique combination of celltype and genotype
+                    pert_labels = celltype_labels_next*1000+perturbation_labels_next
+                    loss_cce = cce_loss(output_dict["contrastive_dict"], input_labels, pert_labels, logit_norm=logit_norm)
+                    metrics_to_log["train/cce"] = loss_cce.item()
+                    loss += loss_cce * cce_weight
+
+                if cce_mode == 'celltype' or cce_mode == 'cell+geno':
+                    loss_cce_celltype = cce_loss(output_dict["contrastive_dict"], celltype_labels, celltype_labels_next, logit_norm=logit_norm)
+                    metrics_to_log["train/cce_celltype"] = loss_cce_celltype.item()
+                    loss += loss_cce_celltype * max(config.cell_type_classifier_weight, 1)
+
+                if cce_mode == 'genotype' or cce_mode == 'cell+geno':
+                    loss_cce_genotype = cce_loss(output_dict["contrastive_dict"], perturbation_labels, perturbation_labels_next, logit_norm=logit_norm)
+                    metrics_to_log["train/cce_genotype"] = loss_cce_genotype.item()
+                    loss += loss_cce_genotype * max(config.perturbation_classifier_weight,1)
+                
+                
             # next value?
             loss_mse_next = criterion(
                 output_dict["mlm_output"],
@@ -229,6 +253,7 @@ def train(model: nn.Module,
         #import pdb; pdb.set_trace()
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
+
         with warnings.catch_warnings(record=True) as w:
             warnings.filterwarnings("always")
             torch.nn.utils.clip_grad_norm_(
