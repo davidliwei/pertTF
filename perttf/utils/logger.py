@@ -1,8 +1,8 @@
 import logging
 import sys
-def create_logger(id=0):
-
-    logger = logging.getLogger(f"pertTF_worker_{id}")
+def create_logger(id=None):
+    logger_name = f"pertTF_worker_{id}" if id is not None else 'pertTF'
+    logger = logging.getLogger(logger_name)
 # check if logger has been initialized
     if not logger.hasHandlers() or len(logger.handlers) == 0:
         logger.propagate = False
