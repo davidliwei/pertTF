@@ -35,7 +35,7 @@ from perttf.utils.set_optimizer import create_optimizer_dict
 from perttf.custom_loss import cce_loss, criterion_neg_log_bernoulli, masked_mse_loss
 from perttf.utils.plot import process_and_log_umaps
 from perttf.utils.misc import init_plot_worker
-PERT_LOGGER = create_logger()
+
 def train(model: nn.Module,
           loader: DataLoader,
           config,
