@@ -27,7 +27,7 @@ from scgpt.loss import (
 )
 from perttf.utils.custom_tokenizer import tokenize_and_pad_batch, random_mask_value
 from scgpt.model import TransformerModel, AdversarialDiscriminator
-
+from perttf.utils.logger import create_logger
 import matplotlib.pyplot as plt
 
 from perttf.model.train_data_gen import prepare_data, prepare_dataloader
@@ -35,17 +35,19 @@ from perttf.utils.set_optimizer import create_optimizer_dict
 from perttf.custom_loss import cce_loss, criterion_neg_log_bernoulli, masked_mse_loss
 from perttf.utils.plot import process_and_log_umaps
 from perttf.utils.misc import init_plot_worker
+PERT_LOGGER = create_logger()
 def train(model: nn.Module,
           loader: DataLoader,
           config,
           vocab,
           optim_dict: Dict,
           epoch = 0,
-          logger = scg.logger,
+          logger = None,
           device = None) -> None:
     """
     Train the model for one epoch.
     """
+    logger = create_logger() if logger is None else logger
     criterion = masked_mse_loss 
     criterion_dab = nn.CrossEntropyLoss()
     criterion_cls = nn.CrossEntropyLoss()
@@ -574,7 +576,7 @@ def eval_testdata(
     include_types: List[str] = ["cls","pert"],
     input_layer_key = "X_binned",
     next_layer_key = "X_binned_next",
-    logger = scg.logger,
+    logger = None,
     epoch = 0,
     eval_key = "", # titles for evaluation
     make_plots = True,
@@ -585,6 +587,7 @@ def eval_testdata(
     Evaluate the model on test data and return an AnnData object with embeddings.
     Plotting and UMAP are offloaded to a separate process.
     """
+    logger = create_logger() if logger is None else logger
     model.eval()
 
     # copy adata_t to avoid reuse previously computed results stored in adata_t
@@ -798,11 +801,11 @@ def eval_testdata(
 
 
 def wrapper_train(model, config, data_gen,
-                  logger = scg.logger,
+                  logger = None,
                   save_dir = None,
                   device = None,
                   eval_adata_dict: Dict = {}):
-
+    logger = create_logger() if logger is None else logger
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
