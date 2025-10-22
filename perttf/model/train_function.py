@@ -5,7 +5,7 @@ import warnings
 from pathlib import Path
 import copy
 import numpy as np
-
+import pandas as pd
 from typing import Dict, Mapping, Optional, Tuple, Any, Union
 from typing import List, Tuple
 
@@ -797,6 +797,10 @@ def eval_testdata(
         index_to_celltype = {v: k for k, v in cell_type_to_index.items()}
         predicted_celltypes = [index_to_celltype[i] for i in label_predictions_cls]
         adata_t.obs['predicted_celltype'] = predicted_celltypes
+        
+        adata_t.obs['genotype_id'] = adata_t.obs['genotype'].map(genotype_to_index).astype(pd.CategoricalDtype(categories=list(genotype_to_index.values())))
+        adata_t.obs['celltype_id'] = adata_t.obs['celltype'].map(cell_type_to_index).astype(pd.CategoricalDtype(categories=list(cell_type_to_index.values())))
+ 
     return adata_t
 
 
@@ -847,6 +851,7 @@ def wrapper_train(model, config, data_gen,
 
     for epoch in range(1, config.epochs + 1):
         epoch_start_time = time.time()
+        # Clean up background UMAP and metric calculations on past test-data eval
         remaining_processes = []
         for p in evaltest_processes:
             if p.done():
@@ -859,7 +864,7 @@ def wrapper_train(model, config, data_gen,
                         wandb.log(metrics_to_log)
                     logger.info(f'Finished {result["eval_dict_key"]} UMAP for epoch {result["epoch"]}')
                 except Exception as e:
-                    logger.warning(f'UMAP process failed for epoch {result["epoch"]} due to: {e}')
+                    logger.warning(f'UMAP process failed due to: {e}')
             else:
                 remaining_processes.append(p)
          # Joins the process to release resources
@@ -905,6 +910,8 @@ def wrapper_train(model, config, data_gen,
                 logger.info(f"Best model with score {best_val_loss:5.4f}")
 
         #if epoch % config.save_eval_interval == 0 or epoch == config.epochs:
+        expression_epoch = config.get('eval_expr_interval', 0)
+        predict_expr_tmp = True if expression_epoch and epoch % expression_epoch == 0 else False
         if epoch % 2 == 1:
             logger.info(f"Saving model to {save_dir}")
             torch.save(best_model.state_dict(), save_dir / "best_model.pt")
@@ -925,6 +932,8 @@ def wrapper_train(model, config, data_gen,
                     logger=logger,
                     epoch=epoch,
                     eval_key=eval_dict_key,
+                    predict_expr = predict_expr_tmp,
+                    mvc_full_expr= predict_expr_tmp
                 )
                 adata_with_embeddings = results
                 
