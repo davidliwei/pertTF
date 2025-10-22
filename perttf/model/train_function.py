@@ -771,34 +771,30 @@ def eval_testdata(
 
         # Assuming ret_adata.obsm['X_pert_pred'] is a numpy array or can be converted to one
 
-
+        # TODO: This is hardcoded to for genotype and celltype, change to a function in the future (will require major refactor of model and loader code)
         # Convert logits to probabilities using softmax
-        X_pert_pred_probs = np.exp(pert_preds) / np.sum(np.exp(pert_preds), axis=1, keepdims=True)
-
+        X_genotype_cls_probs = np.exp(pert_preds) / np.sum(np.exp(pert_preds), axis=1, keepdims=True)
         # Assign the probabilities back to the AnnData object
-        adata_t.obsm['X_pert_pred_probs'] = X_pert_pred_probs
-
+        adata_t.obsm['X_pert_pred_probs'] = X_genotype_cls_probs  # backward compatibility
+        adata_t.obsm['genotype_pred_probs'] = X_genotype_cls_probs
         # prompt: convert X_pert_pred_probs, which is the probabilities of each label, into label predictions, whose order is defined in genotype_to_index
-
         # Convert probabilities to predicted labels
-        label_predictions = np.argmax(X_pert_pred_probs, axis=1)
-
+        label_predictions = np.argmax(X_genotype_cls_probs, axis=1)
         # Map predicted indices back to genotypes using genotype_to_index
         # Assuming genotype_to_index is a dictionary where keys are indices and values are genotypes
         index_to_genotype = {v: k for k, v in genotype_to_index.items()}
         predicted_genotypes = [index_to_genotype[i] for i in label_predictions]
-
         # Add the predicted genotypes to the AnnData object
         adata_t.obs['predicted_genotype'] = predicted_genotypes
-
-        X_pert_cls_probs = np.exp(cls_preds) / np.sum(np.exp(cls_preds), axis=1, keepdims=True)
-        adata_t.obsm['X_cls_pred_probs'] = X_pert_cls_probs
-        label_predictions_cls = np.argmax(X_pert_cls_probs, axis=1)
+        adata_t.obs['genotype_id'] = adata_t.obs['genotype'].map(genotype_to_index).astype(pd.CategoricalDtype(categories=list(genotype_to_index.values())))
+ 
+        X_celltype_cls_probs = np.exp(cls_preds) / np.sum(np.exp(cls_preds), axis=1, keepdims=True)
+        adata_t.obsm['X_cls_pred_probs'] = X_celltype_cls_probs # backward compatibility
+        adata_t.obsm['celltype_pred_probs'] = X_celltype_cls_probs
+        label_predictions_cls = np.argmax(X_celltype_cls_probs, axis=1)
         index_to_celltype = {v: k for k, v in cell_type_to_index.items()}
         predicted_celltypes = [index_to_celltype[i] for i in label_predictions_cls]
         adata_t.obs['predicted_celltype'] = predicted_celltypes
-        
-        adata_t.obs['genotype_id'] = adata_t.obs['genotype'].map(genotype_to_index).astype(pd.CategoricalDtype(categories=list(genotype_to_index.values())))
         adata_t.obs['celltype_id'] = adata_t.obs['celltype'].map(cell_type_to_index).astype(pd.CategoricalDtype(categories=list(cell_type_to_index.values())))
  
     return adata_t

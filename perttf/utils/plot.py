@@ -40,10 +40,9 @@ def plot_confusion_matrix(y_true, y_pred, class_labels, title):
 
 def get_classification_metrics(
     adata,
-    true_label_col: str,
-    true_label_col_id: str,
-    pred_label_col: str,
-    proba_obsm_key: str
+    task_name: str,
+    metrics_to_log: dict = {},
+    metrics_prefix: str='test/'
 ):
     """
     Calculates and displays comprehensive classification metrics for a multi-class task.
@@ -55,7 +54,12 @@ def get_classification_metrics(
         proba_obsm_key: The key in adata.obsm where the (n_obs, n_classes)
                         prediction probabilities are stored.
     """
+    true_label_col=task_name
+    true_label_col_id=f"{task_name}_id"
+    pred_label_col=f"predicted_{task_name}"
+    proba_obsm_key=f"{task_name}_pred_probs"
     df = adata.obs
+    obsm = adata.obsm
     y_true = df[true_label_col]
     y_pred = df[pred_label_col]
     y_true_id = df[true_label_col_id]
@@ -63,10 +67,9 @@ def get_classification_metrics(
     class_labels = sorted(y_true.unique())
     class_labels_id = sorted(y_true_id.unique().categories)
     # 1. Classification Report (Precision, Recall, F1-Score)
-
     # --- Metrics requiring probabilities ---
     if proba_obsm_key in adata.obsm:
-        y_probas = adata.obsm[proba_obsm_key]
+        y_probas = obsm[proba_obsm_key]
         # Ensure y_probas columns align with class_labels.
         # This is a common source of error. The example assumes the
         # model's output probability columns are in the sorted order of class names.
@@ -102,10 +105,20 @@ def get_classification_metrics(
         #class_labels=class_labels,
         #title=f"Confusion Matrix for '{true_label_col}'"
     #)
-    return roc_auc, aupr, f1, accuracy
+    
+    metrics_to_log[f"{metrics_prefix}_{true_label_col}_auc"] = roc_auc
+    metrics_to_log[f"{metrics_prefix}_{true_label_col}_aupr"] = aupr 
+    metrics_to_log[f"{metrics_prefix}_{true_label_col}_f1"] = f1
+    metrics_to_log[f"{metrics_prefix}_{true_label_col}_acc"] = accuracy
+    return metrics_to_log
 
 
-def expression_correlation(adata, expr_layer = 'next_expr', pred_layer = 'mvc_next_expr', zero_layer = None):
+def expression_correlation( adata, 
+                            expr_layer = 'next_expr', 
+                            pred_layer = 'mvc_next_expr', 
+                            zero_layer = None,
+                            metrics_to_log: dict = {},
+                            metrics_prefix: str='test/'):
     true_expr = adata.layers[expr_layer].toarray()
     pred_expr = adata.obsm[pred_layer]
     true_expr_mean = true_expr.mean(0)
@@ -113,7 +126,9 @@ def expression_correlation(adata, expr_layer = 'next_expr', pred_layer = 'mvc_ne
     pred_expr = pred_expr * pred_expr_zero
     pred_corr = np.mean([pearsonr(pred_expr[i,:], true_expr[i,:])[0] for i in range(true_expr.shape[0])])
     mean_corr = np.mean([pearsonr(true_expr_mean, true_expr[i,:])[0] for i in range(true_expr.shape[0])])
-    return pred_corr, mean_corr
+    metrics_to_log[f"{metrics_prefix}_pred_next_corr"] = pred_corr
+    metrics_to_log[f"{metrics_prefix}_mean_expr_corr"] = mean_corr
+    return metrics_to_log
 
 
 def process_and_log_umaps(adata_t, config, epoch: int, eval_key: str, save_dir: Path, data_gen_ps_names: list = None):
@@ -122,38 +137,31 @@ def process_and_log_umaps(adata_t, config, epoch: int, eval_key: str, save_dir: 
     """
     try:
         print(f"[Process {os.getpid()}] Starting UMAP and plotting for epoch {epoch}, key '{eval_key}'.")
-        
         # Load the AnnData object from the provided path
         #adata_t 
-        print(adata_t.obs['celltype_id'].unique())
         # This block is moved directly from your original `eval_testdata` function
         results = {}
         metrics_to_log = {"epoch": epoch}
         if 'mvc_next_expr' in adata_t.obsm.keys() and config.next_cell_pred_type == 'pert':
-            print('start expression eval')
+            #print('start perturbation expression eval')
             adata_wt = adata_t[adata_t.obs.genotype == 'WT',:]
-            mvc_pred = expression_correlation(adata_wt, expr_layer = 'next_expr', pred_layer = 'mvc_next_expr')
-            metrics_to_log[f"test/{eval_key}_pred_next_corr"] = mvc_pred[0]
-            metrics_to_log[f"test/{eval_key}_mean_expr_corr"] = mvc_pred[1]
-        print('start class eval')
-        celltype_auc, celltype_aupr, celltype_f1, celltype_acc = get_classification_metrics(adata_t,
-                                                                true_label_col="celltype",
-                                                                true_label_col_id="celltype_id",
-                                                                pred_label_col="predicted_celltype",
-                                                                proba_obsm_key="X_cls_pred_probs" )
-        metrics_to_log[f"test/{eval_key}_celltype_auc"] = celltype_auc
-        metrics_to_log[f"test/{eval_key}_celltype_aupr"] = celltype_aupr 
-        metrics_to_log[f"test/{eval_key}_celltype_f1"] = celltype_f1
-        metrics_to_log[f"test/{eval_key}_celltype_acc"] = celltype_acc
-        genotype_auc, genotype_aupr, genotype_f1, genotype_acc  = get_classification_metrics(adata_t,
-                                                                true_label_col="genotype",
-                                                                true_label_col_id="genotype_id",
-                                                                pred_label_col="predicted_genotype",
-                                                                proba_obsm_key="X_pert_pred_probs" )
-        metrics_to_log[f"test/{eval_key}_genotype_auc"] = genotype_auc
-        metrics_to_log[f"test/{eval_key}_genotype_aupr"] = genotype_aupr
-        metrics_to_log[f"test/{eval_key}_genotype_f1"] = genotype_f1
-        metrics_to_log[f"test/{eval_key}_genotype_acc"] = genotype_acc
+            metrics_to_log = expression_correlation(adata_wt, 
+                                                    expr_layer = 'next_expr', 
+                                                    pred_layer = 'mvc_next_expr', 
+                                                    metrics_to_log = metrics_to_log,
+                                                    metrics_prefix = f'test/{eval_key}')
+        #print('start class eval')
+        cls_tasks = []
+        if config.cell_type_classifier and config.cell_type_classifier_weight > 0:
+            cls_tasks.append('celltype')
+        if config.perturbation_classifier_weight > 0:
+            cls_tasks.append('genotype')
+        for task in cls_tasks:
+            metrics_to_log = get_classification_metrics(adata_t,
+                                                    task_name=task,
+                                                    metrics_to_log = metrics_to_log,
+                                                    metrics_prefix = f'test/{eval_key}')
+        
         print('start umap')
         if config.next_cell_pred_type == 'pert':
             sc.pp.neighbors(adata_t, use_rep="X_scGPT_next")
