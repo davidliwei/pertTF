@@ -6,20 +6,163 @@ import anndata
 import os
 from pathlib import Path
 
+from scipy.stats import pearsonr
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+    f1_score,
+    accuracy_score,
+    average_precision_score, # For AUPR
+)
+from sklearn.preprocessing import label_binarize
+
+def plot_confusion_matrix(y_true, y_pred, class_labels, title):
+    """Generates and plots a confusion matrix."""
+    cm = confusion_matrix(y_true, y_pred, labels=class_labels)
+    plt.figure(figsize=(12, 8))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d", # Integer format
+        cmap="Blues",
+        xticklabels=class_labels,
+        yticklabels=class_labels,
+    )
+    plt.ylabel("Actual")
+    plt.xlabel("Predicted")
+    plt.title(title)
+    plt.show()
+
+def get_classification_metrics(
+    adata,
+    task_name: str,
+    metrics_to_log: dict = {},
+    metrics_prefix: str='test/'
+):
+    """
+    Calculates and displays comprehensive classification metrics for a multi-class task.
+
+    Args:
+        adata: Your AnnData object.
+        true_label_col: The column name in adata.obs for the ground truth labels.
+        pred_label_col: The column name in adata.obs for the predicted labels.
+        proba_obsm_key: The key in adata.obsm where the (n_obs, n_classes)
+                        prediction probabilities are stored.
+    """
+    true_label_col=task_name
+    true_label_col_id=f"{task_name}_id"
+    pred_label_col=f"predicted_{task_name}"
+    proba_obsm_key=f"{task_name}_pred_probs"
+    df = adata.obs
+    obsm = adata.obsm
+    y_true = df[true_label_col]
+    y_pred = df[pred_label_col]
+    y_true_id = df[true_label_col_id]
+    # Get the unique class labels in the correct order
+    class_labels = sorted(y_true.unique())
+    class_labels_id = sorted(y_true_id.unique().categories)
+    # 1. Classification Report (Precision, Recall, F1-Score)
+    # --- Metrics requiring probabilities ---
+    if proba_obsm_key in adata.obsm:
+        y_probas = obsm[proba_obsm_key]
+        # Ensure y_probas columns align with class_labels.
+        # This is a common source of error. The example assumes the
+        # model's output probability columns are in the sorted order of class names.
+        
+        # Binarize the true labels for multi-class AUC calculations
+        y_true_binarized = label_binarize(y_true_id, classes=class_labels_id)
+
+        # 2. ROC-AUC Score (One-vs-Rest)
+        # We use a weighted average to account for class imbalance.
+        roc_auc = roc_auc_score(
+            y_true_binarized,
+            y_probas,
+            multi_class="ovr",
+            average="macro"
+        )
+        f1 = f1_score(
+            y_true,
+            y_pred,
+            average="macro"
+        )
+        accuracy = accuracy_score(y_true, y_pred)
+        # 3. AUPR Score (Area Under Precision-Recall Curve)
+        aupr = average_precision_score(y_true_binarized, y_probas, average="macro")
+
+
+    else:
+        print(f"'{proba_obsm_key}' not found in adata.obsm. Skipping ROC-AUC and AUPR calculation.\n")
+
+    # 4. Confusion Matrix Plot
+    #plot_confusion_matrix(
+        #y_true,
+        #y_pred,
+        #class_labels=class_labels,
+        #title=f"Confusion Matrix for '{true_label_col}'"
+    #)
+    
+    metrics_to_log[f"{metrics_prefix}_{true_label_col}_auc"] = roc_auc
+    metrics_to_log[f"{metrics_prefix}_{true_label_col}_aupr"] = aupr 
+    metrics_to_log[f"{metrics_prefix}_{true_label_col}_f1"] = f1
+    metrics_to_log[f"{metrics_prefix}_{true_label_col}_acc"] = accuracy
+    return metrics_to_log
+
+
+def expression_correlation( adata, 
+                            expr_layer = 'next_expr', 
+                            pred_layer = 'mvc_next_expr', 
+                            zero_layer = None,
+                            metrics_to_log: dict = {},
+                            metrics_prefix: str='test/'):
+    true_expr = adata.layers[expr_layer].toarray()
+    pred_expr = adata.obsm[pred_layer]
+    true_expr_mean = true_expr.mean(0)
+    pred_expr_zero = adata.obsm[zero_layer] if zero_layer is not None else 1
+    pred_expr = pred_expr * pred_expr_zero
+    pred_corr = np.mean([pearsonr(pred_expr[i,:], true_expr[i,:])[0] for i in range(true_expr.shape[0])])
+    mean_corr = np.mean([pearsonr(true_expr_mean, true_expr[i,:])[0] for i in range(true_expr.shape[0])])
+    metrics_to_log[f"{metrics_prefix}_pred_next_corr"] = pred_corr
+    metrics_to_log[f"{metrics_prefix}_mean_expr_corr"] = mean_corr
+    return metrics_to_log
+
+
 def process_and_log_umaps(adata_t, config, epoch: int, eval_key: str, save_dir: Path, data_gen_ps_names: list = None):
     """
     Worker function to run UMAP, plotting, and logging in a separate process.
     """
     try:
         print(f"[Process {os.getpid()}] Starting UMAP and plotting for epoch {epoch}, key '{eval_key}'.")
-        
         # Load the AnnData object from the provided path
         #adata_t 
-
         # This block is moved directly from your original `eval_testdata` function
         results = {}
         metrics_to_log = {"epoch": epoch}
-
+        if 'mvc_next_expr' in adata_t.obsm.keys() and config.next_cell_pred_type == 'pert':
+            #print('start perturbation expression eval')
+            adata_wt = adata_t[adata_t.obs.genotype == 'WT',:]
+            metrics_to_log = expression_correlation(adata_wt, 
+                                                    expr_layer = 'next_expr', 
+                                                    pred_layer = 'mvc_next_expr', 
+                                                    metrics_to_log = metrics_to_log,
+                                                    metrics_prefix = f'test/{eval_key}')
+        #print('start class eval')
+        cls_tasks = []
+        if config.cell_type_classifier and config.cell_type_classifier_weight > 0:
+            cls_tasks.append('celltype')
+        if config.perturbation_classifier_weight > 0:
+            cls_tasks.append('genotype')
+        for task in cls_tasks:
+            metrics_to_log = get_classification_metrics(adata_t,
+                                                    task_name=task,
+                                                    metrics_to_log = metrics_to_log,
+                                                    metrics_prefix = f'test/{eval_key}')
+        
+        print('start umap')
         if config.next_cell_pred_type == 'pert':
             sc.pp.neighbors(adata_t, use_rep="X_scGPT_next")
             sc.tl.umap(adata_t, min_dist=0.3)
