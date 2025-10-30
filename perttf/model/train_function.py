@@ -639,8 +639,8 @@ def eval_testdata(
     if config.next_cell_pred_type == "pert":
         if "genotype_next" in adata_t.obs.columns:
             # this is the pred_next  
-            if config.perturbation_classifier_weight > 0:
-                next_cell_prediction = True
+            #if config.perturbation_classifier_weight > 0:
+            next_cell_prediction = True
         else:
             logger.warning('next cell pred is set to pert but the provided adata does not have genotype_next column')
             next_cell_prediction = False
@@ -965,7 +965,22 @@ def wrapper_train(model, config, data_gen,
         if config.ADV:
             optimizer_dict['scheduler_D'].step()
             optimizer_dict['scheduler_E'].step()
-
+            
+    # One final gather for the background processes
+    for p in evaltest_processes:
+            if p.done():
+                try:
+                    result = p.result()
+                    metrics_to_log = result['metrics']
+                    for key, img_path in result['images'].items():
+                        metrics_to_log[key]= wandb.Image(img_path)  
+                    if metrics_to_log:
+                        wandb.log(metrics_to_log)
+                    logger.info(f'Finished {result["eval_dict_key"]} UMAP for epoch {result["epoch"]}')
+                except Exception as e:
+                    logger.warning(f'UMAP process failed due to: {e}')
+            else:
+                remaining_processes.append(p)
     # save the best model
     torch.save(best_model.state_dict(), save_dir / "best_model.pt")
 
