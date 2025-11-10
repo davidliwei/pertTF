@@ -841,7 +841,7 @@ def wrapper_train(model, config, data_gen,
     executor = ProcessPoolExecutor(
         max_workers=4,
         initializer=init_plot_worker,
-        mp_context=multiprocessing.get_context('forkserver') 
+        mp_context=multiprocessing.get_context('spawn') 
         )
     evaltest_processes = []
 
@@ -913,9 +913,15 @@ def wrapper_train(model, config, data_gen,
             logger.info(f"Saving model to {save_dir}")
             torch.save(best_model.state_dict(), save_dir / "best_model.pt")
             torch.save(model.state_dict(), save_dir / f"model_e{epoch}.pt")
+        if epoch % 2 == 1:
+            torch.save(model.state_dict(), save_dir / f"model_e{epoch}.pt")
+        #if epoch % config.save_eval_interval == 0 or epoch == config.epochs:
+        eval_expr_interval = max(round(2e5/len(train_loader.dataset)), abs(config.get('eval_expr_interval', 2))//2*2) # this must be even to match the save interval below
+        predict_expr_tmp = True if eval_expr_interval and epoch % eval_expr_interval == 1 and config.get('next_cell_pred_type') == 'pert' else False
+        if epoch % eval_expr_interval == 1:
+            #logger.info(f"Saving model to {save_dir}")
             save_dir2 = save_dir / f'e{epoch}_imgs'
             save_dir2.mkdir(parents=True, exist_ok=True)
-            
             for eval_dict_key, eval_adata in eval_adata_dict.items():
                 # Step 1: Get AnnData with embeddings from the main process
                 results = eval_testdata(
