@@ -577,9 +577,6 @@ def eval_testdata(
     input_layer_key = "X_binned",
     next_layer_key = "X_binned_next",
     logger = None,
-    epoch = 0,
-    eval_key = "", # titles for evaluation
-    make_plots = True,
     predict_expr = False,
     mvc_full_expr = False
 ) -> Optional[Dict]: # Returns a dictionary containing the AnnData object
@@ -594,10 +591,16 @@ def eval_testdata(
     cell_type_to_index = train_data_dict["cell_type_to_index"]
     genotype_to_index = train_data_dict["genotype_to_index"]
     vocab=train_data_dict['vocab']
-
-    adata_t = adata_t.copy() # make a copy
+    # make sure adata_t is ready for training
+    shared_genes = adata_t.var.index.isin(list(vocab.stoi.keys()))
+    logger.log(f"{sum(shared_genes)} genes shared between model vocab's {len(vocab)} and anndata's f{adata_t.shape[1]} genes")
+    adata_t = adata_t[:, adata_t.var.index.isin(list(vocab.stoi.keys()))] 
     adata_t = adata_t[adata_t.obs['celltype'].isin(cell_type_to_index)]
-
+    adata_t = adata_t[adata_t.obs['genotype'].isin(genotype_to_index)]
+    genes_ids = vocab(adata_t.var.index.tolist())
+    if 'genotype_next' in adata_t.obs.keys():
+        adata_t = adata_t[adata_t.obs['genotype_next'].isin(genotype_to_index)]
+    adata_t = adata_t.copy()# make sure it is a independent copy for faster loading
     all_counts = (
         adata_t.layers[input_layer_key].toarray()
         if issparse(adata_t.layers[input_layer_key])

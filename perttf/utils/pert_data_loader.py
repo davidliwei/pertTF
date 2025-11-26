@@ -500,7 +500,8 @@ class PertTFUniDataManager:
             indices = np.arange(self.adata.n_obs)
             train_indices, valid_indices = train_test_split(indices, test_size=test_size, shuffle=True, random_state=random_state)
         else:
-            assert len(set(train_indices).intersection(valid_indices)) == 0, 'training data and validation data are not separate'
+            if len(set(train_indices).intersection(valid_indices)) > 0:
+                print('WARNING: training data and validation data are not separate, this may be okay for perturbation if the shared samples are ctrls')
             print('overiding random train/valid split with provided indices')
         train_data, train_loader = self.get_data_w_loader(train_indices)
         valid_data, valid_loader = self.get_data_w_loader(valid_indices, full_token=full_token_validate)
