@@ -247,7 +247,9 @@ def process_and_log_umaps(adata_t, config, epoch: int, eval_key: str, save_dir: 
         # Log all collected metrics to wandb
         #if metrics_to_log:
             #wandb.log(metrics_to_log)
-
+        # added: write validation adata_t back to disk
+        if hasattr(config, "save_validation_h5ad") and config.save_validation_h5ad:
+            adata_t.write_h5ad(save_dir / f'adata_last_validation_{eval_key}.h5ad')
         return {
             'images': saved_images,
             'metrics': metrics_to_log,
@@ -255,8 +257,7 @@ def process_and_log_umaps(adata_t, config, epoch: int, eval_key: str, save_dir: 
             'epoch': epoch
         }
         
-        # added: write validation adata_t back to disk
-        # adata_t.write_h5ad(save_dir / f'adata_last_validation_{eval_key}.h5ad')
+
 
     except Exception as e:
         print(f"Error in background UMAP process: {e}")
