@@ -16,15 +16,13 @@ from anndata import AnnData
 import scanpy as sc
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
-from types import SimpleNamespace
+from omegaconf import OmegaConf 
 #multiprocessing.set_start_method('spawn', force=True)
 import wandb
 from scipy.sparse import issparse
 
 import scgpt as scg
-from scgpt.loss import (
-    masked_relative_error,
-)
+
 from perttf.utils.custom_tokenizer import tokenize_and_pad_batch, random_mask_value
 from scgpt.model import TransformerModel, AdversarialDiscriminator
 from perttf.utils.logger import create_logger
@@ -32,7 +30,7 @@ import matplotlib.pyplot as plt
 
 from perttf.model.train_data_gen import prepare_data, prepare_dataloader
 from perttf.utils.set_optimizer import create_optimizer_dict
-from perttf.custom_loss import cce_loss, criterion_neg_log_bernoulli, masked_mse_loss
+from perttf.custom_loss import cce_loss, criterion_neg_log_bernoulli, masked_mse_loss, masked_relative_error
 from perttf.utils.plot import process_and_log_umaps
 from perttf.utils.misc import init_plot_worker
 
@@ -118,9 +116,9 @@ def train(model: nn.Module,
                 pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
                 MVC=config.GEPC,
                 ECS=config.ecs_thres > 0,
-                CLS=config.cell_type_classifier,
+                CLS=config.get('cell_type_classifier', True),
                 CCE = config.CCE,
-                PERTPRED = config.perturbation_classifier_weight > 0,
+                PERTPRED = config.get('genotype_classifier', True),
                 PSPRED = config.ps_weight >0,
                 mvc_src = mvc_src
             )
@@ -207,7 +205,7 @@ def train(model: nn.Module,
                     metrics_to_log.update(
                         {"train/mvc_nzlp_next": loss_gepc_zero_log_prob_next.item()}
                     )
-            if config.cell_type_classifier:
+            if config.get('cell_type_classifier', True):
                 loss_cls = criterion_cls(output_dict["cls_output"], celltype_labels)
                 loss = loss + config.cell_type_classifier_weight * loss_cls
                 metrics_to_log.update({"train/cls": loss_cls.item()})
@@ -222,7 +220,7 @@ def train(model: nn.Module,
                     .item()
                 ) / celltype_labels.size(0)
 
-            if config.perturbation_classifier_weight > 0:
+            if config.get('genotype_classifier', True):
                 loss_pert = criterion_pert(output_dict["pert_output"], perturbation_labels)
                 loss = loss + config.perturbation_classifier_weight * loss_pert
                 metrics_to_log.update({"train/pert": loss_pert.item()})
@@ -231,7 +229,7 @@ def train(model: nn.Module,
                 loss = loss + config.perturbation_classifier_weight * config.next_weight * loss_pert_next
                 metrics_to_log.update({"train/pert_next": loss_pert_next.item()})
 
-            if config.ps_weight >0:
+            if config.ps_weight > 0:
                 loss_ps = criterion_ps(output_dict["ps_output"], ps_score)
                 #import pdb; pdb.set_trace()
                 #print(f"loss_ps: {loss_ps}")
@@ -245,6 +243,7 @@ def train(model: nn.Module,
                 loss_ecs = config.ecs_weight  * output_dict["loss_ecs"]
                 loss = loss + loss_ecs
                 metrics_to_log.update({"train/ecs": loss_ecs.item()})
+
             if config.dab_weight > 0:
                 loss_dab = criterion_dab(output_dict["dab_output"], batch_labels)
                 loss = loss + config.dab_weight * loss_dab
@@ -283,9 +282,9 @@ def train(model: nn.Module,
                 pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
                 MVC=config.GEPC,
                 ECS=config.ecs_thres > 0,
-                CLS=config.cell_type_classifier,
+                CLS=config.get('cell_type_classifier', True),
                 #CCE=config.CCE,
-                PERTPRED = config.perturbation_classifier_weight > 0,
+                PERTPRED = config.get('genotype_classifier', True),
                 PSPRED = config.ps_weight >0,
                 #do_sample=config.do_sample_in_train,
                 #generative_training=False
@@ -334,8 +333,8 @@ def train(model: nn.Module,
         total_adv_E += loss_adv_E.item() if config.ADV else 0.0
         total_adv_D += loss_adv_D.item() if config.ADV else 0.0
 
-        total_cls += loss_cls.item() if config.cell_type_classifier else 0.0
-        total_pert += loss_pert.item() if config.perturbation_classifier_weight > 0 else 0.0
+        total_cls += loss_cls.item() if config.get('cell_type_classifier', True) else 0.0
+        total_pert += loss_pert.item() if config.get('genotype_classifier', True) else 0.0
         total_ps += loss_ps.item() if config.ps_weight >0 else 0.0
         total_ps_next += loss_ps_next.item() if ps_next_training_weight >0 else 0.0
 
@@ -352,8 +351,8 @@ def train(model: nn.Module,
             cur_dab = total_dab / log_interval if config.dab_weight >0 else 0.0
             cur_adv_E = total_adv_E / log_interval if config.ADV else 0.0
             cur_adv_D = total_adv_D / log_interval if config.ADV else 0.0
-            cur_cls = total_cls / log_interval if config.cell_type_classifier else 0.0
-            cur_pert = total_pert / log_interval if config.perturbation_classifier_weight > 0 else 0.0
+            cur_cls = total_cls / log_interval if config.get('cell_type_classifier', True) else 0.0
+            cur_pert = total_pert / log_interval if config.get('genotype_classifier', True) else 0.0
             cur_ps = total_ps / log_interval if config.ps_weight >0 else 0.0
             cur_ps_next = total_ps_next / log_interval if ps_next_training_weight >0 else 0.0
             # ppl = math.exp(cur_loss)
@@ -469,8 +468,8 @@ def evaluate(model: nn.Module,
                     pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
                     MVC=config.GEPC,
                     ECS=config.ecs_thres > 0,
-                    CLS=config.cell_type_classifier,
-                    PERTPRED = config.perturbation_classifier_weight > 0,
+                    CLS=config.get('cell_type_classifier', True),
+                    PERTPRED = config.get('genotype_classifier', True),
                     PSPRED = config.ps_weight>0,
                     mvc_src = mvc_src
                 )
@@ -504,10 +503,10 @@ def evaluate(model: nn.Module,
 
                 if config.dab_weight > 0:
                     loss_dab = criterion_dab(output_dict["dab_output"], batch_labels)
-                if config.cell_type_classifier: #added
+                if config.get('cell_type_classifier', True): #added
                     loss_cls = criterion_cls(output_dict["cls_output"], celltype_labels)
                     # = loss + loss_cls
-                if config.perturbation_classifier_weight > 0:
+                if config.get('genotype_classifier', True):
                     loss_pert = criterion_pert(output_dict["pert_output"], perturbation_labels)
                     # = loss + loss_pert
 
@@ -525,9 +524,9 @@ def evaluate(model: nn.Module,
             total_error_next += masked_relative_error(output_values, target_values_next, masked_positions).item() * len(input_gene_ids)
             if config.dab_weight > 0:
                 total_dab += loss_dab.item() * len(input_gene_ids)
-            if config.cell_type_classifier: #added
+            if config.get('cell_type_classifier', True): #added
                 total_cls += loss_cls.item() * len(input_gene_ids)
-            if config.perturbation_classifier_weight > 0:
+            if config.get('genotype_classifier', True):
                 total_pert += loss_pert.item() * len(input_gene_ids)
             if config.ps_weight > 0:
                 total_ps += loss_ps.item() * len(input_gene_ids)
@@ -593,7 +592,7 @@ def eval_testdata(
     vocab=train_data_dict['vocab']
     # make sure adata_t is ready for training
     shared_genes = adata_t.var.index.isin(list(vocab.stoi.keys()))
-    logger.log(f"{sum(shared_genes)} genes shared between model vocab's {len(vocab)} and anndata's f{adata_t.shape[1]} genes")
+    logger.info(f"{sum(shared_genes)} genes shared between model vocab's {len(vocab)} and anndata's {adata_t.shape[1]} genes")
     adata_t = adata_t[:, adata_t.var.index.isin(list(vocab.stoi.keys()))] 
     adata_t = adata_t[adata_t.obs['celltype'].isin(cell_type_to_index)]
     adata_t = adata_t[adata_t.obs['genotype'].isin(genotype_to_index)]
@@ -903,7 +902,10 @@ def wrapper_train(model, config, data_gen,
         loss = val_loss + val_loss_next + val_mvc + val_mvc_next + val_cls + val_pert
         if loss < best_val_loss:
             best_val_loss = loss
-            best_model = copy.deepcopy(model)
+            best_model = {
+                k: v.detach().cpu().clone() 
+                for k, v in model.state_dict().items()
+            }
             best_model_epoch = epoch
             if logger is not None:
                 logger.info(f"Best model with score {best_val_loss:5.4f}")
@@ -936,8 +938,6 @@ def wrapper_train(model, config, data_gen,
                     config=config,
                     include_types=["cls"],
                     logger=logger,
-                    epoch=epoch,
-                    eval_key=eval_dict_key,
                     predict_expr = predict_expr_tmp,
                     mvc_full_expr= predict_expr_tmp
                 )
@@ -959,7 +959,7 @@ def wrapper_train(model, config, data_gen,
                 #p.start()           
                 p = executor.submit(
                     process_and_log_umaps,
-                    adata_with_embeddings, SimpleNamespace(**config) , epoch, eval_dict_key, save_dir2, ps_names
+                    adata_with_embeddings, OmegaConf.structured(dict(config)) , epoch, eval_dict_key, save_dir2, ps_names
                 )
                 evaltest_processes.append(p)
 
@@ -991,7 +991,7 @@ def wrapper_train(model, config, data_gen,
             else:
                 remaining_processes.append(p)
     # save the best model
-    torch.save(best_model.state_dict(), save_dir / "best_model.pt")
+    torch.save(best_model, save_dir / "best_model.pt")
 
     return best_model
 

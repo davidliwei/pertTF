@@ -113,9 +113,10 @@ class PertTFDataset(Dataset):
         assert 'genotype' in self.adata.obs.columns and 'celltype' in self.adata.obs.columns, 'no genotype or celltype column found in anndata'
         add_batch_info(self.adata)
         
-    def set_new_indices(self, indices):
+    def set_new_indices(self, indices, next_cell_pool = True):
         self.indices = indices
-        self.next_cell_dict = self._create_next_cell_pool()
+        if next_cell_pool:
+            self.next_cell_dict = self._create_next_cell_pool()
 
     def get_adata_subset(self, next_cell_pred = 'identity'):
         assert next_cell_pred in ['pert', 'identity', "lochness"], 'next_cell_pred can only be identity or pert or lochness'
