@@ -902,10 +902,7 @@ def wrapper_train(model, config, data_gen,
         loss = val_loss + val_loss_next + val_mvc + val_mvc_next + val_cls + val_pert
         if loss < best_val_loss:
             best_val_loss = loss
-            best_model = {
-                k: v.detach().cpu().clone() 
-                for k, v in model.state_dict().items()
-            }
+            best_model = copy.deepcopy(model)
             best_model_epoch = epoch
             if logger is not None:
                 logger.info(f"Best model with score {best_val_loss:5.4f}")
@@ -991,7 +988,7 @@ def wrapper_train(model, config, data_gen,
             else:
                 remaining_processes.append(p)
     # save the best model
-    torch.save(best_model, save_dir / "best_model.pt")
+    torch.save(best_model.state_dict(), save_dir / "best_model.pt")
 
     return best_model
 
