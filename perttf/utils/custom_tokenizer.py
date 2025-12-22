@@ -113,10 +113,11 @@ def weighted_sample(val,
                     non_hvg_size = 1000):
     
     # for each cell, sample from the hvgs and non-hvgs seperately
-    hvg_size = max_size-non_hvg_size
     if mode == 'hvg':
         assert hvg_nonhvg is not None, 'hvg indices not given to sampling'
         # hvg_ids is a tuple, first element is hvg indices, second element is non-hvg_indices
+        non_hvg_size = min(len(hvg_nonhvg[1]), non_hvg_size) # make sure that sampling is done within the actual limits of genes used
+        hvg_size = min(max_size-non_hvg_size, len(hvg_nonhvg[0])) # make sure that sampling is done within the actual limits of genes used
         if non_hvg_size > 0:
             non_hvgs = rng.choice(len(hvg_nonhvg[1]), size = non_hvg_size, replace = False)
             samp_non_hvg_inds = hvg_nonhvg[1][non_hvgs]
@@ -202,11 +203,6 @@ def tokenize_batch(
             values = np.insert(values, 0, cls_value)
             if mod_type is not None:
                 mod_types = np.insert(mod_types, 0, cls_id_mod_type)
-        if return_pt:
-            genes = torch.from_numpy(genes).long()
-            values = torch.from_numpy(values).float()
-            if mod_type is not None:
-                mod_types = torch.from_numpy(mod_types).long()
         tokenized_data.append((genes, values, mod_types))
     return tokenized_data
 
@@ -298,25 +294,25 @@ def pad_batch(
     for i in range(len(new_batch)):
         gene_ids, values, mod_types = new_batch[i]
         if len(gene_ids) < max_len:
-            gene_ids = torch.cat(
+            gene_ids = np.concat(
                 [
                     gene_ids,
-                    torch.full(
+                    np.full(
                         (max_len - len(gene_ids),), pad_id, dtype=gene_ids.dtype
                     ),
                 ]
             )
-            values = torch.cat(
+            values = np.concat(
                 [
                     values,
-                    torch.full((max_len - len(values),), pad_value, dtype=values.dtype),
+                    np.full((max_len - len(values),), pad_value, dtype=values.dtype),
                 ]
             )
             if mod_types is not None:
-                mod_types = torch.cat(
+                mod_types = np.concat(
                     [
                         mod_types,
-                        torch.full(
+                        np.full(
                             (max_len - len(mod_types),),
                             mod_pad_id,
                             dtype=mod_types.dtype,
@@ -328,12 +324,14 @@ def pad_batch(
         values_list.append(values)
         if mod_types is not None:
             mod_types_list.append(mod_types)
+
     batch_padded = {
-        "genes": torch.stack(gene_ids_list, dim=0),
-        "values": torch.stack(values_list, dim=0),
+        "genes": torch.tensor(np.vstack(gene_ids_list), dtype = torch.long),
+        "values": torch.Tensor(np.vstack(values_list)),
     }
+
     if mod_types is not None and mod_types_list:
-        batch_padded["mod_types"] = torch.stack(mod_types_list, dim=0)
+        batch_padded["mod_types"] = torch.tensor(np.vstack(mod_types_list), dtype = torch.long)
         
     return batch_padded, used_indices_list
 

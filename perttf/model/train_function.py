@@ -594,9 +594,9 @@ def eval_testdata(
     shared_genes = adata_t.var.index.isin(list(vocab.stoi.keys()))
     logger.info(f"{sum(shared_genes)} genes shared between model vocab's {len(vocab)} and anndata's {adata_t.shape[1]} genes")
     adata_t = adata_t[:, adata_t.var.index.isin(list(vocab.stoi.keys()))] 
-    adata_t = adata_t[adata_t.obs['celltype'].isin(cell_type_to_index)]
-    adata_t = adata_t[adata_t.obs['genotype'].isin(genotype_to_index)]
-    genes_ids = vocab(adata_t.var.index.tolist())
+    adata_t = adata_t[adata_t.obs['celltype'].isin(cell_type_to_index)] if 'celltype' in adata_t.obs.columns else adata_t
+    adata_t = adata_t[adata_t.obs['genotype'].isin(genotype_to_index)] if 'genotype' in adata_t.obs.columns else adata_t
+    gene_ids = vocab(adata_t.var.index.tolist())
     if 'genotype_next' in adata_t.obs.keys():
         adata_t = adata_t[adata_t.obs['genotype_next'].isin(genotype_to_index)]
     adata_t = adata_t.copy()# make sure it is a independent copy for faster loading
@@ -614,7 +614,7 @@ def eval_testdata(
     else:
         all_counts_next = None
 
-    if "celltype" in adata_t.obs.columns and config.cell_type_classifier:
+    if "celltype" in adata_t.obs.columns and config.cell_type_classifier and adata_t.obs["celltype"].isin(cell_type_to_index).all():
         celltypes_labels = adata_t.obs["celltype"].tolist()  # make sure count from 0
         celltypes_labels = np.array(celltypes_labels)
         celltypes_labels = np.array([cell_type_to_index[cell_type] for cell_type in celltypes_labels])
@@ -797,8 +797,8 @@ def eval_testdata(
         index_to_celltype = {v: k for k, v in cell_type_to_index.items()}
         predicted_celltypes = [index_to_celltype[i] for i in label_predictions_cls]
         adata_t.obs['predicted_celltype'] = predicted_celltypes
-        adata_t.obs['celltype_id'] = adata_t.obs['celltype'].map(cell_type_to_index).astype(pd.CategoricalDtype(categories=list(cell_type_to_index.values())))
- 
+        if celltypes_labels is not None:
+            adata_t.obs['celltype_id'] = adata_t.obs['celltype'].map(cell_type_to_index).astype(pd.CategoricalDtype(categories=list(cell_type_to_index.values())))
     return adata_t
 
 
