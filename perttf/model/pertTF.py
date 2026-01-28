@@ -135,10 +135,12 @@ class PertExpEncoder(nn.Module):
     """
     def __init__(
         self,
-        d_model: int
+        d_model: int,
+        pert_dim: int = None
     ):
         super().__init__()
-        d_in = d_model * 2 
+        pert_dim = d_model if pert_dim is None else pert_dim
+        d_in = d_model + pert_dim
         #d_in = d_model
         self.fc = nn.Sequential(
             nn.Linear(d_in, d_model),
@@ -158,7 +160,6 @@ class PertExpEncoder(nn.Module):
         return self.fc(x) # (batch, d_model)
 
 
-
 class PerturbationTFModel(TransformerModel):
     def __init__(self,
                  n_pert: int,
@@ -168,15 +169,15 @@ class PerturbationTFModel(TransformerModel):
         self.pred_lochness_next = kwargs.pop("pred_lochness_next", False) # additional optional parameter to ask whether to predict lochness scores
         ps_decoder2_nlayer = kwargs.pop("ps_decoder2_nlayer",3) # additional parameter to specify ps_decoder2 nlayer
         self.pert_pad_id = kwargs.pop("pert_pad_id", None) # get the pert_pad_id
+        self.pert_dim = kwargs.pop('pert_dim', None)
         super().__init__(*args, **kwargs)
         # add perturbation encoder
         # variables are defined in super class
-        d_model = self.d_model
+        d_model = self.d_model 
+        pert_dim = d_model if self.pert_dim is None else self.pert_dim
         #self.pert_encoder = nn.Embedding(3, d_model, padding_idx=pert_pad_id)
-        self.pert_encoder = PertLabelEncoder(n_pert, d_model, padding_idx=self.pert_pad_id)
-
-        self.pert_exp_encoder = PertExpEncoder (d_model) 
-
+        self.pert_encoder = PertLabelEncoder(n_pert, pert_dim, padding_idx=self.pert_pad_id)
+        self.pert_exp_encoder = PertExpEncoder(d_model, self.pert_dim) 
         # the following is the perturbation decoder
         #n_pert = kwargs.get("n_perturb", 1) 
         #nlayers_pert = kwargs.get("nlayers_perturb", 3) 

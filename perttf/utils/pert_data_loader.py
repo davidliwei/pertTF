@@ -113,9 +113,10 @@ class PertTFDataset(Dataset):
         assert 'genotype' in self.adata.obs.columns and 'celltype' in self.adata.obs.columns, 'no genotype or celltype column found in anndata'
         add_batch_info(self.adata)
         
-    def set_new_indices(self, indices):
+    def set_new_indices(self, indices, next_cell_pool = True):
         self.indices = indices
-        self.next_cell_dict = self._create_next_cell_pool()
+        if next_cell_pool:
+            self.next_cell_dict = self._create_next_cell_pool()
 
     def get_adata_subset(self, next_cell_pred = 'identity'):
         assert next_cell_pred in ['pert', 'identity', "lochness"], 'next_cell_pred can only be identity or pert or lochness'
@@ -301,7 +302,7 @@ class PertBatchCollator:
         self.nonzero_prop = config.get('nonzero_prop', 0.7)
         self.sampling_mode = config.get('sampling_mode', 'simple')
         self.fix_nonzero_prop = config.get('fix_nonzero_prop', False)
-        self.non_hvg_size = config.get('non_hvg_size', 1000)
+        self.non_hvg_size = min(config.get('non_hvg_size', 1000), len(hvg_inds[1])) if hvg_inds is not None else 0
         self.hvg_inds = hvg_inds
 
     def __call__(self, batch: list) -> dict:
@@ -318,7 +319,6 @@ class PertBatchCollator:
         # max seq len determines the context window for pertTF transformer modeling
         # during validation and predictions, this window may be around all genes with expression
         max_seq_len = self.max_seq_len if not self.full_tokenize else len(self.gene_ids) + self.append_cls
-
 
         # TODO: These functions may need to be modified to accomodate inputs w differing number of genes in the future
         expr_mat, expr_mat_next = np.array(expr_list), np.array(expr_next_list)
@@ -428,8 +428,9 @@ class PertTFUniDataManager:
             self.hvg_col = config.get('hvg_col', 'highly_variable')
             assert self.hvg_col in adata.var.keys(), 'adata must have calculated HVGs or adata.var must have hvg_col'
             n_hvg = min(self.adata.var[self.hvg_col].sum(), n_hvg)
-            self.config.update({'max_seq_len': n_hvg + config.get('non_hvg_size', 1000) + config.get('append_cls', True)}, allow_val_change=True)
-            print(f'sampling_mode is hvg, sampling {n_hvg} HVGs + {config.get("non_hvg_size", 1000)} non-HVGs for training')
+            non_hvg = min(len(self.gene_ids) - n_hvg, config.get('non_hvg_size', 1000))
+            self.config.update({'max_seq_len': n_hvg + non_hvg + config.get('append_cls', True)}, allow_val_change=True)
+            print(f'sampling_mode is hvg, sampling {n_hvg} HVGs + {non_hvg} non-HVGs for training')
             self.hvg_inds = (np.where(self.adata.var[self.hvg_col])[0], np.where(~self.adata.var[self.hvg_col])[0])
         
         add_batch_info(self.adata)
@@ -439,7 +440,7 @@ class PertTFUniDataManager:
         self.collator = PertBatchCollator(self.vocab, self.gene_ids, hvg_inds = self.hvg_inds, **config)
         ## full collator may be used for validation or inference 
         ## This may be very slow for full gene set, scaling is roughly 2x context length -> 3.6x time, 3-4x more memory
-        self.full_token_collator = PertBatchCollator( self.vocab, self.gene_ids, full_tokenize=True, **config)
+        self.full_token_collator = PertBatchCollator( self.vocab, self.gene_ids, full_tokenize=True, hvg_inds = self.hvg_inds, **config)
         print("Initialization complete.")
 
     def set_genotype_index(self, genotype_to_index):
@@ -500,7 +501,8 @@ class PertTFUniDataManager:
             indices = np.arange(self.adata.n_obs)
             train_indices, valid_indices = train_test_split(indices, test_size=test_size, shuffle=True, random_state=random_state)
         else:
-            assert len(set(train_indices).intersection(valid_indices)) == 0, 'training data and validation data are not separate'
+            if len(set(train_indices).intersection(valid_indices)) > 0:
+                print('WARNING: training data and validation data are not separate, this may be okay for perturbation if the shared samples are ctrls')
             print('overiding random train/valid split with provided indices')
         train_data, train_loader = self.get_data_w_loader(train_indices)
         valid_data, valid_loader = self.get_data_w_loader(valid_indices, full_token=full_token_validate)

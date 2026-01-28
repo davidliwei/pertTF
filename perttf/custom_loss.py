@@ -5,8 +5,16 @@ from torch import nn
 from typing import Optional
 
 
-from scgpt.loss import masked_relative_error
-
+def masked_relative_error(
+    input: torch.Tensor, target: torch.Tensor, mask: torch.LongTensor
+) -> torch.Tensor:
+    """
+    Compute the masked relative error between input and target.
+    """
+    if not mask.any():
+        mask = torch.ones_like(input, dtype=torch.bool)
+    loss = torch.abs(input[mask] - target[mask]) / (target[mask] + 1e-6)
+    return loss.mean()
 
 def masked_mse_loss(
     input: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None
@@ -14,8 +22,11 @@ def masked_mse_loss(
     """
     Compute the masked MSE loss between input and target.
     """
+    
     if mask is None:
         return F.mse_loss(input, target, reduction="mean")
+    if not mask.any():
+        mask = torch.ones_like(input, dtype=torch.bool)
     mask = mask.float() 
     loss = F.mse_loss(input * mask, target * mask, reduction="sum")
     return loss / mask.sum()
@@ -27,10 +38,13 @@ def criterion_neg_log_bernoulli(
     """
     Compute the negative log-likelihood of Bernoulli distribution
     """
+    
     if mask is None:
         bernoulli = torch.distributions.Bernoulli(probs=input)
         masked_log_probs = bernoulli.log_prob((target > 0).float())
         return -masked_log_probs.mean()
+    if not mask.any():
+        mask = torch.ones_like(input, dtype=torch.bool)
     mask = mask.float()
     bernoulli = torch.distributions.Bernoulli(probs=input)
     masked_log_probs = bernoulli.log_prob((target > 0).float()) * mask
