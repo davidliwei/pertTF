@@ -21,18 +21,15 @@ from omegaconf import OmegaConf
 import wandb
 from scipy.sparse import issparse
 
-import scgpt as scg
 
 from perttf.utils.custom_tokenizer import tokenize_and_pad_batch, random_mask_value
-from scgpt.model import TransformerModel, AdversarialDiscriminator
 from perttf.utils.logger import create_logger
 import matplotlib.pyplot as plt
 
-from perttf.model.train_data_gen import prepare_data, prepare_dataloader
-from perttf.utils.set_optimizer import create_optimizer_dict
-from perttf.custom_loss import cce_loss, criterion_neg_log_bernoulli, masked_mse_loss, masked_relative_error
-from perttf.utils.plot import process_and_log_umaps
-from perttf.utils.misc import init_plot_worker
+from ..utils.set_optimizer import create_optimizer_dict
+from ..custom_loss import cce_loss, criterion_neg_log_bernoulli, masked_mse_loss, masked_relative_error
+from ..utils.plot import process_and_log_umaps
+from ..utils.misc import init_plot_worker
 
 def train(model: nn.Module,
           loader: DataLoader,

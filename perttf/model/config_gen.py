@@ -4,11 +4,18 @@ import wandb
 
 from typing import Literal
 
-from scgpt.utils import set_seed
+import random
+import numpy as np
+import torch
 import copy
 
-# Check the Python interpreter being used
-#print(sys.executable)
+def set_seed(seed):
+    """set random seed."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def generate_config(parameter_dict,
         project_name = "scGPT",

@@ -12,155 +12,19 @@ import torch.nn.functional as F
 
 import torch.distributed as dist
 
+from .base_model import BaseModel
+
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
+from .modules import (
+    PertExpEncoder,
+    PerturbationDecoder,
+    PSDecoder,
+    Batch2LabelEncoder,
+    PertLabelEncoder
+    )
 
 
-import scgpt as scg
-from scgpt.model import TransformerModel
-from torch.nn import TransformerEncoder
-
-
-
-class PerturbationDecoder(nn.Module):
-    """
-    Decoder for perturbation label prediction.
-    revised from scGPT.ClsDecoder
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        n_pert: int,
-        nlayers: int = 3,
-        activation: callable = nn.ReLU,
-    ):
-        super().__init__()
-        # module list
-        self._decoder = nn.ModuleList()
-        for i in range(nlayers - 1):
-            self._decoder.append(nn.Linear(d_model, d_model))
-            self._decoder.append(activation())
-            self._decoder.append(nn.LayerNorm(d_model))
-        self.out_layer = nn.Linear(d_model, n_pert)
-
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Args:
-            x: Tensor, shape [batch_size, embsize]
-        """
-        for layer in self._decoder:
-            x = layer(x)
-        return self.out_layer(x)
-
-
-class PSDecoder(nn.Module):
-    """
-    Decoder for ps score prediction.
-    revised from scGPT.ClsDecoder
-    """
-
-    def __init__(
-        self,
-        d_model: int,
-        n_pert: int,
-        nlayers: int = 3,
-        activation: callable = nn.ReLU,
-        geneinput: bool = False,
-    ):
-        super().__init__()
-        # module list
-        self._decoder = nn.ModuleList()
-        if geneinput:
-            self.input_dim =  d_model * 2 #this is a concatenation of cell embedding and perturbation embedding
-        else:
-            self.input_dim = d_model # just cell embedding
-        
-        for i in range(nlayers - 1):
-            if i == 0:
-                self._decoder.append(nn.Linear(self.input_dim, d_model))
-            else:
-                self._decoder.append(nn.Linear(d_model, d_model))
-            self._decoder.append(activation())
-            self._decoder.append(nn.LayerNorm(d_model))
-        self.out_layer = nn.Linear(d_model, n_pert)
-
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Args:
-            x: Tensor, shape [batch_size, embsize]
-        """
-        for layer in self._decoder:
-            x = layer(x)
-        return self.out_layer(x)
-
-class Batch2LabelEncoder(nn.Module):
-    def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        padding_idx: Optional[int] = None,
-    ):
-        super().__init__()
-        self.embedding = nn.Embedding(
-            num_embeddings, embedding_dim, padding_idx=padding_idx
-        )
-        self.enc_norm = nn.LayerNorm(embedding_dim)
-
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.embedding(x)  # (batch, embsize)
-        x = self.enc_norm(x)
-        return x
-
-class PertLabelEncoder(nn.Module):
-    def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        padding_idx: Optional[int] = None,
-    ):
-        super().__init__()
-        self.embedding = nn.Embedding(
-            num_embeddings, embedding_dim, padding_idx=padding_idx
-        )
-        self.enc_norm = nn.LayerNorm(embedding_dim)
-
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.embedding(x)  # (batch, embsize)
-        x = self.enc_norm(x)
-        return x
-
-
-class PertExpEncoder(nn.Module):
-    """
-    Concatenating gene expression embeddings (from transformers) with perturbation embeddings (from scGPT's PertEncoder)
-    """
-    def __init__(
-        self,
-        d_model: int,
-        pert_dim: int = None
-    ):
-        super().__init__()
-        pert_dim = d_model if pert_dim is None else pert_dim
-        d_in = d_model + pert_dim
-        #d_in = d_model
-        self.fc = nn.Sequential(
-            nn.Linear(d_in, d_model),
-            nn.Sigmoid(),#nn.ReLU(),#nn.LeakyReLU(),
-            nn.Linear(d_model, d_model),
-            #nn.ReLU(),
-            nn.Sigmoid(),
-            nn.Linear(d_model, d_model),
-            #nn.LayerNorm(d_model),
-            #nn.Linear(d_model, d_model),
-        )
-
-
-    def forward(self, x: Tensor) -> Dict[str, Tensor]:
-        """x is the output of the transformer concatenated with perturbation embedding, (batch, d_model*2)"""
-        # pred_value = self.fc(x).squeeze(-1)  
-        return self.fc(x) # (batch, d_model)
-
-
-class PerturbationTFModel(TransformerModel):
+class PerturbationTFModel(BaseModel):
     def __init__(self,
                  n_pert: int,
                  nlayers_pert: int,
@@ -190,26 +54,43 @@ class PerturbationTFModel(TransformerModel):
         self.n_cls = kwargs.get("n_cls", 1) 
         
         
-        if kwargs.get('use_fast_transformer', False):
+        if self.use_fast_transformer:
             nlayers = self.transformer_encoder.num_layers if self.transformer_encoder is not None else 2
             d_hid = self.transformer_encoder.layers[0].linear1.out_features if self.transformer_encoder is not None else 32
             nhead = self.transformer_encoder.layers[0].self_attn.num_heads if self.transformer_encoder is not None else 4
             try:
-                from perttf.model.modules import FlashTransformerEncoderLayerVarlen, SDPATransformerEncoderLayer
+                from .modules import FlashTransformerEncoderLayerVarlen
                 
                 encoder_layers = FlashTransformerEncoderLayerVarlen(
                     d_model,
                     kwargs.get('nhead', nhead),
                     kwargs.get('d_hid', d_hid),
-                    kwargs.get('dropout', 0.1),
+                    self.dropout,
                     batch_first=True,
-                    norm_scheme=self.norm_scheme,
+                    norm_scheme=self.norm_scheme
                 )
-                if encoder_layers.flash_version is not None:
-                    self.transformer_encoder = TransformerEncoder(encoder_layers, kwargs.get('nlayers', nlayers))
-            except Exception as e: 
+            except Exception as e:
                 print(e)
-                print('Custom flash attention v2/v3 setup failed, falling back to scGPT implementation')
+                print('DAO flash attention setup failed, trying pytorch SDPA')
+                try:
+                    from .modules import SDPATransformerEncoderLayer
+                    encoder_layers = SDPATransformerEncoderLayer(
+                        d_model,
+                        nhead,
+                        d_hid,
+                        self.dropout,
+                        batch_first=True,
+                        norm_scheme=self.norm_scheme,
+                    )
+                except Exception as ee: 
+                    print(ee)
+                    print('pytorch sdpa attention setup failed, falling back to native pytorch attention')
+                    self.use_fast_transformer = 'native'
+                    encoder_layers = TransformerEncoderLayer(
+                        d_model, nhead, d_hid, self.dropout, batch_first=True
+                    )
+            self.transformer_encoder = TransformerEncoder(encoder_layers,  nlayers)
+
         
         # added: adding PS score decoder
         #self.n_ps = kwargs.get("n_ps") if "n_ps" in kwargs else 0
