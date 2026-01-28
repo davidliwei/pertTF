@@ -135,10 +135,12 @@ class PertExpEncoder(nn.Module):
     """
     def __init__(
         self,
-        d_model: int
+        d_model: int,
+        pert_dim: int = None
     ):
         super().__init__()
-        d_in = d_model * 2 
+        pert_dim = d_model if pert_dim is None else pert_dim
+        d_in = d_model + pert_dim
         #d_in = d_model
         self.fc = nn.Sequential(
             nn.Linear(d_in, d_model),
@@ -157,42 +159,6 @@ class PertExpEncoder(nn.Module):
         # pred_value = self.fc(x).squeeze(-1)  
         return self.fc(x) # (batch, d_model)
 
-class PertExpAE(nn.Module):
-    """
-    Concatenating gene expression embeddings (from transformers) with perturbation embeddings (from scGPT's PertEncoder)
-    """
-    def __init__(
-        self,
-        d_model: int,
-        d_hid: int
-    ):
-        super().__init__()
-        d_in = d_model
-        #d_in = d_model
-        self.d_in = d_in
-        self.d_hid = d_hid
-        self.encoder = nn.Sequential(
-            nn.Linear(d_in, d_hid * 2),
-            nn.ReLU(),
-            nn.Linear(d_hid * 2, d_hid),
-            nn.ReLU(),
-            nn.LayerNorm(d_hid)
-        )
-        # Decoder
-        self.decoder = nn.Sequential(
-            nn.Linear(d_hid, d_hid * 2),
-            nn.ReLU(),
-            nn.Linear(d_hid * 2, d_in),
-        )
-
-
-    def forward(self, z: Tensor) -> Dict[str, Tensor]:
-        """x is the output of the transformer concatenated with perturbation embedding, (batch, d_model*2)"""
-        # pred_value = self.fc(x).squeeze(-1)  
-        x, y = torch.split(z, [self.d_in, self.d_hid], dim=1)
-        encoded = self.encoder(x)+y
-        decoded = self.decoder(encoded)
-        return decoded # (batch, d_model)
 
 class PerturbationTFModel(TransformerModel):
     def __init__(self,
@@ -211,10 +177,7 @@ class PerturbationTFModel(TransformerModel):
         pert_dim = d_model if self.pert_dim is None else self.pert_dim
         #self.pert_encoder = nn.Embedding(3, d_model, padding_idx=pert_pad_id)
         self.pert_encoder = PertLabelEncoder(n_pert, pert_dim, padding_idx=self.pert_pad_id)
-        if pert_dim == d_model:
-            self.pert_exp_encoder = PertExpEncoder (d_model) 
-        else:
-            self.pert_exp_encoder = PertExpAE(d_model, pert_dim) 
+        self.pert_exp_encoder = PertExpEncoder(d_model, self.pert_dim) 
         # the following is the perturbation decoder
         #n_pert = kwargs.get("n_perturb", 1) 
         #nlayers_pert = kwargs.get("nlayers_perturb", 3) 

@@ -576,6 +576,9 @@ def eval_testdata(
     input_layer_key = "X_binned",
     next_layer_key = "X_binned_next",
     logger = None,
+    epoch = 0,
+    eval_key = "", # titles for evaluation
+    make_plots = True,
     predict_expr = False,
     mvc_full_expr = False
 ) -> Optional[Dict]: # Returns a dictionary containing the AnnData object
@@ -908,18 +911,13 @@ def wrapper_train(model, config, data_gen,
                 logger.info(f"Best model with score {best_val_loss:5.4f}")
 
         #if epoch % config.save_eval_interval == 0 or epoch == config.epochs:
-        eval_expr_interval = abs(config.get('eval_expr_interval', 2))//2*2 # this must be even to match the save interval below
+        eval_expr_interval = max(round(2e5/len(train_loader.dataset)), abs(config.get('eval_expr_interval', 2))//2*2) # this must be even to match the save interval below
         predict_expr_tmp = True if eval_expr_interval and epoch % eval_expr_interval == 1 and config.get('next_cell_pred_type') == 'pert' else False
         save_eval_interval = config.get('save_eval_interval', 2)
         if epoch % save_eval_interval == 1:
             logger.info(f"Saving model to {save_dir}")
             torch.save(best_model.state_dict(), save_dir / "best_model.pt")
             torch.save(model.state_dict(), save_dir / f"model_e{epoch}.pt")
-        if epoch % 2 == 1:
-            torch.save(model.state_dict(), save_dir / f"model_e{epoch}.pt")
-        #if epoch % config.save_eval_interval == 0 or epoch == config.epochs:
-        eval_expr_interval = max(round(2e5/len(train_loader.dataset)), abs(config.get('eval_expr_interval', 2))//2*2) # this must be even to match the save interval below
-        predict_expr_tmp = True if eval_expr_interval and epoch % eval_expr_interval == 1 and config.get('next_cell_pred_type') == 'pert' else False
         if epoch % eval_expr_interval == 1:
             #logger.info(f"Saving model to {save_dir}")
             save_dir2 = save_dir / f'e{epoch}_imgs'
@@ -935,6 +933,8 @@ def wrapper_train(model, config, data_gen,
                     config=config,
                     include_types=["cls"],
                     logger=logger,
+                    epoch=epoch,
+                    eval_key=eval_dict_key,
                     predict_expr = predict_expr_tmp,
                     mvc_full_expr= predict_expr_tmp
                 )
