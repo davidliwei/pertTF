@@ -89,7 +89,3 @@ def init_plot_worker():
     matplotlib.use('Agg')
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        try: # supress that stupid scgpt warning for flash_attn
-            import scgpt
-        except Exception:
-            pass
