@@ -1,6 +1,5 @@
 from torch import nn, Tensor
 from typing import Dict, Mapping, Optional, Tuple, Any, Union
-#from scgpt.model import BatchLabelEncoder
 from tqdm import trange
 
 import numpy as np
