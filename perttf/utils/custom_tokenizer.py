@@ -19,16 +19,16 @@ class SimpleVocab:
     A simple, dependency-free vocabulary class to replace torchtext.vocab.Vocab.
     It handles string-to-index (stoi) and index-to-string (itos) mappings.
     """
-    def __init__(self, tokens: list = None, special_tokens: list = None, vocab_path:str = None):
+    def __init__(self, tokens: list = None, special_tokens: list = None):
         """
         Args:
             tokens (list): A list of tokens (e.g., gene names) to build the vocabulary from.
             special_tokens (list, optional): A list of special tokens like '<pad>' or '<cls>'.
                                               These will be added to the beginning of the vocabulary.
         """
-        if vocab_path is not None:
-            self.from_json(vocab_path, special_tokens)
-        elif tokens is not None:
+        #if vocab_path is not None:
+         #   self.from_json(vocab_path, special_tokens)
+        if tokens is not None:
             self.special_tokens = special_tokens if special_tokens else []
 
             # Combine special tokens and unique regular tokens
@@ -83,24 +83,53 @@ class SimpleVocab:
         """Returns the list of tokens in order of their index."""
         return self.itos
     
-    def from_json(self, json_file: str, special_tokens: list = None):
-        with open(json_file) as f:
-            stoi = json.load(f)
-        self.special_tokens = [s for s in special_tokens if s in stoi] if special_tokens else []
-        self.stoi = stoi
-        self.itos = {i:t for i,t in enumerate(stoi)}
+    @classmethod
+    def from_dict(
+        cls,
+        map: dict,
+        special_tokens: list = ['<pad>', '<cls>', '<unk>', '<eos>']
+    ):
+        vocab = SimpleVocab()
+        vocab.special_tokens = [s for s in special_tokens if s in map] if special_tokens else []
+        vocab.stoi = map
+        vocab.itos = {i:t for i,t in enumerate(vocab.stoi)}
 
         # Create sorted arrays for fast NumPy lookups
-        if "<pad>" in self.stoi:
-            self.set_default_index(self.stoi["<pad>"])
-        elif "<unk>" in self.stoi:
-            self.set_default_index(self.stoi["<unk>"])
-        
+        if "<pad>" in vocab.stoi:
+            vocab.set_default_index(vocab.stoi["<pad>"])
+        elif "<unk>" in vocab.stoi:
+            vocab.set_default_index(vocab.stoi["<unk>"])
+        return vocab
+
+    @classmethod
+    def from_json(
+        cls, 
+        json_file: str, 
+        special_tokens: list = ['<pad>', '<cls>', '<unk>', '<eos>']
+    ):
+        with open(json_file) as f:
+            stoi = json.load(f)
+        vocab = SimpleVocab()
+        vocab.special_tokens = [s for s in special_tokens if s in stoi] if special_tokens else []
+        vocab.stoi = stoi
+        vocab.itos = {i:t for i,t in enumerate(stoi)}
+
+        # Create sorted arrays for fast NumPy lookups
+        if "<pad>" in vocab.stoi:
+            vocab.set_default_index(vocab.stoi["<pad>"])
+        elif "<unk>" in vocab.stoi:
+            vocab.set_default_index(vocab.stoi["<unk>"])
+        return vocab
+    
+    def to_dict(self):
+        return self.stoi
 
     def append(self, token: str):
         assert token not in self.stoi and token and type(token) == str, 'cannot append token, please check if token is str, not empty and new'
         self.itos[len(self.itos)] = token
         self.stoi[token] = len(self.itos)
+
+
 
 # Smarter sampling function to get more non-zero expression for each cell during sentence generation
 def weighted_sample(val, 
