@@ -22,8 +22,8 @@ import wandb
 from scipy.sparse import issparse
 
 
-from perttf.utils.custom_tokenizer import tokenize_and_pad_batch, random_mask_value
-from perttf.utils.logger import create_logger
+from ..utils.custom_tokenizer import tokenize_and_pad_batch, random_mask_value
+from ..utils.logger import create_logger
 import matplotlib.pyplot as plt
 
 from ..utils.set_optimizer import create_optimizer_dict

@@ -7,7 +7,7 @@ from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
 # Ensure these are importable
 from .pertTF import PerturbationTFModel
 from ..utils.custom_tokenizer import SimpleVocab 
-
+from .train_function import wrapper_train, eval_testdata
 
 def legacy_vocab_loading(vocab_path):
     if vocab_path:
@@ -55,15 +55,7 @@ def legacy_vocab_loading(vocab_path):
             if legacy_full in sys.modules: del sys.modules[legacy_full]
     return vocab_obj
 
-"""
-HuggingFace Hub compliant model 
-supports:
-- loading models from local (including most legacy model folders) or hub 
-- pushing model to hub or saving model/vocab/config/misc params locally
-- partial loading of parameters for user finetuning, dynamically matching layers based on size
-- partial loading of token embeddings for user custom vocabulary
-- freezing loaded layers during finetuning
-"""
+
 class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
     def __init__(
         self,
@@ -73,7 +65,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         ntoken: int = None,
         d_model: int = 32,
         nhead: int = 4,
-        d_hid: int = 32,
+        d_hid: int = None,
         nlayers: int = 2,
         nlayers_cls: int = 3,
         n_cls: int = 1,
@@ -87,7 +79,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         num_batch_labels: Optional[int] = None,
         domain_spec_batchnorm: Union[bool, str] = False,
         input_emb_style: str = "continuous",
-        n_input_bins: Optional[int] = None,
+        n_bins: Optional[int] = 51,
         cell_emb_style: str = "cls",
         mvc_decoder_style: str = "inner product",
         ecs_threshold: float = 0.7,
@@ -129,6 +121,26 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             self.ps_names = kwargs.pop('ps_names')
             n_ps = len(self.ps_names)
 
+                # fix up some old configurations and param names
+        if kwargs.get('layer_size', False):
+            d_model = kwargs.pop('layer_size')
+
+        if d_hid is None:
+            d_hid = d_model
+
+        if kwargs.get('GEPC', False):
+            do_mvc = True
+            
+        #if config.get('embsize', False):
+         #   config['d_model'] = config['layer_size']
+
+        if kwargs.get('nheads', False):
+            nhead = kwargs.pop('nheads')
+
+        if kwargs.get('fast_transformer', False):
+            use_fast_transformer = kwargs.pop('fast_transformer')
+
+        ntoken = len(vocab) if vocab is not None else None
         # 3. Initialize Parent (Without **kwargs, as you requested)
         super().__init__(
             n_pert=n_pert,
@@ -151,7 +163,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             num_batch_labels=num_batch_labels,
             domain_spec_batchnorm=domain_spec_batchnorm,
             input_emb_style=input_emb_style,
-            n_input_bins=n_input_bins,
+            n_input_bins= n_bins,
             cell_emb_style=cell_emb_style,
             mvc_decoder_style=mvc_decoder_style,
             ecs_threshold=ecs_threshold,
@@ -172,6 +184,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         if hasattr(self, "_hub_mixin_config"):
             # Remove vocab to prevent crash
             if "vocab" in self._hub_mixin_config:
+                self._hub_mixin_config['ntoken'] = len(vocab)
                 self._hub_mixin_config["vocab"] = None
             
             for n in list(self._hub_mixin_config.keys()):
@@ -225,16 +238,6 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
-        """
-        Relatively flexible loading of models from hub or locally
-        user can provide through kwargs:
-            - vocab, user can provide a SimpleVocab object to remake the token embedding layer
-            - vocab_merge, 'custom' uses the user's provided vocab or 'union' combines users and models own vocab into larger vocab
-            - genotype_to_index, overides model's own genotype_to_index to build new classification head for genotype
-            - cell_type_to_index, overides model's own genotype_to_index to build new classification head for cell_type_to_index
-            - ps_names, overides model's own ps_names to build new  head for ps/lochness score predictions
-            - num_batch_labels, overides model's own batch label encoder and modules for batch effect removal
-        """
         def fetch_file(filename):
             if os.path.isdir(pretrained_model_name_or_path):
                 file_path = os.path.join(pretrained_model_name_or_path, filename)
@@ -309,8 +312,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         # 5. Merge Parameters (Kwargs > RunningParams > Defaults)
         # Note: Fixed the 'kwargs(p_name)' syntax error here
         for p_name in ['genotype_to_index', 'cell_type_to_index']:
-            print(f'WARNING: {p_name} provided by user, {p_name} related layers may be different from pretrained model, this is okay for finetuning')
             if kwargs.get(p_name, False):
+                print(f'WARNING: {p_name} provided by user, {p_name} related layers may be different from pretrained model, this is okay for finetuning')
                 config[p_name] = kwargs[p_name]
             elif p_name in running_params:
                 config[p_name] = running_params[p_name]
@@ -328,24 +331,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         elif 'ps_names' in running_params:
             config['ps_names'] = running_params['ps_names']
 
-        # fix up some old configurations and param names
-        if config.get('layer_size', False):
-            config['d_model'] = config.pop('layer_size')
 
-        if config.get('d_hid', None) is None:
-            config['d_hid'] = config['d_model']
-
-        if config.get('GEPC', False):
-            config['do_mvc'] = True
-            
-        #if config.get('embsize', False):
-         #   config['d_model'] = config['layer_size']
-
-        if config.get('nheads', False):
-            config['nhead'] = config.pop('nheads')
-
-        if config.get('fast_transformer', False):
-            config['use_fast_transformer'] = True
         # 6. Instantiate Model
         # If loading an OLD model, 'config' might contain training params (e.g., 'lr').
         # These will be passed to __init__, captured in **kwargs, and moved to self.training_config.
@@ -471,6 +457,30 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         
         print(f"Froze {frozen_count} pretrained parameters.")
 
+    # ----------------------------------------------------------------------
+    # UTILITY: Enforce a anndata object to be compatible with the model
+    # ----------------------------------------------------------------------
+    # TODO: Finish these functions for user demo usage
     def comply_anndata(self, anndata, celltype_col = 'celltype', genotype_col ='genotype'):
         print('Force Complying anndata object with model, use this only for inference on test data, it WILL alter the anndata object')
         pass
+
+    def _init_default_train_config_(self):
+        # initiate default training configuration
+        pass
+
+    def run_train(self, anndata):
+        pass
+
+    def eval_identity(self, anndata):
+        pass  
+
+    def eval_perturb(self, anndata):
+        pass
+
+    def eval_lochness(self, anndata):
+        pass
+
+    def run_test(self, anndata):
+        pass
+

@@ -88,7 +88,7 @@ class PerturbationTFModel(BaseModel):
                     encoder_layers = TransformerEncoderLayer(
                         d_model, nhead, d_hid, self.dropout, batch_first=True
                     )
-            self.transformer_encoder = TransformerEncoder(encoder_layers,  nlayers)
+            self.transformer_encoder = TransformerEncoder(encoder_layers,  nlayers, enable_nested_tensor=False)
 
         
         # added: adding PS score decoder
@@ -293,7 +293,7 @@ class PerturbationTFModel(BaseModel):
             output["cls_output_next"] = self.cls_decoder(cell_emb_next)  # (batch, n_cls)
 
         cur_gene_token_embs = self.encoder(mvc_src) if mvc_src is not None else self.cur_gene_token_embs
-        if MVC:
+        if MVC and hasattr(self, 'mvc_decoder'):
             mvc_output = self.mvc_decoder(
                 cell_emb
                 if not self.use_batch_labels
@@ -320,7 +320,7 @@ class PerturbationTFModel(BaseModel):
             if self.explicit_zero_prob:
                 output["mvc_zero_probs"] = mvc_output["zero_probs"]
                 output["mvc_zero_probs_next"] = mvc_output_next["zero_probs"]
-        if ECS:
+        if ECS and hasattr(self, 'sim'):
             # Here using customized cosine similarity instead of F.cosine_similarity
             # to avoid the pytorch issue of similarity larger than 1.0, pytorch # 78064
             # normalize the embedding
