@@ -53,6 +53,7 @@ class BaseModel(nn.Module):
         use_fast_transformer: bool = False,
         fast_transformer_backend: str = "flash",
         pre_norm: bool = False,
+        **kwargs
     ):
         super().__init__()
         self.model_type = "Transformer"
@@ -75,14 +76,16 @@ class BaseModel(nn.Module):
         self.nlayers = nlayers
         self.num_batch_labels = num_batch_labels
         self.n_input_bins = n_input_bins
+        self.use_fast_transformer = use_fast_transformer
+
         if self.input_emb_style not in ["category", "continuous", "scaling",'autobin']:
             raise ValueError(
                 f"input_emb_style should be one of category, continuous, scaling, "
                 f"got {self.input_emb_style}"
             )
-        if cell_emb_style not in ["cls", "avg-pool", "w-pool"]:
+        if self.cell_emb_style not in ["cls", "avg-pool", "w-pool"]:
             raise ValueError(f"Unknown cell_emb_style: {self.cell_emb_style}")
-        self.use_fast_transformer = use_fast_transformer
+        
 
         # TODO: add dropout in the GeneEncoder
         self.encoder = GeneEncoder( self.vocab_size, self.d_model, padding_idx=vocab[pad_token])
