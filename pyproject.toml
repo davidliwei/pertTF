@@ -4,7 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pertTF"
-version = "0.1.0"  # or use dynamic versioning
+#version = "0.1.0"  # or use dynamic versioning
+dynamic = ["version"]
 description = "Transformer model with single-cell perturbation predictions"
 readme = "README.md"
 requires-python = ">=3.7"
@@ -35,3 +36,10 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/davidliwei/pertTF"
 Repository = "https://github.com/davidliwei/pertTF"
+
+
+[tool.setuptools]
+packages = ["perttf"] 
+
+[tool.setuptools.dynamic]
+version = {attr = "perttf.__version__"}
