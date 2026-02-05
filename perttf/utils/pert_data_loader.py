@@ -20,7 +20,7 @@ from scipy.sparse import issparse
 #    Vocab as VocabPybind,
 #)
 from sklearn.model_selection._split import _BaseKFold
-from perttf.utils.custom_tokenizer import tokenize_and_pad_batch, random_mask_value, SimpleVocab
+from .custom_tokenizer import tokenize_and_pad_batch, random_mask_value, SimpleVocab
 
 
 def add_batch_info(adata):
