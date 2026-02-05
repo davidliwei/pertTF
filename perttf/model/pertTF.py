@@ -56,7 +56,7 @@ class PerturbationTFModel(BaseModel):
         if self.use_fast_transformer:
             nlayers = self.nlayers
             d_hid = self.d_hid
-            nhead = self.d_model
+            nhead = self.nhead
             if self.fast_transformer_backend == 'flash':
                 try:
                     from .modules import FlashTransformerEncoderLayerVarlen

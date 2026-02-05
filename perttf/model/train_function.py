@@ -710,7 +710,7 @@ def eval_testdata(
 
         all_gene_ids, all_values = tokenized_all["genes"], tokenized_all["values"]
         if logger is not None:
-            logger.info(f"Evaluating cls cell embeddings using {all_gene_ids.shape} for each cell")
+            logger.info(f"Evaluating data using {all_gene_ids.shape[1]} genes for each cell")
 
         if next_layer_key in adata_t.layers:
             tokenized_all_next, _ = tokenize_and_pad_batch(
