@@ -76,7 +76,8 @@ class BaseModel(nn.Module):
         self.nlayers = nlayers
         self.num_batch_labels = num_batch_labels
         self.n_input_bins = n_input_bins
-        self.use_fast_transformer = use_fast_transformer
+        self.use_fast_transformer = False if not torch.cuda.is_available() or fast_transformer_backend == 'vanilla' else use_fast_transformer
+        self.fast_transformer_backend = fast_transformer_backend if torch.cuda.is_available() else 'vanilla'
 
         if self.input_emb_style not in ["category", "continuous", "scaling",'autobin']:
             raise ValueError(

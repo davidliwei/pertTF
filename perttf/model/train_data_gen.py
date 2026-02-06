@@ -10,8 +10,8 @@ from scipy.sparse import issparse
 from anndata import AnnData
 from sklearn.model_selection import train_test_split
 
-from perttf.utils.custom_tokenizer import tokenize_and_pad_batch, random_mask_value, SimpleVocab
-from perttf.utils.pert_data_loader import PertBatchCollator, PertTFDataset, PertTFUniDataManager, add_batch_info
+from ..utils.custom_tokenizer import tokenize_and_pad_batch, random_mask_value, SimpleVocab
+from ..utils.pert_data_loader import PertBatchCollator, PertTFDataset, PertTFUniDataManager, add_batch_info
 from ..utils.logger import create_logger
 
 def produce_training_datasets(adata_input, config,

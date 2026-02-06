@@ -425,6 +425,7 @@ class SDPATransformerEncoderLayer(nn.Module):
         dtype=None,
         norm_scheme="post",
         causal=False,
+        bias = True
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -441,8 +442,8 @@ class SDPATransformerEncoderLayer(nn.Module):
         # REMOVED: The FlashSelfAttention module and use_flash_attn flag are no longer needed.
         
         # Linear projections for Q, K, V
-        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=False, **factory_kwargs)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=bias, **factory_kwargs)
+        self.out_proj = nn.Linear(d_model, d_model, bias=bias, **factory_kwargs)
         
         # Feedforward network
         self.linear1 = nn.Linear(d_model, dim_feedforward, **factory_kwargs)

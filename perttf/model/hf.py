@@ -8,6 +8,7 @@ from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
 from .pertTF import PerturbationTFModel
 from ..utils.custom_tokenizer import SimpleVocab 
 from .train_function import wrapper_train, eval_testdata
+from omegaconf import OmegaConf
 
 def legacy_vocab_loading(vocab_path):
     if vocab_path:
@@ -107,58 +108,64 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             if isinstance(v, (int, float, str, bool, type(None))):
                 self.training_config[k] = v
                 training_keys.append(k)
-
-        # 2. Extract Specific Running Params
+        
+        # 2. Extract Specific Running Params to accomodate legacy saved models and configs
         if 'cell_type_to_index' in kwargs:
             self.cell_type_to_index = kwargs.pop('cell_type_to_index')
-            n_cls = len(self.cell_type_to_index)
+            self._hub_mixin_config['n_cls'] = len(self.cell_type_to_index)
         
         if 'genotype_to_index' in kwargs:
             self.genotype_to_index = kwargs.pop('genotype_to_index')
-            n_pert = len(self.genotype_to_index)
+            self._hub_mixin_config['n_pert'] = len(self.genotype_to_index)
             
         if 'ps_names' in kwargs:
             self.ps_names = kwargs.pop('ps_names')
-            n_ps = len(self.ps_names)
+            self._hub_mixin_config['n_ps'] = len(self.ps_names)
 
                 # fix up some old configurations and param names
         if kwargs.get('layer_size', False):
-            d_model = kwargs.pop('layer_size')
+            self._hub_mixin_config['d_model'] = kwargs.pop('layer_size')
 
         if d_hid is None:
-            d_hid = d_model
+            self._hub_mixin_config['d_hid'] = self._hub_mixin_config['d_model']
 
         if kwargs.get('GEPC', False):
-            do_mvc = True
+            self._hub_mixin_config['do_mvc'] = True
             
         #if config.get('embsize', False):
          #   config['d_model'] = config['layer_size']
 
         if kwargs.get('nheads', False):
-            nhead = kwargs.pop('nheads')
+            self._hub_mixin_config['nhead'] = kwargs.pop('nheads')
 
         if kwargs.get('fast_transformer', False):
-            use_fast_transformer = kwargs.pop('fast_transformer')
+            self._hub_mixin_config['use_fast_transformer'] = kwargs.pop('fast_transformer')
+
+        if kwargs.get('dab_weight', 0.0) > 0:
+            self._hub_mixin_config['do_dab'] = True
+
+        if kwargs.get('pred_lochness_next', 0) > 0:
+            self._hub_mixin_config['pred_lochness_next'] = kwargs['pred_lochness_next']
 
         ntoken = len(vocab) if vocab is not None else None
         # 3. Initialize Parent (Without **kwargs, as you requested)
         super().__init__(
-            n_pert=n_pert,
+            n_pert=self._hub_mixin_config['n_pert'],
             nlayers_pert=nlayers_pert,
-            n_ps=n_ps,
+            n_ps=self._hub_mixin_config['n_ps'],
             ntoken=ntoken,
-            d_model=d_model,
-            nhead=nhead,
-            d_hid=d_hid,
+            d_model=self._hub_mixin_config['d_model'],
+            nhead=self._hub_mixin_config['nhead'],
+            d_hid=self._hub_mixin_config['d_hid'],
             nlayers=nlayers,
             nlayers_cls=nlayers_cls,
-            n_cls=n_cls,
+            n_cls=self._hub_mixin_config['n_cls'],
             vocab=vocab,
             dropout=dropout,
             pad_token=pad_token,
             pad_value=pad_value,
-            do_mvc=do_mvc,
-            do_dab=do_dab,
+            do_mvc=self._hub_mixin_config['do_mvc'],
+            do_dab=self._hub_mixin_config['do_dab'],
             use_batch_labels=use_batch_labels,
             num_batch_labels=num_batch_labels,
             domain_spec_batchnorm=domain_spec_batchnorm,
@@ -168,10 +175,10 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             mvc_decoder_style=mvc_decoder_style,
             ecs_threshold=ecs_threshold,
             explicit_zero_prob=explicit_zero_prob,
-            use_fast_transformer=use_fast_transformer,
+            use_fast_transformer=self._hub_mixin_config['use_fast_transformer'],
             fast_transformer_backend=fast_transformer_backend,
             pre_norm=pre_norm,
-            pred_lochness_next=pred_lochness_next,
+            pred_lochness_next=self._hub_mixin_config['pred_lochness_next'],
             ps_decoder2_nlayer=ps_decoder2_nlayer,
             pert_pad_id=pert_pad_id,
             pert_dim=pert_dim,
@@ -181,27 +188,28 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         # 4. SANITIZE HF CONFIG
         # The Mixin automatically captured EVERYTHING in __init__ into self.config.
         # If you want config.json to NOT contain training params, you must remove them here.
-        if hasattr(self, "_hub_mixin_config"):
             # Remove vocab to prevent crash
-            if "vocab" in self._hub_mixin_config:
-                self._hub_mixin_config['ntoken'] = len(vocab)
-                self._hub_mixin_config["vocab"] = None
-            
-            for n in list(self._hub_mixin_config.keys()):
-                if type(self._hub_mixin_config[n]) in [dict, list]:
-                    del self._hub_mixin_config[n]
+        if "vocab" in self._hub_mixin_config:
+            self._hub_mixin_config['ntoken'] = len(vocab)
+            self._hub_mixin_config["vocab"] = None
+        
+        for n in list(self._hub_mixin_config.keys()):
+            if type(self._hub_mixin_config[n]) in [dict, list]:
+                del self._hub_mixin_config[n]
 
-            # Remove training params from the model config (Cleaner config.json)
-            for k in training_keys:
-                if k in self._hub_mixin_config:
-                    del self._hub_mixin_config[k]
-            
-            # Remove the explicit 'training_config' dict if it was passed
-            if "training_config" in self._hub_mixin_config:
-                del self._hub_mixin_config["training_config"]
+        # Remove training params from the model config (Cleaner config.json)
+        for k in training_keys:
+            if k in self._hub_mixin_config:
+                del self._hub_mixin_config[k]
+        
+        # Remove the explicit 'training_config' dict if it was passed
+        if "training_config" in self._hub_mixin_config:
+            del self._hub_mixin_config["training_config"]
                 
-        self.training_config['pad_value'] = self._hub_mixin_config['pad_value']
+        #self.training_config['pad_value'] = self._hub_mixin_config['pad_value']
         self.vocab = vocab
+        self.training_config.update(self._hub_mixin_config)
+        self.training_config = OmegaConf.create(self.training_config)
 
     def save_pretrained(self, save_directory: str, training_config: Optional[Dict] = None, **kwargs):
         super().save_pretrained(save_directory, **kwargs)
@@ -228,7 +236,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             torch.save(running_params_to_save, os.path.join(save_directory, "running_parameters.pt"))
 
         # Save Training Config
-        final_train_config = self.training_config.copy() if self.training_config else {}
+        final_train_config = dict(self.training_config) if self.training_config else {}
         if training_config:
             final_train_config.update(training_config)
             
@@ -331,7 +339,13 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         elif 'ps_names' in running_params:
             config['ps_names'] = running_params['ps_names']
 
+        # let user option to choose attention backend
+        if 'use_fast_transformer' in kwargs:
+            config['use_fast_transformer'] = kwargs['use_fast_transformer']
+            config['fast_transformer'] = config['use_fast_transformer']
 
+        if 'fast_transformer_backend' in kwargs:
+            config['fast_transformer_backend'] = kwargs['fast_transformer_backend']
         # 6. Instantiate Model
         # If loading an OLD model, 'config' might contain training params (e.g., 'lr').
         # These will be passed to __init__, captured in **kwargs, and moved to self.training_config.
@@ -345,7 +359,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         else:
             bin_path = fetch_file("best_model.pt") 
             if bin_path:
-                state_dict = torch.load(bin_path, weights_only=True)
+                state_dict = torch.load(bin_path, weights_only=True, map_location=torch.device('cpu'))
                 
         if state_dict is not None:
             # CALL THE REFACTORED WORKER FUNCTION
@@ -366,36 +380,72 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
     @staticmethod
     def _smart_load_weights(model, state_dict, old_vocab, new_vocab):
         """
-        Loads state_dict into model, handling mismatches and performing 
-        vocabulary embedding transfer if needed.
+        Loads state_dict into model, handling mismatches, performing 
+        vocabulary embedding transfer, and mapping between Vanilla/Flash layers.
         """
         model_state_dict = model.state_dict()
         keys_to_drop = []
         loaded_keys = []
 
         # Check if we can perform embedding transfer
-        # (Requires both vocabs and they must be different objects)
         do_vocab_transfer = (old_vocab is not None and new_vocab is not None and old_vocab is not new_vocab)
         
-        for key in list(state_dict.keys()):
-            if key not in model_state_dict:
-                continue # Skip unknown keys
+        # Define bidirectional replacement rules for Vanilla <-> Flash mapping
+        # Format: (Pattern A, Pattern B) - will try replacing A with B and B with A
+        remappings = [
+            ("self_attn.in_proj_weight", "qkv_proj.weight"),
+            ("self_attn.in_proj_bias",   "qkv_proj.bias"),
+            ("self_attn.out_proj.",       "out_proj.") 
+        ]
 
-            param_new = model_state_dict[key]
+        # Iterate over a copy of keys so we can modify state_dict if needed
+        for key in list(state_dict.keys()):
+            
+            # --- STEP 0: Key Remapping (Vanilla <-> Flash) ---
+            target_key = key
+            
+            # If the exact key isn't in the model, try to find a remapped equivalent
+            if key not in model_state_dict:
+                for pat_a, pat_b in remappings:
+                    if pat_a in key:
+                        potential_key = key.replace(pat_a, pat_b)
+                        if potential_key in model_state_dict:
+                            print(f"Remapping (Vanilla->Fast):{key} -> {potential_key}")
+                            target_key = potential_key
+                            break
+                    elif pat_b in key:
+                        potential_key = key.replace(pat_b, pat_a)
+                        if potential_key in model_state_dict:
+                            print(f"Remapping (Fast->Vanilla):{key} -> {potential_key}")
+                            target_key = potential_key
+                            break
+
+            # If after remapping we still don't have a match, skip it
+            if target_key not in model_state_dict:
+                print(f"Skipping unknown key: {key}") 
+                continue 
+
             param_old = state_dict[key]
+            param_new = model_state_dict[target_key]
+
+            # If we remapped, we must update the state_dict to use the NEW key
+            # so load_state_dict(strict=False) picks it up later.
+            if target_key != key:
+                state_dict[target_key] = param_old
+                keys_to_drop.append(key) # Mark old key for deletion
 
             # CASE 1: Exact Match
             if param_old.shape == param_new.shape:
-                loaded_keys.append(key)
+                loaded_keys.append(target_key)
                 continue
 
             # CASE 2: Shape Mismatch
             # Check if this is an embedding layer we can fix
             # usually named 'encoder.embedding.weight' or similar
-            is_embedding = "embedding.weight" in key and param_new.dim() == 2
+            is_embedding = "embedding.weight" in target_key and param_new.dim() == 2
             
             if is_embedding and do_vocab_transfer:
-                print(f"Attempting vocabulary transfer for layer: {key}")
+                print(f"Attempting vocabulary transfer for layer: {target_key}")
                 try:
                     # Create a new tensor with the NEW shape
                     new_weight = param_new.clone().detach() # Start with random init of current model
@@ -414,23 +464,23 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
                         transferred_count += 1
                     
                     # Update state_dict with the grafted weight
-                    state_dict[key] = new_weight
-                    loaded_keys.append(key) # We count this as "loaded" since we transferred info
+                    state_dict[target_key] = new_weight
+                    loaded_keys.append(target_key)
                     
                     print(f" - Transferred {transferred_count}/{len(new_vocab)} tokens.")
                     continue 
 
                 except Exception as e:
-                    print(f" - Vocab transfer failed for {key}: {e}")
-                    # Fall through to drop
-
-            # CASE 3: Unresolvable Mismatch -> Drop
-            print(f"Dropping layer {key} due to shape mismatch: {param_old.shape} vs {param_new.shape}")
-            keys_to_drop.append(key)
+                    print(f" - Vocab transfer failed for {target_key}: {e}")
+            
+            # --- STEP 3: Unresolvable Mismatch -> Drop ---
+            print(f"Dropping layer {target_key} due to shape mismatch: {param_old.shape} vs {param_new.shape}")
+            keys_to_drop.append(target_key)
 
         # Cleanup state_dict
         for key in keys_to_drop:
-            del state_dict[key]
+            if key in state_dict:
+                del state_dict[key]
 
         # Load
         model.load_state_dict(state_dict, strict=False)
@@ -469,18 +519,18 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         # initiate default training configuration
         pass
 
-    def run_train(self, anndata):
+    def run_train(self, adata):
         pass
 
-    def eval_identity(self, anndata):
+    def eval_identity(self, adata):
         pass  
 
-    def eval_perturb(self, anndata):
+    def eval_perturb(self, adata):
         pass
 
-    def eval_lochness(self, anndata):
+    def eval_lochness(self, adata):
         pass
 
-    def run_test(self, anndata):
+    def run_test(self, adata):
         pass
 

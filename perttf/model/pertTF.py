@@ -54,23 +54,28 @@ class PerturbationTFModel(BaseModel):
         
         
         if self.use_fast_transformer:
-            nlayers = self.transformer_encoder.num_layers if self.transformer_encoder is not None else 2
-            d_hid = self.transformer_encoder.layers[0].linear1.out_features if self.transformer_encoder is not None else 32
-            nhead = self.transformer_encoder.layers[0].self_attn.num_heads if self.transformer_encoder is not None else 4
-            try:
-                from .modules import FlashTransformerEncoderLayerVarlen
-                
-                encoder_layers = FlashTransformerEncoderLayerVarlen(
-                    d_model,
-                    kwargs.get('nhead', nhead),
-                    kwargs.get('d_hid', d_hid),
-                    self.dropout,
-                    batch_first=True,
-                    norm_scheme=self.norm_scheme
-                )
-            except Exception as e:
-                print(e)
-                print('DAO flash attention setup failed, trying pytorch SDPA')
+            nlayers = self.nlayers
+            d_hid = self.d_hid
+            nhead = self.nhead
+            if self.fast_transformer_backend == 'flash':
+                try:
+                    from .modules import FlashTransformerEncoderLayerVarlen
+                    
+                    encoder_layers = FlashTransformerEncoderLayerVarlen(
+                        d_model,
+                        kwargs.get('nhead', nhead),
+                        kwargs.get('d_hid', d_hid),
+                        self.dropout,
+                        batch_first=True,
+                        norm_scheme=self.norm_scheme
+                    )
+                except Exception as e:
+                    print(e)
+                    print('DAO flash attention setup failed')
+                    self.fast_transformer_backend == 'sdpa'
+
+            if self.fast_transformer_backend == 'sdpa':
+                print('trying pytorch SDPA')
                 try:
                     from .modules import SDPATransformerEncoderLayer
                     encoder_layers = SDPATransformerEncoderLayer(
@@ -84,7 +89,8 @@ class PerturbationTFModel(BaseModel):
                 except Exception as ee: 
                     print(ee)
                     print('pytorch sdpa attention setup failed, falling back to native pytorch attention')
-                    self.use_fast_transformer = 'native'
+                    self.use_fast_transformer = False
+                    self.fast_transformer_backend == 'vanilla'
                     encoder_layers = TransformerEncoderLayer(
                         d_model, nhead, d_hid, self.dropout, batch_first=True
                     )
