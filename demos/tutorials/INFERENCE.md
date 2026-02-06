@@ -1,5 +1,9 @@
 
 # Inference Tutorial
+
+You can run this tutorial on Google Colab!  
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1KWWvRJJJOj9QXuF5zgddLHkdCx6KJnTa?usp=sharing)
+
 ### Preparation
 ```python
 # first we load in some packages
