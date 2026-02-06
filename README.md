@@ -1,9 +1,9 @@
-<img src="assets/img/LOGO.png" alt="" width="1000"/>
+<img src="assets/img/LOGO.png" alt="" width="800"/>
 
 **pertTF is a transformer model designed for single-cell perturbation predictions.**
-
+-----
 # Installation
-## Pre-requiste environment
+## Prerequisite environment
 pertTF require `torch > 2.3.0` and `cuda > 12.0` 
 
 best way to install is to set up a seperate envrionment with conda or mamba
@@ -48,9 +48,11 @@ Then, in your python code, you can directly use the pertTF package:
 import sys
 sys.path.insert(0, '/content/pertTF/')
 ```
+-----------------------
+
 
 # Inference Tutorial
-## Preparation
+### Preparation
 ```python
 # first we load in some packages
 from huggingface_hub import hf_hub_download, login
@@ -73,7 +75,7 @@ adata.layers['X_binned'] = adata.X
 sc.pp.highly_variable_genes(adata, n_top_genes=5000)
 ```
 
-# define simple evaluation wrapper
+### define simple evaluation wrapper
 ```python
 def eval_wrapper(model, adata_test, expression = False):
     res = eval_testdata(
@@ -91,7 +93,7 @@ def eval_wrapper(model, adata_test, expression = False):
     return res
 ```
 
-## classification task
+### classification task
 ```python
 classify_model = HFPerturbationTFModel.from_pretrained('weililab/pertTF-tiny', use_fast_transformer = True, fast_transformer_backend = 'flash')
 classify_model.to('cuda')
@@ -101,7 +103,7 @@ adata_eva.obs['predicted_genotype']
 adata_eva.obs['predicted_celltype']
 ```
 
-## cell composition scoring
+### cell composition scoring
 ```python
 lochness_model = HFPerturbationTFModel.from_pretrained('weililab/pertTF_virtual_screen_lochness', use_fast_transformer = True, fast_transformer_backend = 'flash')
 lochness_model.to('cuda')
@@ -116,7 +118,7 @@ adata_eva.obsm['ps_pred']
 adata_eva.obsm['ps_pred_next']
 ```
 
-## perturbation task
+### perturbation task
 ```python
 perturb_model = HFPerturbationTFModel.from_pretrained('weililab/pertTF-perturb_5k_mvc_only', use_fast_transformer = True, fast_transformer_backend = 'flash')
 perturb_model.to('cuda')
