@@ -595,13 +595,13 @@ def eval_testdata(
     # make sure adata_t is ready for training
     shared_genes = adata_t.var.index.isin(list(vocab.stoi.keys()))
     logger.info(f"{sum(shared_genes)} genes shared between model vocab's {len(vocab)} and anndata's {adata_t.shape[1]} genes")
-    adata_t = adata_t[:, adata_t.var.index.isin(list(vocab.stoi.keys()))] 
-    adata_t = adata_t[adata_t.obs['celltype'].isin(cell_type_to_index)] if 'celltype' in adata_t.obs.columns else adata_t
-    adata_t = adata_t[adata_t.obs['genotype'].isin(genotype_to_index)] if 'genotype' in adata_t.obs.columns else adata_t
+    adata_t = adata_t[:, shared_genes] 
+    #adata_t = adata_t[adata_t.obs['celltype'].isin(cell_type_to_index)] if 'celltype' in adata_t.obs.columns else adata_t
+    #adata_t = adata_t[adata_t.obs['genotype'].isin(genotype_to_index)] if 'genotype' in adata_t.obs.columns else adata_t
     gene_ids = vocab(adata_t.var.index.tolist())
     if 'genotype_next' in adata_t.obs.keys():
         adata_t = adata_t[adata_t.obs['genotype_next'].isin(genotype_to_index)]
-    
+    adata_t = adata_t.copy() # make sure it is a independent copy for faster loading
     all_counts = (
         adata_t.layers[input_layer_key].toarray()
         if issparse(adata_t.layers[input_layer_key])
@@ -619,7 +619,7 @@ def eval_testdata(
     if "celltype" in adata_t.obs.columns and config.cell_type_classifier and adata_t.obs["celltype"].isin(cell_type_to_index).all():
         celltypes_labels = adata_t.obs["celltype"].tolist()  # make sure count from 0
         celltypes_labels = np.array(celltypes_labels)
-        celltypes_labels = np.array([cell_type_to_index[cell_type] for cell_type in celltypes_labels])
+        celltypes_labels = np.array([cell_type_to_index[ctype] if ctype in genotype_to_index else 0 for ctype in celltypes_labels])
     else:
         #celltypes_labels = np.array(random.choices( [0,1], k=adata_t.shape[0]))
         celltypes_labels = None
@@ -629,7 +629,7 @@ def eval_testdata(
     if "genotype" in adata_t.obs.columns and (config.perturbation_classifier_weight > 0 or config.perturbation_input):
         perturbation_labels = adata_t.obs["genotype"].tolist()  # make sure count from 0
         perturbation_labels = np.array(perturbation_labels)
-        perturbation_labels = np.array([genotype_to_index[perturbation_type] for perturbation_type in perturbation_labels])
+        perturbation_labels = np.array([genotype_to_index[pert] if pert in genotype_to_index else 0 for pert in perturbation_labels])
     else:
         #perturbation_labels = np.array(random.choices( [0,1], k=adata_t.shape[0]))
         perturbation_labels = None
@@ -710,7 +710,7 @@ def eval_testdata(
 
         all_gene_ids, all_values = tokenized_all["genes"], tokenized_all["values"]
         if logger is not None:
-            logger.info(f"Evaluating data using {all_gene_ids.shape[1]} genes for each cell")
+            logger.info(f"Evaluating data using {all_gene_ids.shape[1]} tokens for each cell")
 
         if next_layer_key in adata_t.layers:
             tokenized_all_next, _ = tokenize_and_pad_batch(
@@ -732,7 +732,7 @@ def eval_testdata(
             all_gene_ids_next, all_values_next = tokenized_all_next["genes"], tokenized_all_next["values"]
 
         src_key_padding_mask = all_gene_ids.eq(vocab[config.pad_token])
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=config.amp):
+        with torch.no_grad(), torch.amp.autocast('cuda', enabled=config.amp):
             #cell_embeddings = model.encode_batch(all_gene_ids,all_values.float(),
             #    src_key_padding_mask=src_key_padding_mask,
             #    batch_size=config.batch_size,
@@ -740,7 +740,9 @@ def eval_testdata(
             #    time_step=0,
             #    return_np=True,
             #)
-            cell_embeddings, cell_embeddings_next, pert_preds, cls_preds, ps_preds, ps_preds_next, expr_dict = model.encode_batch_with_perturb(all_gene_ids,all_values.float(),
+            cell_embeddings, cell_embeddings_next, pert_preds, cls_preds, ps_preds, ps_preds_next, expr_dict = model.encode_batch_with_perturb(
+                all_gene_ids,
+                all_values.float(),
                 src_key_padding_mask=src_key_padding_mask,
                 batch_size=config.batch_size,
                 batch_labels=torch.from_numpy(batch_ids).long() if config.use_batch_label else None, # if config.DSBN else None,
@@ -790,7 +792,8 @@ def eval_testdata(
         predicted_genotypes = [index_to_genotype[i] for i in label_predictions]
         # Add the predicted genotypes to the AnnData object
         adata_t.obs['predicted_genotype'] = predicted_genotypes
-        adata_t.obs['genotype_id'] = adata_t.obs['genotype'].map(genotype_to_index).astype(pd.CategoricalDtype(categories=list(genotype_to_index.values())))
+        if perturbation_labels is not None:
+            adata_t.obs['genotype_id'] = adata_t.obs['genotype'].map(genotype_to_index).astype(pd.CategoricalDtype(categories=list(genotype_to_index.values())))
  
         X_celltype_cls_probs = np.exp(cls_preds) / np.sum(np.exp(cls_preds), axis=1, keepdims=True)
         adata_t.obsm['X_cls_pred_probs'] = X_celltype_cls_probs # backward compatibility
