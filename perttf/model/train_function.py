@@ -601,7 +601,6 @@ def eval_testdata(
     gene_ids = vocab(adata_t.var.index.tolist())
     if 'genotype_next' in adata_t.obs.keys():
         adata_t = adata_t[adata_t.obs['genotype_next'].isin(genotype_to_index)]
-    adata_t = adata_t.copy() # make sure it is a independent copy for faster loading
     all_counts = (
         adata_t.layers[input_layer_key].toarray()
         if issparse(adata_t.layers[input_layer_key])
