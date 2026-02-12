@@ -14,6 +14,7 @@ import torch.distributed as dist
 from .base_model import BaseModel
 
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
+from .expr_sampler import DistributionGenerator
 from .modules import (
     PertExpEncoder,
     PerturbationDecoder,
@@ -170,6 +171,8 @@ class PerturbationTFModel(BaseModel):
         batch_labels: Optional[Tensor] = None,
         pert_labels: Optional[Tensor] = None, 
         pert_labels_next: Optional[Tensor] = None, 
+        sf: Optional[Tensor] = None,
+        sf_next: Optional[Tensor] = None,
         CLS: bool = False,
         CCE: bool = False,
         MVC: bool = False,
@@ -306,6 +309,7 @@ class PerturbationTFModel(BaseModel):
                 else torch.cat([cell_emb, batch_emb], dim=1),
                 # else cell_emb + batch_emb,
                 cur_gene_token_embs,
+                target_size_factor = sf if self.distribution is not None else None
             )
             mvc_output_next = self.mvc_decoder(
                 cell_emb_next
@@ -313,19 +317,18 @@ class PerturbationTFModel(BaseModel):
                 else torch.cat([cell_emb_next, batch_emb], dim=1),
                 # else cell_emb + batch_emb,
                 cur_gene_token_embs, # is it working well??
+                target_size_factor = sf_next if self.distribution is not None else None
             )
-            if self.explicit_zero_prob and do_sample:
+            if self.explicit_zero_prob and False: # bernoulli sampling is meaningless here
                 bernoulli = Bernoulli(probs=mvc_output["zero_probs"])
                 output["mvc_output"] = bernoulli.sample() * mvc_output["pred"]
 
                 bernoulli_n = Bernoulli(probs=mvc_output_next["zero_probs"])
                 output["mvc_output_next"] = bernoulli.sample() * mvc_output_next["pred"]
             else:
-                output["mvc_output"] = mvc_output["pred"]  # (batch, seq_len)
-                output["mvc_output_next"] = mvc_output_next["pred"]  # (batch, seq_len)
-            if self.explicit_zero_prob:
-                output["mvc_zero_probs"] = mvc_output["zero_probs"]
-                output["mvc_zero_probs_next"] = mvc_output_next["zero_probs"]
+                output["mvc_output"] = mvc_output  # (batch, seq_len)
+                output["mvc_output_next"] = mvc_output_next  # (batch, seq_len)
+
         if ECS and hasattr(self, 'sim'):
             # Here using customized cosine similarity instead of F.cosine_similarity
             # to avoid the pytorch issue of similarity larger than 1.0, pytorch # 78064
@@ -370,11 +373,13 @@ class PerturbationTFModel(BaseModel):
         batch_labels: Optional[Tensor] = None,
         pert_labels: Optional[Tensor] = None, # the first perturbation
         pert_labels_next: Optional[Tensor] = None, # the second perturbation
+        sf: Optional[Tensor] = None,
         output_to_cpu: bool = True,
         time_step: Optional[int] = None,
         return_np: bool = False,
         predict_expr = False,
-        mvc_src: Tensor = None # optional MVC tensor of gene ids for MVC decoder
+        mvc_src: Tensor = None, # optional MVC tensor of gene ids for MVC decoder
+        sample: bool = False, 
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         revised scgpt.TransformerModel.encode_batch but with additional perturbation
@@ -431,7 +436,8 @@ class PerturbationTFModel(BaseModel):
             mlm_outputs, mlm_zero_outputs = array_func(mlm_expr_shape, dtype=float32_), array_func(mlm_expr_shape, dtype=float32_)
             mvc_outputs, mvc_zero_outputs = array_func(mvc_expr_shape, dtype=float32_), array_func(mvc_expr_shape, dtype=float32_)
             mvc_next_outputs, mvc_next_zero_outputs = array_func(mvc_expr_shape, dtype=float32_), array_func(mvc_expr_shape, dtype=float32_)
-
+            if self.distribution in ['nb', 'hnb', 'zinb', 'zig']:
+                mvc_param2_outputs, mvc_next_param2_outputs = array_func(mvc_expr_shape, dtype=float32_), array_func(mvc_expr_shape, dtype=float32_)
         for i in trange(0, N, batch_size):
             src_d = src[i : i + batch_size].to(device)
             values_d = values[i : i + batch_size].to(device)
@@ -440,6 +446,7 @@ class PerturbationTFModel(BaseModel):
             pert_labels_d = pert_labels[i : i + batch_size].to(device) if pert_labels is not None else None
             pert_labels_next_d = pert_labels_next[i : i + batch_size].to(device) if pert_labels_next is not None else None
             mvc_src_d = mvc_src[i:i+batch_size].to(device) if mvc_src is not None else None
+            sf_d = sf[i:i+batch_size].to(device) if sf is not None else None
             raw_output = self._encode(
                 src_d,
                 values_d,
@@ -533,38 +540,39 @@ class PerturbationTFModel(BaseModel):
                                 else torch.cat([cell_emb, batch_emb], 
                                 dim=1
                                 ), # else cell_emb + batch_emb,
-                            cur_gene_token_embs,)
+                                cur_gene_token_embs,
+                                target_size_factor=sf_d,)
                 if pert_labels_next_d is not None:
                     mvc_output_next = self.mvc_decoder(
                                 cell_emb_next if not self.use_batch_labels
                                 else torch.cat([cell_emb_next, batch_emb], 
                                 dim=1
                                 ), # else cell_emb + batch_emb,
-                            cur_gene_token_embs,)
+                                cur_gene_token_embs,
+                                target_size_factor=sf_d,)
                 else:
                     mvc_output_next = mvc_output
 
-                mlm_pred, mlm_zero_probs = mlm_output['pred'], mlm_output['zero_probs'] if self.explicit_zero_prob else 1
-                mvc_pred, mvc_zero_probs = mvc_output['pred'], mvc_output['zero_probs'] if self.explicit_zero_prob else 1
-                mvc_pred_next, mvc_zero_probs_next = mvc_output_next['pred'], mvc_output_next['zero_probs'] if self.explicit_zero_prob else 1
-                if output_to_cpu:
-                    mlm_pred, mlm_zero_probs = mlm_pred.cpu(), mlm_zero_probs.cpu() if self.explicit_zero_prob else 1
-                    mvc_pred, mvc_zero_probs =  mvc_pred.cpu(), mvc_zero_probs.cpu() if self.explicit_zero_prob else 1
-                    mvc_pred_next, mvc_zero_probs_next = mvc_pred_next.cpu(), mvc_zero_probs_next.cpu() if self.explicit_zero_prob else 1
+                mlm_pred, mlm_zero_probs = mlm_output['pred'], mlm_output['zero_probs'] if self.explicit_zero_prob else torch.ones_like(mlm_output['pred'])
                 if return_np:
-                    mlm_pred, mlm_zero_probs = mlm_pred.numpy(), mlm_zero_probs.numpy() if self.explicit_zero_prob else 1
-                    mvc_pred, mvc_zero_probs =  mvc_pred.numpy(), mvc_zero_probs.numpy() if self.explicit_zero_prob else 1
-                    mvc_pred_next, mvc_zero_probs_next = mvc_pred_next.numpy(), mvc_zero_probs_next.numpy() if self.explicit_zero_prob else 1
-
-                mlm_outputs[i : i + batch_size], mlm_zero_outputs[i : i + batch_size] = mlm_pred, mlm_zero_probs
-                mvc_outputs[i : i + batch_size], mvc_zero_outputs[i : i + batch_size] = mvc_pred, mvc_zero_probs
-                mvc_next_outputs[i : i + batch_size], mvc_next_zero_outputs[i : i + batch_size] = mvc_pred_next, mvc_zero_probs_next
-
+                    mlm_pred, mlm_zero_probs = mlm_pred.cpu().numpy(), mlm_zero_probs.cpu().numpy() 
+                mvc_generator = DistributionGenerator(self.distribution)
+                mvc_output = mvc_generator.generate(mvc_output, sample = sample, to_numpy = return_np)
+                mvc_output_next = mvc_generator.generate(mvc_output_next, sample = sample, to_numpy = return_np)
+                mvc_pred, mvc_param2, mvc_zero_probs = mvc_output['pred'], mvc_output['param2'], mvc_output['zero_probs']
+                mvc_pred_next, mvc_param2_next, mvc_zero_probs_next = mvc_output_next['pred'], mvc_output_next['param2'], mvc_output_next['zero_probs']
+                mlm_outputs[i:i+batch_size], mvc_outputs[i:i+batch_size], mvc_next_outputs[i:i+batch_size] = mlm_pred, mvc_pred, mvc_pred_next
+                if mvc_param2 is not None and mvc_param2_next is not None:
+                    mvc_param2_outputs[i:i+batch_size], mvc_next_param2_outputs[i:i+batch_size]  = mvc_param2, mvc_param2_next
+                if self.explicit_zero_prob:
+                    mlm_zero_outputs[i:i+batch_size], mvc_zero_outputs[i:i+batch_size], mvc_next_zero_outputs[i:i+batch_size] = mlm_zero_probs, mvc_zero_probs,  mvc_zero_probs_next
+                
 
         if predict_expr:
-            expr_dict['mlm_expr'] = (mlm_outputs[:,1:], mlm_zero_outputs[:,1:])
-            expr_dict['mvc_expr'] = (mvc_outputs[:,1:], mvc_zero_outputs[:,1:])
-            expr_dict['mvc_next_expr'] = (mvc_next_outputs[:,1:], mvc_next_zero_outputs[:,1:])
-
+            expr_dict['mlm_expr'], expr_dict['mvc_expr'], expr_dict['mvc_next_expr'] = (mlm_outputs[:,1:], mvc_outputs[:,1:], mvc_next_outputs[:,1:])
+            if self.explicit_zero_prob:
+                expr_dict['mlm_expr_zero'], expr_dict['mvc_expr_zero'], expr_dict['mvc_next_expr_zero'] = (mlm_zero_outputs[:,1:], mvc_zero_outputs[:,1:], mvc_next_zero_outputs[:,1:])
+            if self.distribution in ['nb', 'hnb', 'zinb', 'zig']:
+                expr_dict['mvc_param2'], expr_dict['mvc_next_param2'] = (mvc_param2_outputs[:, 1:], mvc_next_param2_outputs[:, 1:])
         return outputs, outputs_next, pert_outputs, cls_outputs, ps_outputs, ps_outputs_next, expr_dict
 

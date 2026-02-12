@@ -503,3 +503,200 @@ def hard_triplet_loss(embeddings: torch.Tensor, labels: torch.Tensor, margin: fl
     loss = F.relu((hardest_positive_dist - hardest_negative_dist)/ hardest_negative_dist.mean() + margin)
 
     return loss.mean()
+
+# --- 1. Loss Functions ---
+
+def loss_zig(mu, theta, pi, target, eps=1e-6):
+    """Zero-Inflated Gaussian Loss (Log Space)."""
+    sigma = theta
+    zero_mask = (target <= eps)
+    pos_mask = (target > eps)
+    
+    loss = torch.zeros_like(target)
+    
+    # Gate Loss
+    if zero_mask.any():
+        loss[zero_mask] = -torch.log(pi[zero_mask])
+    
+    # Gaussian Loss
+    if pos_mask.any():
+        y = target[pos_mask]
+        mu_p = mu[pos_mask]
+        sigma_p = sigma[pos_mask]
+        gaussian_nll = (
+            torch.log(sigma_p) + 
+            0.5 * 1.837877 + 
+            0.5 * ((y - mu_p) / sigma_p)**2
+        )
+        loss[pos_mask] = -torch.log(1 - pi[pos_mask]) + gaussian_nll
+    return loss
+
+def loss_nb(mu, theta, pi, target, eps=1e-6):
+    """Standard Negative Binomial Loss."""
+    t1 = torch.lgamma(target + theta) - torch.lgamma(theta) - torch.lgamma(target + 1)
+    t2 = theta * torch.log(theta) + target * torch.log(mu)
+    t3 = (theta + target) * torch.log(theta + mu)
+    return -(t1 + t2 - t3)
+
+def loss_zinb(mu, theta, pi, target, eps=1e-6):
+    """Zero-Inflated NB Loss."""
+    nb_nll = loss_nb(mu, theta, pi, target, eps) # Get positive NLL
+    loss = torch.zeros_like(target)
+    
+    # Non-Zero Targets
+    nonzero_mask = (target > 0)
+    if nonzero_mask.any():
+        loss[nonzero_mask] = -torch.log(1 - pi[nonzero_mask]) + nb_nll[nonzero_mask]
+        
+    # Zero Targets
+    zero_mask = ~nonzero_mask
+    if zero_mask.any():
+        pi_z, theta_z, mu_z = pi[zero_mask], theta[zero_mask], mu[zero_mask]
+        log_nb_0 = theta_z * (torch.log(theta_z) - torch.log(theta_z + mu_z))
+        
+        loss[zero_mask] = -torch.logaddexp(
+            torch.log(pi_z), 
+            torch.log(1 - pi_z) + log_nb_0
+        )
+    return loss
+
+def loss_hnb(mu, theta, pi, target, eps=1e-6):
+    """Hurdle NB Loss."""
+    loss = torch.zeros_like(target)
+    zero_mask = (target == 0)
+    pos_mask = (target > 0)
+
+    # Gate Loss (BCE)
+    with torch.autocast(device_type='cuda', enabled=False):
+        loss += F.binary_cross_entropy(pi.float(), zero_mask.float(), reduction='none')
+
+    # Truncated NB Loss
+    if pos_mask.any():
+        nb_nll = loss_nb(mu, theta, pi, target, eps)
+        
+        theta_p, mu_p = theta[pos_mask], mu[pos_mask]
+        log_prob_zero = theta_p * (torch.log(theta_p) - torch.log(theta_p + mu_p))
+        truncation = torch.log(-torch.expm1(log_prob_zero) + eps)
+        
+        loss[pos_mask] += (nb_nll[pos_mask] + truncation) # nb_nll is already positive
+    return loss
+
+def loss_pois(mu, theta, pi, target, eps=1e-6):
+    """Standard Poisson."""
+    return F.poisson_nll_loss(mu, target, log_input=False, full=False, reduction='none')
+
+def loss_zipois(mu, theta, pi, target, eps=1e-6):
+    """Zero-Inflated Poisson."""
+    loss = torch.zeros_like(target)
+    nonzero_mask = (target > 0)
+    
+    # Non-Zero
+    if nonzero_mask.any():
+        pois_nll = F.poisson_nll_loss(mu[nonzero_mask], target[nonzero_mask], 
+                                      log_input=False, full=False, reduction='none')
+        loss[nonzero_mask] = -torch.log(1 - pi[nonzero_mask]) + pois_nll
+        
+    # Zero
+    zero_mask = ~nonzero_mask
+    if zero_mask.any():
+        pi_z, mu_z = pi[zero_mask], mu[zero_mask]
+        # Pois(0) = exp(-mu) -> log(Pois(0)) = -mu
+        loss[zero_mask] = -torch.logaddexp(
+            torch.log(pi_z),
+            torch.log(1 - pi_z) - mu_z
+        )
+    return loss
+
+# --- 2. Loss Registry ---
+
+LOSS_REGISTRY = {
+    'zig': loss_zig,
+    'nb': loss_nb,
+    'zinb': loss_zinb,
+    'hnb': loss_hnb,
+    'pois': loss_pois,
+    'zipois': loss_zipois
+}
+
+class GenerativeExpressionLoss(torch.nn.Module):
+    def __init__(self, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+
+    def forward(
+        self, 
+        outputs: dict, 
+        target: torch.Tensor, 
+        mask: torch.Tensor = None,
+        scale_factor: torch.Tensor = None,
+        positions: torch.Tensor = None
+    ) -> torch.Tensor:
+        
+        # control which samples contribute to loss
+        if positions is None:
+            positions = torch.ones(target.size(0), dtype=torch.bool, device=target.device)
+        # 1. Handle Mask Defaults
+        if mask is None or not mask.any():
+            mask = torch.ones_like(outputs['pred'], dtype=torch.bool)
+        
+        
+        # 2. Check Distribution Type
+        dist_type = outputs.get('distribution', None)
+        if dist_type is None:
+            # Fallback to MSE
+            # Note: Assuming masked_mse_loss handles masking internally
+            return masked_mse_loss(outputs['pred'], target, mask) 
+        
+        if dist_type not in LOSS_REGISTRY:
+             raise ValueError(f"Distribution '{dist_type}' not supported.")
+        
+        mask = mask[positions]
+        # --- PRE-PROCESSING (While shapes are still 2D) ---
+        
+        # Un-normalize Targets (Log-Norm -> Counts)
+        # We do this BEFORE masking so that (Batch, 1) scale_factor broadcasts 
+        # correctly to (Batch, Genes)
+        if dist_type != 'zig':
+            if scale_factor is None:
+                raise ValueError(f"{dist_type} requires scale_factor.")
+            
+            # NOTE: Check math here. 
+            # raw count = expm1(log_norm)/scale_factor
+            target = torch.expm1(target)/scale_factor
+            target = torch.round(target).clamp(min=0)
+
+        # --- MASKING (Flatten to 1D) ---
+        # Now we flatten everything to only valid elements.
+        # This prevents invalid params (e.g. negative theta in padding) from crashing loss.
+        
+        mu = outputs['pred'][positions][mask]
+        target = target[positions][mask]
+        
+        param2 = outputs.get('param2')
+        if param2 is not None:
+            if param2.dim() == 1:
+                param2 = param2.expand(outputs['pred'].shape[0], -1)
+            param2 = param2[positions][mask]
+            # Stability Clamp (Important for Theta/Sigma)
+            param2 = torch.clamp(param2, min=1e-4, max=1e4)
+
+        pi = outputs.get('zero_probs')
+        if pi is not None:
+            # Convert Prob(Non-Zero) -> Prob(Dropout)
+            pi = 1.0 - pi 
+            pi = pi[positions][mask]
+            # Stability Clamp (Important for BCE/Log)
+            pi = torch.clamp(pi, min=1e-4, max=0.999)
+
+        # Clamp Mu
+        mu = torch.clamp(mu, min=self.eps, max=1e6)
+
+        # --- DISPATCH ---
+        # Now all inputs are 1D vectors of valid elements.
+        loss_func = LOSS_REGISTRY[dist_type]
+        loss_elementwise = loss_func(mu, param2, pi, target, self.eps)
+
+        # --- REDUCTION ---
+        # Since we already filtered by mask, we just take the mean.
+        return loss_elementwise.mean()
+

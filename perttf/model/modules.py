@@ -874,7 +874,8 @@ class MVCDecoder(nn.Module):
         arch_style: str = "inner product",
         query_activation: nn.Module = nn.Sigmoid,
         hidden_activation: nn.Module = nn.PReLU,
-        explicit_zero_prob: bool = False,
+        explicit_zero_prob: bool = True, 
+        distribution: str = None,  # Options: 'nb', 'zinb', 'hnb', 'zig', 'pois', 'zipois'
         use_batch_labels: bool = False,
     ) -> None:
         """
@@ -886,14 +887,41 @@ class MVCDecoder(nn.Module):
                 vectors.
             hidden_activation (:obj:`nn.Module`): activation function for the hidden
                 layers.
+            explicit_zero_prob (:obj:`bool`): whther to modle the NON-ZERO probability
+            distribution (:obj:`str`): expression distribution 
+                'nb' (negative binomial) 
+                'zinb' (zero-inflated negative binomial) 
+                'hnb' (hurdle truncated negative binomial) 
+                'zig' (zero inflated gaussian) 
+                'pois' (poisson)
+                'zipois' (zero inflated poisson)
+            use_batch_labels (:obj:`bool`): whether batch label is included during modeling
         """
         super().__init__()
+        self.distribution = None if distribution is None else distribution.lower()
+        
+        valid_dists = ['nb', 'zinb', 'hnb', 'zig', 'pois', 'zipois', None]
+        if self.distribution not in valid_dists:
+            raise ValueError(f"Unknown distribution: {self.distribution}")
+
+        # 1. Determine Gate (Pi)
+        self.explicit_zero_prob = self.distribution in ['zinb', 'hnb', 'zig', 'zipois'] or explicit_zero_prob
+        
+        # 2. Determine param2 (Theta/Sigma)
+        self.has_param2 = self.distribution in ['nb', 'zinb', 'hnb', 'zig']
+
+        self.expr_act = nn.Identity() if distribution is None else nn.Softplus()
         d_in = d_model * 2 if use_batch_labels else d_model
+        
+        if self.has_param2:
+            self.gene2param2 = torch.nn.Linear(d_model, 1) 
+
+        # --- Architecture Setup (Same as before) ---
         if arch_style in ["inner product", "inner product, detach"]:
             self.gene2query = nn.Linear(d_model, d_model)
             self.query_activation = query_activation()
             self.W = nn.Linear(d_model, d_in, bias=False)
-            if explicit_zero_prob:  # by default, gene-wise prob rate
+            if self.explicit_zero_prob:  # by default, gene-wise prob rate
                 self.W_zero_logit = nn.Linear(d_model, d_in)
         elif arch_style == "concat query":
             self.gene2query = nn.Linear(d_model, 64)
@@ -901,58 +929,98 @@ class MVCDecoder(nn.Module):
             self.fc1 = nn.Linear(d_model + 64, 64)
             self.hidden_activation = hidden_activation()
             self.fc2 = nn.Linear(64, 1)
+            if self.explicit_zero_prob:  # by default, gene-wise prob rate
+                self.W_zero_logit = nn.Linear(d_model, d_in)
         elif arch_style == "sum query":
             self.gene2query = nn.Linear(d_model, d_model)
             self.query_activation = query_activation()
             self.fc1 = nn.Linear(d_model, 64)
             self.hidden_activation = hidden_activation()
             self.fc2 = nn.Linear(64, 1)
+            if self.explicit_zero_prob:  # by default, gene-wise prob rate
+                self.W_zero_logit = nn.Linear(d_model, d_in)
         else:
             raise ValueError(f"Unknown arch_style: {arch_style}")
         self.arch_style = arch_style
         self.do_detach = arch_style.endswith("detach")
-        self.explicit_zero_prob = explicit_zero_prob
 
     def forward(
-        self, cell_emb: Tensor, gene_embs: Tensor
-    ) -> Union[Tensor, Dict[str, Tensor]]:
+        self, 
+        cell_emb: Tensor, 
+        gene_embs: Tensor,
+        target_size_factor: Tensor = None,
+    ) -> Dict[str, Tensor]:
         """
         Args:
-            cell_emb: Tensor, shape (batch, embsize=d_model)
-            gene_embs: Tensor, shape (batch, seq_len, embsize=d_model)
+            cell_emb: (batch, d_model)
+            gene_embs: (batch, seq_len, d_model)
+            target_size_factor: (batch, 1) - The total counts of the target cell
         """
         gene_embs = gene_embs.detach() if self.do_detach else gene_embs
+        
+        # 1. Calculate param2
+        param2 = None
+        if self.has_param2:
+            param2 = F.softplus(self.gene2param2(gene_embs)).squeeze(2)
+            param2 = 1/(param2 + 1e-6)
+            param2 = torch.clamp(param2, min=1e-4, max=1e4)
+
+        # 2. Calculate Prediction
+        pred_concentration = None
+        zero_probs = None 
+
         if self.arch_style in ["inner product", "inner product, detach"]:
             query_vecs = self.query_activation(self.gene2query(gene_embs))
             cell_emb = cell_emb.unsqueeze(2)  # (batch, embsize, 1)
             # the pred gene expr values, # (batch, seq_len)
             pred_value = torch.bmm(self.W(query_vecs), cell_emb).squeeze(2)
-            if not self.explicit_zero_prob:
-                return dict(pred=pred_value)
-            # zero logits need to based on the cell_emb, because of input exprs
-            zero_logits = torch.bmm(self.W_zero_logit(query_vecs), cell_emb).squeeze(2)
-            zero_probs = torch.sigmoid(zero_logits)
-            return dict(pred=pred_value, zero_probs=zero_probs)
+            pred_concentration = self.expr_act(pred_value)
+            if self.explicit_zero_prob:
+                zero_logits = torch.bmm(self.W_zero_logit(query_vecs), cell_emb).squeeze(2)
+                zero_probs = torch.sigmoid(zero_logits)
         elif self.arch_style == "concat query":
             query_vecs = self.query_activation(self.gene2query(gene_embs))
-            # expand cell_emb to (batch, seq_len, embsize)
-            cell_emb = cell_emb.unsqueeze(1).expand(-1, gene_embs.shape[1], -1)
-
-            h = self.hidden_activation(
-                self.fc1(torch.cat([cell_emb, query_vecs], dim=2))
-            )
+            
+            # Predict Dropout (Pi) - calculated early for concat style
             if self.explicit_zero_prob:
-                raise NotImplementedError
-            return self.fc2(h).squeeze(2)  # (batch, seq_len)
+                # Note: Logic copied from your snippet, using query * cell dot product for zero prob
+                # You might want to use the FC layers for this too, but keeping your logic:
+                zero_logits = torch.bmm(self.W_zero_logit(query_vecs), 
+                                      self.query_activation(cell_emb.unsqueeze(2))).squeeze(2)
+                zero_probs = torch.sigmoid(zero_logits)
+
+            # Predict Concentration
+            cell_emb_expanded = cell_emb.unsqueeze(1).expand(-1, gene_embs.shape[1], -1)
+            combined = torch.cat([cell_emb_expanded, query_vecs], dim=2)
+            h = self.hidden_activation(self.fc1(combined))
+            raw_pred = self.fc2(h).squeeze(2)
+            pred_concentration = self.expr_act(raw_pred)
+
         elif self.arch_style == "sum query":
             query_vecs = self.query_activation(self.gene2query(gene_embs))
             cell_emb = cell_emb.unsqueeze(1)
-
             h = self.hidden_activation(self.fc1(cell_emb + query_vecs))
             if self.explicit_zero_prob:
-                raise NotImplementedError
-            return self.fc2(h).squeeze(2)  # (batch, seq_len)
+                zero_logits = torch.bmm(self.W_zero_logit(query_vecs), 
+                                      self.query_activation(cell_emb.unsqueeze(2))).squeeze(2)
+                zero_probs = torch.sigmoid(zero_logits)
 
+            raw_pred = self.fc2(h).squeeze(2)
+            pred_concentration = self.expr_act(raw_pred)
+
+        # 3. Finalize Mu
+        if self.distribution == 'zig':
+            mu = pred_concentration
+        else:
+            target_size_factor = 1 if target_size_factor is None else target_size_factor
+            mu = pred_concentration * target_size_factor
+
+        return {
+            "pred": mu,
+            "param2": param2, 
+            "zero_probs": zero_probs if self.explicit_zero_prob else torch.ones_like(mu),
+            "distribution": self.distribution
+        }
 
 from torch.autograd import Function
 class GradReverse(Function):

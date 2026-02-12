@@ -17,10 +17,21 @@ from sklearn.model_selection._split import _BaseKFold
 from .custom_tokenizer import tokenize_and_pad_batch, random_mask_value, SimpleVocab
 from .ot import compute_ot_for_subset
 
+# Get size factor from lognormalized matrix
+def _get_sf(X):
+    if issparse(X):
+        X = X.toarray()
+    X[X == 0] = np.inf
+    X_mins = X.min(1)
+    X[X == np.inf ] = 0
+    sf = np.exp(X_mins).reshape(-1,1)-1
+    return sf
+
+# add batch info 
 def add_batch_info(adata):
     """helper function to add batch effect columns into adata"""
     if "batch" not in adata.obs.columns: 
-        batch_ids_0=random.choices( [0,1], k=adata.shape[0])
+        batch_ids_0=random.choices( [0], k=adata.shape[0])
         adata.obs["batch"]=batch_ids_0
     if "batch_id" not in adata.obs.columns: 
         adata.obs["str_batch"] = adata.obs["batch"]
@@ -58,7 +69,8 @@ class PertTFDataset(Dataset):
                  ps_columns_perturbed_genes: list = None, 
                  next_cell_pred: str = "identity", 
                  additional_ps_dict: dict = None, 
-                 only_sample_wt_pert: bool = False
+                 only_sample_wt_pert: bool = False,
+                 size_factor_col: str = None
                  ):
         """
         The PertTFDataset serves to interface with pytorch Dataloaders 
@@ -82,7 +94,7 @@ class PertTFDataset(Dataset):
         self.indices = indices if indices is not None else np.arange(len(self.adata.obs.index))
         self.use_ot = use_ot
         self.ot_params = ot_params
-        self.ot_pickle_path = self.ot_params.get('ot_pickle_path', './temp_ot.pickle')
+        self.ot_pickle_path = self.ot_params.get('ot_pickle_path', './._temp_ot.pickle')
         self.ot_top_k = self.ot_params.get('ot_top_k', 10)
         self.ot_epsilon = self.ot_params.get('ot_epsilon', 0.5)
         self.ot_max_dist = self.ot_params.get('ot_max_dist', np.inf)
@@ -100,6 +112,7 @@ class PertTFDataset(Dataset):
         # For efficient next-cell sampling, pre-compute a dictionary of valid choices
         # IMPORTANT: This dictionary only contains cells from the current data split (train/valid)
         # to prevent data leakage.
+        self.sf = _get_sf(self.adata.layers[self.expr_layer]) if size_factor_col is None else adata.obs[size_factor_col].values
         self.next_cell_dict = self._create_next_cell_pool()
         self.only_sample_wt_pert = only_sample_wt_pert
         if self.use_ot and self.next_cell_pred == "pert":
@@ -309,7 +322,8 @@ class PertTFDataset(Dataset):
 
         if issparse(next_expr):
             next_expr = next_expr.toarray().flatten()
-
+        current_sf = self.sf[current_cell_global_idx]
+        next_sf = self.sf[next_cell_global_idx]
         # 5. Get labels and PS scores
         cell_label = self.cell_type_to_index[current_cell_celltype]
         pert_label = self.genotype_to_index[current_cell_genotype]
@@ -350,6 +364,8 @@ class PertTFDataset(Dataset):
             "perturbation_labels_next": pert_label_next,
             "ps": ps_scores,
             "ps_next": ps_scores_next,
+            "sf": current_sf,
+            "sf_next": next_sf,
             "index": current_cell_global_idx,
             "next_index": next_cell_global_idx,
             'name': current_cell_idx,
@@ -424,7 +440,12 @@ class PertBatchCollator:
         )
 
         # 4. Collate all other labels into tensors
-        full_gene_id = torch.from_numpy(self.gene_ids).long()
+        cls_vec = np.array([self.cls_value for i in range(len(batch))]).reshape(-1,1)
+        full_gene_id = np.insert(self.gene_ids, 0, self.vocab[self.cls_token]) if self.append_cls else self.gene_ids
+        full_gene_id = torch.from_numpy(full_gene_id).long()
+        expr_mat = expr_mat if not self.append_cls else np.hstack([cls_vec, expr_mat])
+        expr_mat_next = expr_mat_next if not self.append_cls else np.hstack([cls_vec, expr_mat_next])
+
         collated_batch = {
             "gene_ids": tokenized["genes"],
             "next_gene_ids": tokenized_next["genes"],
