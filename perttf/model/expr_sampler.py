@@ -37,6 +37,7 @@ def _sample_zinb(mu, theta, pi, sample=False, **kwargs):
         val = (1 - pi) * val
     return val
 
+# correct way of rejection sampling, might be too slow
 def _sample_hnb(mu, theta, pi, sample=False, **kwargs):
     """Hurdle NB (Rejection Sampling)."""
     if not sample:
@@ -66,7 +67,7 @@ def _sample_hnb(mu, theta, pi, sample=False, **kwargs):
     return samples
 
 import torch
-
+# optimized hurdle negative binomial sampling?? slight approximation for speed
 def _sample_hnb_optimized(mu, theta, pi, sample=False, threshold=0.95, **kwargs):
     """
     Optimized Hurdle NB Sampling.
@@ -166,7 +167,7 @@ class DistributionGenerator:
     Wrapper class that dispatches to the registry.
     """
     def __init__(self, distribution: str = None):
-        # not sure what we should put here for now
+        # lockin the distribution when initiating
         self.distribution = distribution
         if self.distribution is not None:
             assert type(self.distribution) == str, f"Distribution '{self.distribution}' not of type String."

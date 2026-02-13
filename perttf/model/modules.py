@@ -968,7 +968,6 @@ class MVCDecoder(nn.Module):
         # 2. Calculate Prediction
         pred_concentration = None
         zero_probs = None 
-
         if self.arch_style in ["inner product", "inner product, detach"]:
             query_vecs = self.query_activation(self.gene2query(gene_embs))
             cell_emb = cell_emb.unsqueeze(2)  # (batch, embsize, 1)
@@ -978,18 +977,13 @@ class MVCDecoder(nn.Module):
             if self.explicit_zero_prob:
                 zero_logits = torch.bmm(self.W_zero_logit(query_vecs), cell_emb).squeeze(2)
                 zero_probs = torch.sigmoid(zero_logits)
+
         elif self.arch_style == "concat query":
             query_vecs = self.query_activation(self.gene2query(gene_embs))
-            
-            # Predict Dropout (Pi) - calculated early for concat style
             if self.explicit_zero_prob:
-                # Note: Logic copied from your snippet, using query * cell dot product for zero prob
-                # You might want to use the FC layers for this too, but keeping your logic:
                 zero_logits = torch.bmm(self.W_zero_logit(query_vecs), 
                                       self.query_activation(cell_emb.unsqueeze(2))).squeeze(2)
                 zero_probs = torch.sigmoid(zero_logits)
-
-            # Predict Concentration
             cell_emb_expanded = cell_emb.unsqueeze(1).expand(-1, gene_embs.shape[1], -1)
             combined = torch.cat([cell_emb_expanded, query_vecs], dim=2)
             h = self.hidden_activation(self.fc1(combined))
@@ -998,13 +992,12 @@ class MVCDecoder(nn.Module):
 
         elif self.arch_style == "sum query":
             query_vecs = self.query_activation(self.gene2query(gene_embs))
-            cell_emb = cell_emb.unsqueeze(1)
-            h = self.hidden_activation(self.fc1(cell_emb + query_vecs))
             if self.explicit_zero_prob:
                 zero_logits = torch.bmm(self.W_zero_logit(query_vecs), 
                                       self.query_activation(cell_emb.unsqueeze(2))).squeeze(2)
                 zero_probs = torch.sigmoid(zero_logits)
-
+            cell_emb = cell_emb.unsqueeze(1)
+            h = self.hidden_activation(self.fc1(cell_emb + query_vecs))
             raw_pred = self.fc2(h).squeeze(2)
             pred_concentration = self.expr_act(raw_pred)
 
