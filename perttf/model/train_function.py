@@ -602,7 +602,8 @@ def eval_testdata(
     make_plots = True,
     predict_expr = False,
     mvc_full_expr = False,
-    nb_sf = False
+    sizefactor = False,
+    sample = False
 ) -> Optional[Dict]: # Returns a dictionary containing the AnnData object
     """
     Evaluate the model on test data and return an AnnData object with embeddings.
@@ -632,7 +633,7 @@ def eval_testdata(
         else adata_t.layers[input_layer_key]
     )
     from ..utils.pert_data_loader import _get_sf
-    sf = _get_sf(all_counts) if nb_sf else None
+    sf = _get_sf(all_counts) if sizefactor else None
     if next_layer_key in adata_t.layers:
         all_counts_next = (
             adata_t.layers[next_layer_key].toarray()
@@ -774,11 +775,12 @@ def eval_testdata(
                 batch_labels=torch.from_numpy(batch_ids).long() if config.use_batch_label else None, # if config.DSBN else None,
                 pert_labels = torch.from_numpy(perturbation_indexes).long() if config.perturbation_input else None,
                 pert_labels_next = torch.from_numpy(perturbation_indexes_next).long() if next_cell_prediction else None,
-                sf = torch.Tensor(sf) if nb_sf else None,
+                sf = torch.Tensor(sf) if sizefactor else None,
                 time_step=0,
                 return_np=True,
                 predict_expr = predict_expr,
-                mvc_src = full_gene_ids
+                mvc_src = full_gene_ids,
+                sample = sample
             )
 
         cell_embeddings = cell_embeddings / np.linalg.norm(
@@ -928,7 +930,15 @@ def wrapper_train(model, config, data_gen,
                 f"valid ps {val_ps:5.4f} | valid ps_next {val_ps_next:5.4f} |"
             )
             logger.info("-" * 89)
-        loss = val_loss + val_loss_next + val_mvc + val_mvc_next + val_cls + val_pert
+        loss = val_loss * 0.1
+        if config.next_cell_pred_type == 'identity':
+            loss += (val_cls*int(config.cell_type_classifier)
+                      + val_pert*int(config.genotype_classifier))
+        elif config.next_cell_pred_type == 'pert':
+            loss += val_mvc_next 
+        else:
+            loss += val_ps + val_ps_next 
+        best_model_epoch =0
         if loss < best_val_loss:
             best_val_loss = loss
             best_model = copy.deepcopy(model)

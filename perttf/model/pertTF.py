@@ -557,8 +557,8 @@ class PerturbationTFModel(BaseModel):
                 if return_np:
                     mlm_pred, mlm_zero_probs = mlm_pred.cpu().numpy(), mlm_zero_probs.cpu().numpy() 
                 mvc_generator = DistributionGenerator(self.distribution)
-                mvc_output = mvc_generator.generate(mvc_output, sample = sample, to_numpy = return_np)
-                mvc_output_next = mvc_generator.generate(mvc_output_next, sample = sample, to_numpy = return_np)
+                mvc_output = mvc_generator.generate(mvc_output, sample = sample, to_numpy = return_np, device = next(self.parameters()).device)
+                mvc_output_next = mvc_generator.generate(mvc_output_next, sample = sample, to_numpy = return_np, device = next(self.parameters()).device)
                 mvc_pred, mvc_param2, mvc_zero_probs = mvc_output['pred'], mvc_output['param2'], mvc_output['zero_probs']
                 mvc_pred_next, mvc_param2_next, mvc_zero_probs_next = mvc_output_next['pred'], mvc_output_next['param2'], mvc_output_next['zero_probs']
                 mlm_outputs[i:i+batch_size], mvc_outputs[i:i+batch_size], mvc_next_outputs[i:i+batch_size] = mlm_pred, mvc_pred, mvc_pred_next
