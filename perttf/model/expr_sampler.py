@@ -157,7 +157,7 @@ GENERATION_REGISTRY = {
     'zig': _sample_zig,
     'nb': _sample_nb,
     'zinb': _sample_zinb,
-    'hnb': _sample_hnb_optimized,
+    'hnb': _sample_hnb,
     'pois': _sample_pois,
     'zipois': _sample_zipois
 }
