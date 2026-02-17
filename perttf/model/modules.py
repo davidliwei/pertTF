@@ -877,6 +877,7 @@ class MVCDecoder(nn.Module):
         explicit_zero_prob: bool = True, 
         distribution: str = None,  # Options: 'nb', 'zinb', 'hnb', 'zig', 'pois', 'zipois'
         use_batch_labels: bool = False,
+        sf_scaling: bool = True,
     ) -> None:
         """
         Args:
@@ -899,7 +900,7 @@ class MVCDecoder(nn.Module):
         """
         super().__init__()
         self.distribution = None if distribution is None else distribution.lower()
-        
+        self.sf_scaling = sf_scaling
         valid_dists = ['nb', 'zinb', 'hnb', 'zig', 'pois', 'zipois', None]
         if self.distribution not in valid_dists:
             raise ValueError(f"Unknown distribution: {self.distribution}")
@@ -1005,8 +1006,11 @@ class MVCDecoder(nn.Module):
         if self.distribution == 'zig':
             mu = pred_concentration
         else:
-            target_size_factor = 1 if target_size_factor is None else target_size_factor
-            mu = pred_concentration * target_size_factor
+            # maybe use constant sizefactor (sf_scaling = False) and let the model learn what it can
+            target_size_factor = 1 if target_size_factor is None or not self.sf_scaling else target_size_factor
+            # OR this should be division because inputs are size factor agnostic thus outputs are size factor agnostic??
+            # Furthermore, testing shows lower NLL when division is used as opposed to multiplication
+            mu = pred_concentration / target_size_factor 
 
         return {
             "pred": mu,

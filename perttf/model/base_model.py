@@ -54,6 +54,7 @@ class BaseModel(nn.Module):
         fast_transformer_backend: str = "flash",
         pre_norm: bool = False,
         distribution: str = None,
+        sf_scaling: bool = True,
         **kwargs
     ):
         super().__init__()
@@ -80,6 +81,7 @@ class BaseModel(nn.Module):
         self.use_fast_transformer = False if not torch.cuda.is_available() or fast_transformer_backend == 'vanilla' else use_fast_transformer
         self.fast_transformer_backend = fast_transformer_backend if torch.cuda.is_available() else 'vanilla'
         self.distribution = distribution
+        self.sf_scaling = sf_scaling
         if self.input_emb_style not in ["category", "continuous", "scaling",'autobin']:
             raise ValueError(
                 f"input_emb_style should be one of category, continuous, scaling, "
@@ -137,7 +139,8 @@ class BaseModel(nn.Module):
                 arch_style=self.mvc_decoder_style,
                 explicit_zero_prob=self.explicit_zero_prob,
                 use_batch_labels=self.use_batch_labels,
-                distribution=self.distribution
+                distribution=self.distribution,
+                sf_scaling = self.sf_scaling
             )
 
         if do_dab:
