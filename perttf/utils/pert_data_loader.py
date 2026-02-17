@@ -15,17 +15,7 @@ import anndata
 from scipy.sparse import issparse
 from sklearn.model_selection._split import _BaseKFold
 from .custom_tokenizer import tokenize_and_pad_batch, random_mask_value, SimpleVocab
-
-
-# Get size factor from lognormalized matrix
-def _get_sf(X):
-    if issparse(X):
-        X = X.toarray()
-    X[X == 0] = np.inf
-    X_mins = X.min(1)
-    X[X == np.inf ] = 0
-    sf = np.exp(X_mins).reshape(-1,1)-1
-    return sf
+from .misc import _get_sf
 
 # add batch info 
 def add_batch_info(adata):
@@ -589,7 +579,8 @@ class PertTFUniDataManager:
             next_cell_pred=self.next_cell_pred_type ,  
             additional_ps_dict = self.additional_ps_dict,  
             expr_layer=self.expr_layer, 
-            only_sample_wt_pert=self.only_sample_wt_pert
+            only_sample_wt_pert=self.only_sample_wt_pert,
+            size_factor_col = self.config.get('size_factor_col', None)
         )
         return perttf_dataset
 
