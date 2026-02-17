@@ -15,7 +15,7 @@ import anndata
 from scipy.sparse import issparse
 from sklearn.model_selection._split import _BaseKFold
 from .custom_tokenizer import tokenize_and_pad_batch, random_mask_value, SimpleVocab
-from .ot import compute_ot_for_subset
+
 
 # Get size factor from lognormalized matrix
 def _get_sf(X):
@@ -187,6 +187,13 @@ class PertTFDataset(Dataset):
 
     def _recalculate_ot(self):
         # 1. Create View
+        try:
+            from .ot import compute_ot_for_subset
+        except:
+            print('ott-jax import failed, please pip install ott-jax if use_ot = True; default back to random pairings')
+            self.use_ot = False
+            self.next_cell_dict = self._create_next_cell_pool()
+            return None
         adata_subset = self.adata[self.indices]
 
         # 2. Compute Maps (Pass the calculated threshold)
