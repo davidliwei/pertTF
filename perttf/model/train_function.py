@@ -27,7 +27,13 @@ from ..utils.logger import create_logger
 import matplotlib.pyplot as plt
 
 from ..utils.set_optimizer import create_optimizer_dict
-from ..custom_loss import cce_loss, criterion_neg_log_bernoulli, masked_mse_loss, masked_relative_error
+from ..custom_loss import (
+    cce_loss, 
+    criterion_neg_log_bernoulli, 
+    masked_mse_loss, 
+    masked_relative_error,
+    GenerativeExpressionLoss
+)
 from ..utils.plot import process_and_log_umaps
 from ..utils.misc import init_plot_worker
 
@@ -49,6 +55,7 @@ def train(model: nn.Module,
     criterion_pert = nn.CrossEntropyLoss()
     criterion_adv = nn.CrossEntropyLoss()  # consider using label smoothing
     criterion_ps = nn.MSELoss() # this is the loss for predicting PS scores
+    criterion_mvc = GenerativeExpressionLoss()
     #criterion_ps = nn.CrossEntropyLoss()
 
     if device is None:
@@ -91,7 +98,8 @@ def train(model: nn.Module,
         batch_labels = batch_data["batch_labels"].to(device)
         celltype_labels = batch_data["celltype_labels"].to(device) #added
         perturbation_labels = batch_data["perturbation_labels"].to(device) #added
-
+        sf = batch_data['sf'].to(device)
+        sf_next = batch_data['sf_next'].to(device)
         celltype_labels_next = batch_data["celltype_labels_next"].to(device) #added
         perturbation_labels_next = batch_data["perturbation_labels_next"].to(device) #added
 
@@ -111,6 +119,8 @@ def train(model: nn.Module,
                 batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
                 pert_labels = perturbation_labels if config.perturbation_input else None,
                 pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
+                sf = sf,
+                sf_next = sf,
                 MVC=config.GEPC,
                 ECS=config.ecs_thres > 0,
                 CLS=config.get('cell_type_classifier', True),
@@ -174,19 +184,25 @@ def train(model: nn.Module,
                 mvc_target_values = target_values if config.get('mvc_masked_train', True) else batch_data["full_expr"].to(device)
                 mvc_target_values_next = target_values_next if config.get('mvc_masked_train', True) else batch_data["full_expr_next"].to(device)
                 mvc_masked_positions = masked_positions if config.get('mvc_masked_train', True) else None
-                loss_gepc = criterion(
-                    output_dict["mvc_output"], mvc_target_values, mvc_masked_positions
-                )
+                loss_gepc = criterion_mvc(
+                        output_dict["mvc_output"], 
+                        mvc_target_values, 
+                        mvc_masked_positions,
+                        scale_factor = sf,
+                    )
                 loss = loss + config.this_weight *loss_gepc
                 metrics_to_log.update({"train/mvc": loss_gepc.item()})
                 # added
-                loss_gepc_next = criterion(
-                    output_dict["mvc_output_next"], mvc_target_values_next, mvc_masked_positions
+                loss_gepc_next = criterion_mvc(
+                    output_dict["mvc_output_next"], 
+                    mvc_target_values_next, 
+                    mvc_masked_positions,
+                    scale_factor = sf_next,
                 )
                 loss = loss + config.next_weight * loss_gepc_next
                 metrics_to_log.update({"train/mvc_next": loss_gepc_next.item()})
                 
-                if config.explicit_zero_prob:
+                if config.explicit_zero_prob and config.distribution is None:
                     loss_gepc_zero_log_prob = criterion_neg_log_bernoulli(
                         output_dict["mvc_zero_probs"], mvc_target_values, mvc_masked_positions
                     )
@@ -277,6 +293,8 @@ def train(model: nn.Module,
                 batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
                 pert_labels = perturbation_labels if config.perturbation_input else None,
                 pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
+                sf = sf,
+                sf_next = sf,
                 MVC=config.GEPC,
                 ECS=config.ecs_thres > 0,
                 CLS=config.get('cell_type_classifier', True),
@@ -415,7 +433,7 @@ def evaluate(model: nn.Module,
     criterion_pert = nn.CrossEntropyLoss()
     criterion_adv = nn.CrossEntropyLoss()  # consider using label smoothing
     criterion_ps = nn.MSELoss() # this is the loss for predicting PS scores
-
+    criterion_mvc = GenerativeExpressionLoss()
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -441,7 +459,7 @@ def evaluate(model: nn.Module,
         ps_next_training_weight = config.ps_weight * config.next_weight
 
     with torch.no_grad():
-        for batch_data in loader:
+        for batch, batch_data in enumerate(loader):
             input_gene_ids = batch_data["gene_ids"].to(device)
             input_values = batch_data["values"].to(device)
             target_values = batch_data["target_values"].to(device)
@@ -452,7 +470,8 @@ def evaluate(model: nn.Module,
             perturbation_labels_next = batch_data["perturbation_labels_next"].to(device) #added
             ps_score = batch_data["ps"].to(device) #added
             ps_score_next = batch_data["ps_next"].to(device) #added
-            
+            sf = batch_data['sf'].to(device)
+            sf_next = batch_data['sf'].to(device)
             src_key_padding_mask = input_gene_ids.eq(vocab[config.pad_token])
             mvc_src = None if config.get('mvc_masked_train', True) else batch_data['full_gene_ids'].to(device)
             with torch.cuda.amp.autocast(enabled=config.amp):
@@ -463,6 +482,8 @@ def evaluate(model: nn.Module,
                     batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
                     pert_labels = perturbation_labels if config.perturbation_input else None,
                     pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
+                    sf = sf,
+                    sf_next = sf,
                     MVC=config.GEPC,
                     ECS=config.ecs_thres > 0,
                     CLS=config.get('cell_type_classifier', True),
@@ -487,14 +508,17 @@ def evaluate(model: nn.Module,
                 if config.GEPC:
                     mvc_target_values = target_values if config.get('mvc_masked_train', True) else batch_data["full_expr"].to(device)
                     mvc_target_values_next = target_values_next if config.get('mvc_masked_train', True) else batch_data["full_expr_next"].to(device)
-                    mvc_masked_positions = masked_positions if config.get('mvc_masked_train', True) else None
+                    #mvc_masked_positions = masked_positions if config.get('mvc_masked_train', True) else None
 
-                    loss_gepc = criterion(
-                        output_dict["mvc_output"], mvc_target_values, mvc_masked_positions
+                    loss_gepc = loss_gepc = criterion_mvc(
+                        output_dict["mvc_output"], 
+                        mvc_target_values, 
+                        scale_factor = sf,
                     )
-                    # added
-                    loss_gepc_next = criterion(
-                        output_dict["mvc_output_next"], mvc_target_values_next, mvc_masked_positions
+                    loss_gepc_next = criterion_mvc(
+                        output_dict["mvc_output_next"], 
+                        mvc_target_values_next, 
+                        scale_factor = sf_next,
                     )
                     
 
@@ -577,7 +601,9 @@ def eval_testdata(
     eval_key = "", # titles for evaluation
     make_plots = True,
     predict_expr = False,
-    mvc_full_expr = False
+    mvc_full_expr = False,
+    sizefactor = False,
+    sample = False
 ) -> Optional[Dict]: # Returns a dictionary containing the AnnData object
     """
     Evaluate the model on test data and return an AnnData object with embeddings.
@@ -606,6 +632,8 @@ def eval_testdata(
         if issparse(adata_t.layers[input_layer_key])
         else adata_t.layers[input_layer_key]
     )
+    from ..utils.pert_data_loader import _get_sf
+    sf = _get_sf(all_counts) if sizefactor else None
     if next_layer_key in adata_t.layers:
         all_counts_next = (
             adata_t.layers[next_layer_key].toarray()
@@ -747,10 +775,12 @@ def eval_testdata(
                 batch_labels=torch.from_numpy(batch_ids).long() if config.use_batch_label else None, # if config.DSBN else None,
                 pert_labels = torch.from_numpy(perturbation_indexes).long() if config.perturbation_input else None,
                 pert_labels_next = torch.from_numpy(perturbation_indexes_next).long() if next_cell_prediction else None,
+                sf = torch.Tensor(sf) if sizefactor else None,
                 time_step=0,
                 return_np=True,
                 predict_expr = predict_expr,
-                mvc_src = full_gene_ids
+                mvc_src = full_gene_ids,
+                sample = sample
             )
 
         cell_embeddings = cell_embeddings / np.linalg.norm(
@@ -768,10 +798,7 @@ def eval_testdata(
         if config.next_cell_pred_type ==  'lochness':
             adata_t.obsm["ps_pred_next"] = ps_preds_next 
         for k in expr_dict:
-
-            adata_t.obsm[k] = expr_dict[k][0]
-            if len(expr_dict[k]) > 1:
-                adata_t.obsm[k+'_zero'] =  expr_dict[k][1]
+            adata_t.obsm[k] = expr_dict[k]
         # require: genotype_to_index
 
         # Assuming ret_adata.obsm['X_pert_pred'] is a numpy array or can be converted to one
@@ -903,7 +930,15 @@ def wrapper_train(model, config, data_gen,
                 f"valid ps {val_ps:5.4f} | valid ps_next {val_ps_next:5.4f} |"
             )
             logger.info("-" * 89)
-        loss = val_loss + val_loss_next + val_mvc + val_mvc_next + val_cls + val_pert
+        loss = val_loss * 0.1
+        if config.next_cell_pred_type == 'identity':
+            loss += (val_cls*int(config.cell_type_classifier)
+                      + val_pert*int(config.genotype_classifier))
+        elif config.next_cell_pred_type == 'pert':
+            loss += val_mvc_next 
+        else:
+            loss += val_ps + val_ps_next 
+        best_model_epoch =0
         if loss < best_val_loss:
             best_val_loss = loss
             best_model = copy.deepcopy(model)

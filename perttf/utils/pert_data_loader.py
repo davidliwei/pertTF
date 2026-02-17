@@ -1,9 +1,7 @@
 from typing import List, Tuple, Dict, Union, Optional, Literal
-import time
-import copy
+import os
+import pickle
 from operator import itemgetter
-
-
 from sklearn.model_selection import train_test_split, KFold
 import torch
 import numpy as np
@@ -15,18 +13,25 @@ from sklearn.model_selection import train_test_split
 from anndata import AnnData
 import anndata
 from scipy.sparse import issparse
-#from torchtext.vocab import Vocab
-#from torchtext._torchtext import (
-#    Vocab as VocabPybind,
-#)
 from sklearn.model_selection._split import _BaseKFold
 from .custom_tokenizer import tokenize_and_pad_batch, random_mask_value, SimpleVocab
+from .ot import compute_ot_for_subset
 
+# Get size factor from lognormalized matrix
+def _get_sf(X):
+    if issparse(X):
+        X = X.toarray()
+    X[X == 0] = np.inf
+    X_mins = X.min(1)
+    X[X == np.inf ] = 0
+    sf = np.exp(X_mins).reshape(-1,1)-1
+    return sf
 
+# add batch info 
 def add_batch_info(adata):
     """helper function to add batch effect columns into adata"""
     if "batch" not in adata.obs.columns: 
-        batch_ids_0=random.choices( [0,1], k=adata.shape[0])
+        batch_ids_0=random.choices( [0], k=adata.shape[0])
         adata.obs["batch"]=batch_ids_0
     if "batch_id" not in adata.obs.columns: 
         adata.obs["str_batch"] = adata.obs["batch"]
@@ -44,11 +49,29 @@ class PertTFDataset(Dataset):
     """
     A PyTorch Dataset for AnnData objects that performs next-cell sampling on the fly.
     """
-    def __init__(self, adata: AnnData, indices: np.ndarray = None, 
-                 cell_type_to_index: dict = None, genotype_to_index: dict = None, expr_layer: str = 'X_binned',
-                 ps_columns: list = None, ps_columns_perturbed_genes: list = None, next_cell_pred: str = "identity", 
+    def __init__(self, 
+                 adata: AnnData, 
+                 indices: np.ndarray = None, 
+                 # OT Parameters
+                 use_ot: bool = False,
+                 ot_params: dict = dict(
+                    ot_pickle_path= None,
+                    ot_top_k= 10,
+                    ot_epsilon = "auto",
+                    ot_max_dist = "auto",
+                    ot_epsilon_scaler= 0.01
+                    ),
+                 # Standard Parameters
+                 cell_type_to_index: dict = None, 
+                 genotype_to_index: dict = None, 
+                 expr_layer: str = 'X_binned',
+                 ps_columns: list = None, 
+                 ps_columns_perturbed_genes: list = None, 
+                 next_cell_pred: str = "identity", 
                  additional_ps_dict: dict = None, 
-                 only_sample_wt_pert: bool = False):
+                 only_sample_wt_pert: bool = False,
+                 size_factor_col: str = None
+                 ):
         """
         The PertTFDataset serves to interface with pytorch Dataloaders 
         Its main function is to subset and extract single samples from a single Anndata object that is in-memory
@@ -69,6 +92,15 @@ class PertTFDataset(Dataset):
         self.adata = adata
         self._check_anndata_content()
         self.indices = indices if indices is not None else np.arange(len(self.adata.obs.index))
+        self.use_ot = use_ot
+        self.ot_params = ot_params
+        self.ot_pickle_path = self.ot_params.get('ot_pickle_path', './._temp_ot.pickle')
+        self.ot_top_k = self.ot_params.get('ot_top_k', 10)
+        self.ot_epsilon = self.ot_params.get('ot_epsilon', 0.5)
+        self.ot_max_dist = self.ot_params.get('ot_max_dist', np.inf)
+        self.ot_epsilon_scaler = self.ot_params.get('ot_epsilon_scaler', 0.01)
+        self.ot_cache = {} # Holds the map for the CURRENT indices
+        
         self.expr_layer = expr_layer
         self.next_cell_pred = next_cell_pred
         
@@ -80,8 +112,11 @@ class PertTFDataset(Dataset):
         # For efficient next-cell sampling, pre-compute a dictionary of valid choices
         # IMPORTANT: This dictionary only contains cells from the current data split (train/valid)
         # to prevent data leakage.
+        self.sf = _get_sf(self.adata.layers[self.expr_layer]) if size_factor_col is None else adata.obs[size_factor_col].values
         self.next_cell_dict = self._create_next_cell_pool()
         self.only_sample_wt_pert = only_sample_wt_pert
+        if self.use_ot and self.next_cell_pred == "pert":
+            self._recalculate_ot()
         if self.next_cell_pred == "lochness":
             if ps_columns is None:
                 raise ValueError("PS columns must be provided for lochness prediction")
@@ -118,6 +153,10 @@ class PertTFDataset(Dataset):
         if next_cell_pool:
             self.next_cell_dict = self._create_next_cell_pool()
 
+        if self.use_ot and self.next_cell_pred == "pert":
+            print(f"--- Indices Updated (N={len(indices)}). Recalculating OT Maps... ---")
+            self._recalculate_ot()
+
     def get_adata_subset(self, next_cell_pred = 'identity'):
         assert next_cell_pred in ['pert', 'identity', "lochness"], 'next_cell_pred can only be identity or pert or lochness'
 
@@ -144,6 +183,41 @@ class PertTFDataset(Dataset):
             adata_small.obs['next_cell_id'] = next_cell_id_list
             adata_small.layers['next_expr'] = self.adata.layers[self.expr_layer][next_cell_global_idx_list]
         return adata_small
+    
+
+    def _recalculate_ot(self):
+        # 1. Create View
+        adata_subset = self.adata[self.indices]
+
+        # 2. Compute Maps (Pass the calculated threshold)
+        new_maps = compute_ot_for_subset(
+            adata_subset, 
+            top_k=self.ot_top_k, 
+            epsilon=self.ot_epsilon,
+            max_dist_sq=self.ot_max_dist, 
+            red_key='X_pca',
+            epsilon_scaler=self.ot_epsilon_scaler
+        )
+        
+        # 3. Update Cache & Pickle (Same as before)
+        self.ot_cache = new_maps
+        
+        if self.ot_pickle_path:
+            full_cache = {}
+            if os.path.exists(self.ot_pickle_path):
+                try:
+                    with open(self.ot_pickle_path, 'rb') as f:
+                        full_cache = pickle.load(f)
+                except Exception:
+                    pass # handle read error
+            
+            full_cache.update(new_maps)
+            try:
+                with open(self.ot_pickle_path, 'wb') as f:
+                    pickle.dump(full_cache, f)
+            except Exception as e:
+                print(f"Warning: Could not save OT pickle: {e}")
+
 
     def __len__(self):
         return len(self.indices)
@@ -189,11 +263,26 @@ class PertTFDataset(Dataset):
             # Randomly select a different genotype
             next_pert_value = random.choice(list(valid_genotypes.keys()))
         else:
-            # For non-WT, the "next" state is the same perturbation
-            next_pert_value = current_genotype
+            # Perturbed cells map to themselves (logic handled later)
+            next_pert_value = current_cell_genotype
 
-        if next_pert_value == current_genotype and self.only_sample_wt_pert:
-            return current_cell_id, next_pert_value
+        # 2. OT Sampling (WT -> Perturbation only)
+        if self.use_ot and current_cell_genotype == 'WT' and next_pert_value != 'WT':
+            # Check if we have a valid OT map for this specific cell and target
+            if current_cell_idx in self.ot_cache:
+                if next_pert_value in self.ot_cache[current_cell_idx]:
+                    candidates, weights = self.ot_cache[current_cell_idx][next_pert_value]
+                    # Sample weighted choice
+                    next_cell_id = random.choices(candidates, weights=weights, k=1)[0]
+                    return next_cell_id, next_pert_value
+                else:
+                    return current_cell_idx, current_cell_genotype
+            else:
+                return current_cell_idx, current_cell_genotype
+        # 3. Fallback / Standard Logic
+        if next_pert_value == current_cell_genotype and self.only_sample_wt_pert:
+            # Perturbed cells (or WT mapped to WT) return themselves
+            return current_cell_idx, next_pert_value
         else:
             # Sample a random cell with the target cell type and genotype
             possible_next_cells = valid_genotypes.get(next_pert_value, [current_cell_id])
@@ -233,7 +322,8 @@ class PertTFDataset(Dataset):
 
         if issparse(next_expr):
             next_expr = next_expr.toarray().flatten()
-
+        current_sf = self.sf[current_cell_global_idx]
+        next_sf = self.sf[next_cell_global_idx]
         # 5. Get labels and PS scores
         cell_label = self.cell_type_to_index[current_cell_celltype]
         pert_label = self.genotype_to_index[current_cell_genotype]
@@ -274,6 +364,8 @@ class PertTFDataset(Dataset):
             "perturbation_labels_next": pert_label_next,
             "ps": ps_scores,
             "ps_next": ps_scores_next,
+            "sf": current_sf,
+            "sf_next": next_sf,
             "index": current_cell_global_idx,
             "next_index": next_cell_global_idx,
             'name': current_cell_idx,
@@ -348,7 +440,12 @@ class PertBatchCollator:
         )
 
         # 4. Collate all other labels into tensors
-        full_gene_id = torch.from_numpy(self.gene_ids).long()
+        cls_vec = np.array([self.cls_value for i in range(len(batch))]).reshape(-1,1)
+        full_gene_id = np.insert(self.gene_ids, 0, self.vocab[self.cls_token]) if self.append_cls else self.gene_ids
+        full_gene_id = torch.from_numpy(full_gene_id).long()
+        expr_mat = expr_mat if not self.append_cls else np.hstack([cls_vec, expr_mat])
+        expr_mat_next = expr_mat_next if not self.append_cls else np.hstack([cls_vec, expr_mat_next])
+
         collated_batch = {
             "gene_ids": tokenized["genes"],
             "next_gene_ids": tokenized_next["genes"],
@@ -472,10 +569,20 @@ class PertTFUniDataManager:
     def _create_dataset_from_indices(self, indices):
         """A helper function to create PertTFDataset from underlying adata."""
         perttf_dataset = PertTFDataset(
-            self.adata, indices=indices, cell_type_to_index=self.cell_type_to_index, genotype_to_index=self.genotype_to_index,
-            ps_columns=self.ps_columns, ps_columns_perturbed_genes = self.ps_columns_perturbed_genes, 
-            next_cell_pred=self.next_cell_pred_type ,    additional_ps_dict = self.additional_ps_dict,  
-            expr_layer=self.expr_layer, only_sample_wt_pert=self.only_sample_wt_pert
+            self.adata, 
+            indices=indices, 
+            # ot parameters
+            use_ot=self.config.use_ot, 
+            ot_params= self.config.get('ot_params', {}),
+            # other parameters
+            cell_type_to_index=self.cell_type_to_index, 
+            genotype_to_index=self.genotype_to_index,
+            ps_columns=self.ps_columns, 
+            ps_columns_perturbed_genes = self.ps_columns_perturbed_genes, 
+            next_cell_pred=self.next_cell_pred_type ,  
+            additional_ps_dict = self.additional_ps_dict,  
+            expr_layer=self.expr_layer, 
+            only_sample_wt_pert=self.only_sample_wt_pert
         )
         return perttf_dataset
 
