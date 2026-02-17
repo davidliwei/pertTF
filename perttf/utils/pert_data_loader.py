@@ -102,7 +102,7 @@ class PertTFDataset(Dataset):
         # For efficient next-cell sampling, pre-compute a dictionary of valid choices
         # IMPORTANT: This dictionary only contains cells from the current data split (train/valid)
         # to prevent data leakage.
-        self.sf = _get_sf(self.adata.layers[self.expr_layer]) if size_factor_col is None else adata.obs[size_factor_col].values
+        self.sf = _get_sf(self.adata.layers[self.expr_layer]) if size_factor_col is None else adata.obs[size_factor_col].values.reshape(-1,1)
         self.next_cell_dict = self._create_next_cell_pool()
         self.only_sample_wt_pert = only_sample_wt_pert
         if self.use_ot and self.next_cell_pred == "pert":
