@@ -1,5 +1,6 @@
 import numpy as np
 from typing import Literal
+from scipy import sparse
 
 # Courtesy of Gemini AI, unbin predicted expr values if they were binned prior to scGPT
 def unbin_matrix(
@@ -73,6 +74,37 @@ def unbin_matrix(
             unbinned_matrix[i, binned_row == bin_idx] = rep_value
 
     return unbinned_matrix
+
+
+def _get_sf(X):
+    if sparse.issparse(X):
+        # Ensure CSR format for fast row slicing
+        # (If already CSR, this takes no memory/time)
+        X = X.tocsr()
+        # Remove explicit zeros if they exist in the sparse structure
+        # (ensures X.data contains ONLY non-zero values)
+        X.eliminate_zeros()
+        if X.nnz == 0:
+            return np.zeros((X.shape[0], 1))
+        # We need the min of X.data within the ranges defined by X.indptr
+        # np.minimum.reduceat performs the reduction on slices without loops
+        mins = np.minimum.reduceat(X.data, X.indptr[:-1])
+        # EDGE CASE: reduceat produces "garbage" (next row's value) for empty rows.
+        # We must identify empty rows and set them to 0 (or a neutral value).
+        nnz_per_row = np.diff(X.indptr)
+        mins[nnz_per_row == 0] = 0
+    else:
+        # Use a masked array to ignore zeros without creating a copy with np.inf
+        # This is more memory efficient than X[X==0] = np.inf
+        mX = np.ma.masked_equal(X, 0)
+        # Calculate min of valid values only. 
+        # fill_value=0 handles rows that are all zeros.
+        mins = mX.min(axis=1).filled(0)
+    # 3. Calculate scaling factor
+    # Formula: e^(min_nonzero) - 1
+    sf = np.exp(mins).reshape(-1, 1) - 1
+    return sf
+
 
 def init_plot_worker():
     """Initialize each worker process"""
