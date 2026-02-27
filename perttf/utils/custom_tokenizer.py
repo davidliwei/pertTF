@@ -157,7 +157,7 @@ def weighted_sample(val,
         else:
             hvgs = rng.choice(len(hvg_nonhvg[0]), size = hvg_size, replace = False)
             samp_hvg_inds = hvg_nonhvg[0][hvgs]
-        return np.concatenate([samp_hvg_inds, samp_non_hvg_inds])
+        return np.array(np.concatenate([samp_hvg_inds, samp_non_hvg_inds]), dtype = np.int32)
 
     # for each cell, sample the expressed and zero genes seperately
     elif mode == 'expressed':

@@ -1003,7 +1003,7 @@ class MVCDecoder(nn.Module):
             pred_concentration = self.expr_act(raw_pred)
 
         # 3. Finalize Mu
-        if self.distribution == 'zig':
+        if self.distribution == 'zig' or self.distribution is None:
             mu = pred_concentration
         else:
             # maybe use constant sizefactor (sf_scaling = False) and let the model learn what it can

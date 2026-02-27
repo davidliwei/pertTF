@@ -198,15 +198,14 @@ class DistributionGenerator:
             dictionary: {'pred', 'param2', 'zero_probs'}
         """
         mu = torch.as_tensor(outputs['pred']).to(device)
-        param2 = torch.as_tensor(outputs['param2']).to(device)
         pi = 1.0 - torch.as_tensor(outputs['zero_probs']).to(device) # Convert NonZero Prob -> Dropout Prob
         if self.distribution is None:
             return {
                 'pred': mu.cpu().numpy() if to_numpy else mu,
-                'param2': param2.cpu().numpy() if to_numpy else param2,
-                'zero_probs': pi.cpu().numpy() if to_numpy else pi
+                'param2': None,
+                'zero_probs': 1 - pi.cpu().numpy() if to_numpy else 1 - pi
             }
-        
+        param2 = torch.as_tensor(outputs['param2']).to(device)
         # Expand for N samples
         if n_samples > 1:
             mu = mu.unsqueeze(-1).expand(-1, -1, n_samples)
