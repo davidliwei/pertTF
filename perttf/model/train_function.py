@@ -204,7 +204,7 @@ def train(model: nn.Module,
                 
                 if config.explicit_zero_prob and config.distribution is None:
                     loss_gepc_zero_log_prob = criterion_neg_log_bernoulli(
-                        output_dict["mvc_zero_probs"], mvc_target_values, mvc_masked_positions
+                        output_dict["mvc_output"]["zero_probs"], mvc_target_values, mvc_masked_positions
                     )
                     loss = loss + config.this_weight *loss_gepc_zero_log_prob
                     metrics_to_log.update(
@@ -212,7 +212,7 @@ def train(model: nn.Module,
                     )
                     # added
                     loss_gepc_zero_log_prob_next = criterion_neg_log_bernoulli(
-                        output_dict["mvc_zero_probs_next"], mvc_target_values_next, mvc_masked_positions
+                        output_dict["mvc_output_next"]["zero_probs"], mvc_target_values_next, mvc_masked_positions
                     )
                     loss = loss + config.next_weight * loss_gepc_zero_log_prob_next
                     metrics_to_log.update(
