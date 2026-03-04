@@ -50,4 +50,6 @@ sys.path.insert(0, '/content/pertTF/')
 ```
 -----------------------
 
-## [Inference Tutorial](demos/tutorials/INFERENCE.md)
+## Tutorials
+
+- [Inference Tutorial](demos/tutorials/INFERENCE.md)
