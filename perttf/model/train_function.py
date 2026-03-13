@@ -37,6 +37,7 @@ from ..custom_loss import (
 from ..utils.plot import process_and_log_umaps
 from ..utils.misc import init_plot_worker
 
+
 def train(model: nn.Module,
           loader: DataLoader,
           config,
@@ -539,8 +540,9 @@ def evaluate(model: nn.Module,
 
             total_loss += loss.item() * len(input_gene_ids)
             total_loss_next += loss_mse_next.item() * len(input_gene_ids)
-            total_mvc += loss_gepc.item() * len(input_gene_ids)
-            total_mvc_next += loss_gepc_next.item() * len(input_gene_ids)
+            if config.GEPC:
+                total_mvc += loss_gepc.item() * len(input_gene_ids)
+                total_mvc_next += loss_gepc_next.item() * len(input_gene_ids)
             total_error += masked_relative_error(output_values, target_values, masked_positions).item() * len(input_gene_ids)
             total_error_next += masked_relative_error(output_values, target_values_next, masked_positions).item() * len(input_gene_ids)
             if config.dab_weight > 0:
@@ -1027,7 +1029,3 @@ def wrapper_train(model, config, data_gen,
     torch.save(best_model.state_dict(), save_dir / "best_model.pt")
 
     return best_model
-
-
-
-

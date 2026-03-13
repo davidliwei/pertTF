@@ -1,14 +1,15 @@
 import os
 import json
 import torch
+from pathlib import Path
 from typing import Optional, Any, Union, Dict
 from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
+from omegaconf import OmegaConf
 
 # Ensure these are importable
 from .pertTF import PerturbationTFModel
 from ..utils.custom_tokenizer import SimpleVocab 
-from .train_function import wrapper_train, eval_testdata
-from omegaconf import OmegaConf
+
 
 def legacy_vocab_loading(vocab_path):
     if vocab_path:
@@ -92,6 +93,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         ps_decoder2_nlayer: int = 3,
         pert_pad_id: Optional[int] = None,
         pert_dim: Optional[int] = None,
+        distribution: Optional[str] = None,
         **kwargs
     ):
         # 1. Handle Training Config & Extras
@@ -175,6 +177,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             mvc_decoder_style=mvc_decoder_style,
             ecs_threshold=ecs_threshold,
             explicit_zero_prob=explicit_zero_prob,
+            distribution=distribution,
             use_fast_transformer=self._hub_mixin_config['use_fast_transformer'],
             fast_transformer_backend=fast_transformer_backend,
             pre_norm=pre_norm,
@@ -516,12 +519,246 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         pass
 
     def _init_default_train_config_(self):
-        # initiate default training configuration
-        pass
+        fallback_defaults = {
+            "seed": 42,
+            "batch_size": 8,
+            "special_tokens": ["<pad>", "<cls>", "<eos>", "<unk>"],
+            "n_bins": getattr(self, "n_input_bins", 51) or 51,
+            "n_hvg": 3000,
+            "sampling_mode": "simple",
+            "append_cls": True,
+            "include_zero_gene": True,
+            "mask_ratio": 0.15,
+            "mask_value": -1,
+            "pad_value": getattr(self, "pad_value", -2),
+            "pad_token": "<pad>",
+            "lr": 1e-3,
+            "schedule_ratio": 0.99,
+            "schedule_interval": 1,
+            "lr_ADV": 1e-3,
+            "amp": False,
+            "amp_dtype": "fp16",
+            "log_interval": 10,
+            "layer_size": getattr(self, "d_model", 32),
+            "do_train": True,
+            "GEPC": False,
+            "CCE": False,
+            "ADV": False,
+            "DSBN": False,
+            "use_batch_label": False,
+            "perturbation_input": False,
+            "cell_type_classifier": True,
+            "genotype_classifier": True,
+            "cell_type_classifier_weight": 1.0,
+            "perturbation_classifier_weight": 1.0,
+            "this_weight": 1.0,
+            "next_weight": 0.0,
+            "next_cell_pred_type": "identity",
+            "ecs_thres": 0.0,
+            "ecs_weight": 1.0,
+            "dab_weight": 0.0,
+            "ps_weight": 0.0,
+            "explicit_zero_prob": getattr(self, "explicit_zero_prob", False),
+            "distribution": None,
+            "use_ot": False,
+            "dataset_name": "adata",
+        }
 
-    def run_train(self, adata):
-        pass
+        base_config = self.training_config if self.training_config is not None else OmegaConf.create({})
+        merged = OmegaConf.merge(OmegaConf.create(fallback_defaults), base_config)
+        return merged
 
+    @staticmethod
+    def build_lora_config(r=8, lora_alpha=32, lora_dropout=0.1, target_modules=None):
+        try:
+            from peft import LoraConfig
+        except ImportError as e:
+            raise ImportError(
+                "The 'peft' package is required to use LoRA-related functionality. "
+                "Install it with `pip install peft` and try again."
+            ) from e
+
+        if target_modules is None:
+            target_modules = [
+                "qkv_proj",
+                "out_proj",
+                "linear1",
+                "linear2",
+                "decoder.fc.0",
+                "decoder.fc.2",
+            ]
+        return LoraConfig(
+            inference_mode=False,
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            target_modules=target_modules,
+        )
+        
+    def run_lora_train(
+        self,
+        adata,
+        epochs: int = 1,
+        batch_size: Optional[int] = None,
+        lr: Optional[float] = None,
+        train_val_split: float = 0.2,
+        input_layer_key: str = "X_binned",
+        next_layer_key: str = "X_binned_next",
+        lora_config=None,
+        device: Optional[torch.device] = None,
+        save_dir: Optional[str] = None,
+        amp: Optional[bool] = None,
+        amp_dtype: Optional[str] = None,
+        log_interval: Optional[int] = None,
+        seed: Optional[int] = None,
+    ):
+        import random
+        import numpy as np
+        from peft import get_peft_model
+        from . import train_function
+        from .train_data_gen import produce_training_datasets
+        from ..utils.set_optimizer import create_optimizer_dict
+
+        if "genotype" not in adata.obs.columns and "condition" in adata.obs.columns:
+            adata.obs["genotype"] = adata.obs["condition"].copy()
+        if input_layer_key not in adata.layers:
+            adata.layers[input_layer_key] = adata.X.copy()
+        if next_layer_key not in adata.layers:
+            adata.layers[next_layer_key] = adata.layers[input_layer_key].copy()
+
+        config = self._init_default_train_config_()
+        # Avoid duplicate kwarg collision in PertBatchCollator(vocab=..., **config).
+        if "vocab" in config:
+            del config["vocab"]
+        # Keep training flags aligned with the loaded model, not stale checkpoint training_config.
+        config.GEPC = hasattr(self, "mvc_decoder")
+        config.explicit_zero_prob = bool(getattr(self, "explicit_zero_prob", False))
+        config.distribution = getattr(self, "distribution", None)
+        if batch_size is not None:
+            config.batch_size = batch_size
+        if lr is not None:
+            config.lr = lr
+        if amp is not None:
+            config.amp = amp
+        if amp_dtype is not None:
+            config.amp_dtype = amp_dtype
+        if log_interval is not None:
+            config.log_interval = log_interval
+        config.dataset_name = Path(getattr(adata, "filename", "") or "adata").stem
+
+        # Reproducibility: seed all RNGs before data loading and training.
+        effective_seed = seed if seed is not None else config.get("seed", 42)
+        random.seed(effective_seed)
+        np.random.seed(effective_seed)
+        torch.manual_seed(effective_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(effective_seed)
+
+        ps_columns = getattr(self, "ps_names", None)
+        if ps_columns:
+            valid_ps_columns = [col for col in ps_columns if col in adata.obs.columns]
+            if len(valid_ps_columns) != len(ps_columns):
+                print(
+                    f"[run_lora_train] filtered ps columns to existing obs columns: "
+                    f"{valid_ps_columns if valid_ps_columns else 'None'}"
+                )
+            ps_columns = valid_ps_columns if valid_ps_columns else None
+
+        cell_type_to_index = getattr(self, "cell_type_to_index", None)
+        if cell_type_to_index is not None and "celltype" in adata.obs.columns:
+            missing_celltypes = [x for x in adata.obs["celltype"].unique() if x not in cell_type_to_index]
+            if missing_celltypes:
+                print(
+                    "[run_lora_train] model cell_type_to_index missing labels from current adata; "
+                    "rebuilding celltype mapping from adata."
+                )
+                cell_type_to_index = None
+
+        genotype_to_index = getattr(self, "genotype_to_index", None)
+        if genotype_to_index is not None and "genotype" in adata.obs.columns:
+            missing_genotypes = [x for x in adata.obs["genotype"].unique() if x not in genotype_to_index]
+            if missing_genotypes:
+                print(
+                    "[run_lora_train] model genotype_to_index missing labels from current adata; "
+                    "rebuilding genotype mapping from adata."
+                )
+                genotype_to_index = None
+
+        data_gen = produce_training_datasets(
+            adata_input=adata,
+            config=config,
+            input_layer_key=input_layer_key,
+            next_layer_key=next_layer_key,
+            next_cell_pred=config.next_cell_pred_type,
+            cell_type_to_index=cell_type_to_index,
+            genotype_to_index=genotype_to_index,
+            vocab=self.vocab,
+            ps_columns=ps_columns,
+            train_val_split=train_val_split,
+        )
+
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.to(device)
+        peft_model = get_peft_model(self, lora_config or self.build_lora_config()).to(device)
+
+        # train_function logs through wandb by default; keep this entry-point side-effect free.
+        if hasattr(train_function, "wandb") and hasattr(train_function.wandb, "log"):
+            train_function.wandb.log = lambda *args, **kwargs: None
+
+        optimizer_dict = create_optimizer_dict(peft_model, device, config, data_gen["num_batch_types"])
+
+        best_val_loss = float("inf")
+        best_epoch = 0
+        best_state_dict = None
+
+        for epoch in range(1, epochs + 1):
+            train_function.train(
+                model=peft_model,
+                loader=data_gen["train_loader"],
+                config=config,
+                vocab=data_gen["vocab"],
+                optim_dict=optimizer_dict,
+                epoch=epoch,
+                logger=None,
+                device=device,
+            )
+
+            # Validation
+            val_results = train_function.evaluate(
+                model=peft_model,
+                loader=data_gen["valid_loader"],
+                config=config,
+                vocab=data_gen["vocab"],
+                epoch=epoch,
+                device=device,
+            )
+            val_mse = val_results[0]
+            print(f"Epoch {epoch}/{epochs} | val_mse: {val_mse:.4f}")
+
+            if val_mse < best_val_loss:
+                best_val_loss = val_mse
+                best_epoch = epoch
+                best_state_dict = {k: v.cpu().clone() for k, v in peft_model.state_dict().items()}
+
+        # Restore best checkpoint
+        if best_state_dict is not None:
+            peft_model.load_state_dict(best_state_dict)
+            peft_model.to(device)
+            print(f"Restored best model from epoch {best_epoch} (val_mse={best_val_loss:.4f})")
+
+        if save_dir:
+            adapter_dir = Path(save_dir)
+            adapter_dir.mkdir(parents=True, exist_ok=True)
+            peft_model.save_pretrained(str(adapter_dir))
+            print(f"Saved PEFT adapter to: {adapter_dir.resolve()}")
+
+        return peft_model
+
+    def run_train(self, adata, **kwargs):
+        return self.run_lora_train(adata=adata, **kwargs)
+        
     def eval_identity(self, adata):
         pass  
 
@@ -533,4 +770,3 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
 
     def run_test(self, adata):
         pass
-
