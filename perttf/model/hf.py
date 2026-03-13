@@ -92,6 +92,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         pred_lochness_next: bool = False,
         ps_decoder2_nlayer: int = 3,
         pert_pad_id: Optional[int] = None,
+        pert_dim: Optional[int] = None,
         distribution: Optional[str] = None,
         **kwargs
     ):
@@ -175,6 +176,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             cell_emb_style=cell_emb_style,
             mvc_decoder_style=mvc_decoder_style,
             ecs_threshold=ecs_threshold,
+            explicit_zero_prob=explicit_zero_prob,
             distribution=distribution,
             use_fast_transformer=self._hub_mixin_config['use_fast_transformer'],
             fast_transformer_backend=fast_transformer_backend,
