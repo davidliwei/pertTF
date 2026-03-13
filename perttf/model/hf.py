@@ -92,7 +92,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         pred_lochness_next: bool = False,
         ps_decoder2_nlayer: int = 3,
         pert_pad_id: Optional[int] = None,
-        pert_dim: Optional[int] = None,
+        distribution: Optional[str] = None,
         **kwargs
     ):
         # 1. Handle Training Config & Extras
@@ -175,7 +175,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             cell_emb_style=cell_emb_style,
             mvc_decoder_style=mvc_decoder_style,
             ecs_threshold=ecs_threshold,
-            explicit_zero_prob=explicit_zero_prob,
+            distribution=distribution,
             use_fast_transformer=self._hub_mixin_config['use_fast_transformer'],
             fast_transformer_backend=fast_transformer_backend,
             pre_norm=pre_norm,
@@ -568,7 +568,13 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
 
     @staticmethod
     def build_lora_config(r=8, lora_alpha=32, lora_dropout=0.1, target_modules=None):
-        from peft import LoraConfig
+        try:
+            from peft import LoraConfig
+        except ImportError as e:
+            raise ImportError(
+                "The 'peft' package is required to use LoRA-related functionality. "
+                "Install it with `pip install peft` and try again."
+            ) from e
 
         if target_modules is None:
             target_modules = [
