@@ -139,7 +139,7 @@ def generate_pert_embeddings(adata_target, adata_wt, candidate_genes,
                                     config = config,
                                     make_plots=False)
         #
-        a_eva=eval_results_0['adata']
+        a_eva=eval_results_0 #['adata']
         cell_emb_data=a_eva.obsm['X_scGPT_next'] #[:10000,:]
         perturb_info=a_eva.obs[['genotype','genotype_next']]
 
