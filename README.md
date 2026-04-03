@@ -52,4 +52,10 @@ sys.path.insert(0, '/content/pertTF/')
 
 ## Tutorials
 
-- [Inference Tutorial](demos/tutorials/INFERENCE.md)
+All these tutorials can run on Google Colab. 
+
+- [Inference Tutorial](demos/tutorials/INFERENCE.md): use the HuggingFace pertTF model to make inferences
+- [LoRA fine tuning tutorial](demos/tutorials/LORA_FINETUNING.md) and [python notebook](demos/tutorials/lora_finetuning_tutorial.ipynb): use LoRA to fine tune the pertTF model
+- [Virtual CRISPR screens](demos/tutorials/virtual_pooled_screen.ipynb): a python notebook to perform virtual pooled CRISPR screens from pertTF model
+
+
