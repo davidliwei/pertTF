@@ -81,6 +81,7 @@ def generate_lochness_ranking( adata_wt, candidate_genes,
     """
     # expand
     adata_bwmerge=sc.concat([adata_wt]*n_expands_per_epoch,axis=0)
+    adata_bwmerge.var=adata_wt.var
     #cell_emb_data_all = None
     perturb_info_all = None
 
