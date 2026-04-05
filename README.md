@@ -34,10 +34,20 @@ python setup.py install
 ## pertTF installation
 You can install and use pertTF in two ways.
 
-The first way, pertTF is avaiable on PyPI. Use the following command to install pertTF:
+The first way, pertTF is avaiable on PyPI and testPyPI. Use one of the following command to install pertTF:
+
+```bash
+pip install pertTF
+```
+
+or 
+
 ```bash
 pip install -i https://test.pypi.org/simple/ pertTF
 ```
+
+
+
 The second way is suitable for you to run the most recent pertTF source code. First, fork our pertTF GitHub repository:
 
 ```bash
@@ -58,5 +68,11 @@ All these tutorials can run on Google Colab.
 - [LoRA fine tuning tutorial](demos/tutorials/LORA_FINETUNING.md) and [python notebook](demos/tutorials/lora_finetuning_tutorial.ipynb): use LoRA to fine tune the pertTF model
 - [Virtual CRISPR screens](demos/tutorials/virtual_pooled_screen.ipynb): perform virtual pooled CRISPR screens between two cell populations from pertTF model
 - [Train pertTF to predict composition change](demos/tutorials/train_pertTF_with__lochNESS.ipynb): calculate lochNESS scores, train pertTF to predict cell compositions from lochNESS scores. In addition, this notebook demonstrates the combination of external gene information (e.g., essential genes) to train the model.
+
+## References
+
+- our [bioRxiv preprint](https://www.biorxiv.org/content/10.64898/2026.03.12.711379v1).
+- [HuggingFace website](https://huggingface.co/weililab) hosting models and datasets.
+- [Li lab website](https://weililab.org)
 
 
