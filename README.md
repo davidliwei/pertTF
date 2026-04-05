@@ -56,6 +56,7 @@ All these tutorials can run on Google Colab.
 
 - [Inference Tutorial](demos/tutorials/INFERENCE.md): use the HuggingFace pertTF model to make inferences
 - [LoRA fine tuning tutorial](demos/tutorials/LORA_FINETUNING.md) and [python notebook](demos/tutorials/lora_finetuning_tutorial.ipynb): use LoRA to fine tune the pertTF model
-- [Virtual CRISPR screens](demos/tutorials/virtual_pooled_screen.ipynb): a python notebook to perform virtual pooled CRISPR screens from pertTF model
+- [Virtual CRISPR screens](demos/tutorials/virtual_pooled_screen.ipynb): perform virtual pooled CRISPR screens between two cell populations from pertTF model
+- [Train pertTF to predict composition change](demos/tutorials/train_pertTF_with__lochNESS.ipynb): calculate lochNESS scores, train pertTF to predict cell compositions from lochNESS scores. In addition, this notebook demonstrates the combination of external gene information (e.g., essential genes) to train the model.
 
 
