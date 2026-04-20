@@ -68,6 +68,7 @@ All these tutorials can run on Google Colab.
 - [LoRA fine tuning tutorial](demos/tutorials/LORA_FINETUNING.md) and [python notebook](demos/tutorials/lora_finetuning_tutorial.ipynb): use LoRA to fine tune the pertTF model
 - [Virtual CRISPR screens](demos/tutorials/virtual_pooled_screen.ipynb): perform virtual pooled CRISPR screens between two cell populations from pertTF model
 - [Train pertTF to predict composition change](demos/tutorials/train_pertTF_with__lochNESS.ipynb): calculate lochNESS scores, train pertTF to predict cell compositions from lochNESS scores. In addition, this notebook demonstrates the combination of external gene information (e.g., essential genes) to train the model.
+- [Inference of composition changes using CRISPRi-based Perturb-seq](demos/tutorials/Inference_using_Perturbseq.ipynb): use pertTF (lochNESS-aware during training) to infer composition changes using the predicted lochNESS scores. Include the inference of essential genes and unseen genes (like CTNNB1).
 
 ## References
 
