@@ -4,15 +4,23 @@ import wandb
 
 from typing import Literal
 
-from scgpt.utils import set_seed
+import random
+import numpy as np
+import torch
 import copy
 
-# Check the Python interpreter being used
-#print(sys.executable)
+def set_seed(seed):
+    """set random seed."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def generate_config(parameter_dict,
         project_name = "scGPT",
-        wandb_mode : Literal["disabled","online","offline"] = "disabled"):
+        wandb_mode : Literal["disabled","online","offline"] = "disabled",
+        run_name: str = None):
     # If it's not the desired interpreter, set the WANDB__EXECUTABLE environment variable
     # For example, if you want to use Python 3.8:
     os.environ["WANDB__EXECUTABLE"] = "/usr/local/bin/python"  # Replace with the actual path
@@ -24,11 +32,19 @@ def generate_config(parameter_dict,
                                         parameter_dict.get('cls_token', '<cls>'), 
                                         "<eoc>"]
 
-
+    parameter_dict['sampling_mode']  = parameter_dict.get('sampling_mode', 'simple')
+    parameter_dict['fix_nonzero_prop'] = parameter_dict.get('fix_nonzero_prop', False)
+    parameter_dict['nonzero_prop'] = parameter_dict.get('nonzero_prop', 0.9)
+    if parameter_dict['next_cell_pred_type'] == 'identity':
+      parameter_dict['next_weight'] = 0
     #mask_ratio = config.mask_ratio
 
+        #mask_ratio = config.mask_ratio
     # n_input_bins = config.n_bins
-    parameter_dict['max_seq_len'] = parameter_dict['n_hvg'] + 1
+    if parameter_dict['sampling_mode'] == 'hvg':
+      parameter_dict['max_seq_len'] = parameter_dict['n_hvg'] + parameter_dict.get('non_hvg_size', 1000)+parameter_dict.get('append_cls', True)
+    else:
+      parameter_dict['max_seq_len'] = parameter_dict['n_hvg'] + parameter_dict.get('append_cls', True)
 
     use_wandb=True
     if use_wandb:
@@ -39,6 +55,7 @@ def generate_config(parameter_dict,
           settings=wandb.Settings(start_method="fork"),
           #mode="online",
           mode=wandb_mode, #
+          name = run_name
       )
       config = wandb.config
     else:

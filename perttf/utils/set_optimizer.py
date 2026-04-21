@@ -1,5 +1,5 @@
 import torch
-from scgpt.model import TransformerModel, AdversarialDiscriminator
+from ..model.modules import AdversarialDiscriminator
 
 def create_optimizer_dict(model, device, config, num_batch_types = -1):
     scaler = torch.cuda.amp.GradScaler(enabled=config.amp)

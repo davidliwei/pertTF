@@ -6,7 +6,7 @@ from typing import Literal
 import scanpy as sc
 import numpy as np
 import pandas as pd
-from perttf.model.train_function import eval_testdata
+from .train_function import eval_testdata
 
 def load_pert_embedding_from_gears(gears_path, adata, 
                                   intersect_type : Literal["common","gears"] = "common"):
@@ -139,7 +139,7 @@ def generate_pert_embeddings(adata_target, adata_wt, candidate_genes,
                                     config = config,
                                     make_plots=False)
         #
-        a_eva=eval_results_0['adata']
+        a_eva=eval_results_0 #['adata']
         cell_emb_data=a_eva.obsm['X_scGPT_next'] #[:10000,:]
         perturb_info=a_eva.obs[['genotype','genotype_next']]
 

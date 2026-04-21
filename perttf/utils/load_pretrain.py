@@ -2,9 +2,9 @@ import torch
 from collections import OrderedDict
 from perttf.utils.custom_tokenizer import SimpleVocab
 from perttf.model.pertTF import PerturbationTFModel
-import scgpt as scg
 import json
 import os
+from .logger import create_logger
 # Try to take pretrained scGPT model files as input and output a vocab, config and pertTF model that has the weights loaded
 
 def load_scGPT(folder):
@@ -30,7 +30,7 @@ def pertTF_from_scGPT_pretrain(config,
                                num_batch_types = 1,
                                model = None, 
                                device = None, 
-                               logger = scg.logger):
+                               logger = create_logger()):
     """
     Transfers weights from scGPT pretrained model to pertTF model, handling both key name
     and shape mismatches automatically.
