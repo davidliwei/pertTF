@@ -66,9 +66,10 @@ All these tutorials can run on Google Colab.
 
 - [Inference Tutorial](demos/tutorials/INFERENCE.md): use the HuggingFace pertTF model to make inferences
 - [LoRA fine tuning tutorial](demos/tutorials/LORA_FINETUNING.md) and [python notebook](demos/tutorials/lora_finetuning_tutorial.ipynb): use LoRA to fine tune the pertTF model
-- [Virtual CRISPR screens](demos/tutorials/virtual_pooled_screen.ipynb): perform virtual pooled CRISPR screens between two cell populations from pertTF model
-- [Train pertTF to predict composition change](demos/tutorials/train_pertTF_with__lochNESS.ipynb): calculate lochNESS scores, train pertTF to predict cell compositions from lochNESS scores. In addition, this notebook demonstrates the combination of external gene information (e.g., essential genes) to train the model.
-- [Inference of composition changes using CRISPRi-based Perturb-seq](demos/tutorials/Inference_using_Perturbseq.ipynb): use pertTF (lochNESS-aware during training) to infer composition changes using the predicted lochNESS scores. Include the inference of essential genes and unseen genes (like CTNNB1).
+- [Virtual CRISPR screens](demos/tutorials/virtual_pooled_screen.ipynb) and [Google Colab notebook](https://colab.research.google.com/drive/179y3UUTXvCHGpmc7lwrOgc8I3svhnD9Z?usp=sharing): perform virtual pooled CRISPR screens between two cell populations from pertTF model
+- [Train pertTF to predict composition change](demos/tutorials/train_pertTF_with__lochNESS.ipynb) and [Google Colab notebook](https://colab.research.google.com/drive/1QiWBKbMOGJwthIqZMG-BYGbengguxQ7A?usp=sharing): calculate lochNESS scores, train pertTF to predict cell compositions from lochNESS scores. In addition, this notebook demonstrates the combination of external gene information (e.g., essential genes) to train the model.
+- [Inference of composition changes using CRISPRi-based Perturb-seq](demos/tutorials/Inference_using_Perturbseq.ipynb) and [Google Colab notebook](https://colab.research.google.com/drive/1OiMNI7R1SoicIO9YRDoWFLki1e3pJcHL?usp=sharing): use pertTF (lochNESS-aware during training) to infer composition changes using the predicted lochNESS scores. Include the inference of essential genes and unseen genes (like CTNNB1).
+- [virtual Perturb-seq](demos/tutorials/TUTORIAL_50gene_eval.ipynb) and [Google Colab notebook](https://colab.research.google.com/drive/1J7NQMF1XlBQZ3bDooVJWgbAOilxdUUJE?usp=sharing): use pertTF to perform virtual Perturb-seq, and compare with the real CRISPRi-based Perturb-seq.
 
 ## References
 
