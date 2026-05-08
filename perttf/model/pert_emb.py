@@ -1,12 +1,20 @@
 
 import torch
 import os
-from typing import Literal
 
 import scanpy as sc
 import numpy as np
 import pandas as pd
+
+from typing import Literal, Dict, Optional
+
+import pickle
+
+from anndata import AnnData
+
+
 from .train_function import eval_testdata
+
 
 def load_pert_embedding_from_gears(gears_path, adata, 
                                   intersect_type : Literal["common","gears"] = "common"):
@@ -84,6 +92,82 @@ def load_pert_embedding_to_model(o_model, model_weights, requires_grad = True):
     o_model.pert_encoder.embedding.weight.data = model_weights_tensor # torch.tensor(gears_model_subset,dtype=torch.double)
     o_model.pert_encoder.embedding.weight.requires_grad = requires_grad
     return o_model
+
+
+
+def _load_raw_embeddings(embed_type: str, path1: str, path2: Optional[str] = None) -> Dict[str, np.ndarray]:
+    """Helper to load different embedding formats into a standard {gene: np.array} dict."""
+    if embed_type == "gears":
+        model = torch.load(os.path.join(path1, 'model.pt'), map_location='cpu')
+        with open(os.path.join(path1, 'pert_gene_list.pkl'), 'rb') as f:
+            genes = pickle.load(f)['pert_gene_list']
+        weights = model['pert_emb.weight'].numpy()
+        return dict(zip(genes, weights))
+
+    elif embed_type == "genept":
+        with open(path1, 'rb') as f:
+            data = pickle.load(f)
+        return {g: np.array(v, dtype=np.float32) for g, v in data.items()}
+
+    elif embed_type == "esm2":
+        data = torch.load(path1, map_location='cpu')
+        return {g: v.numpy() for g, v in data.items()}
+
+    elif embed_type == "concat":
+        if not path2:
+            raise ValueError("path2 is required for 'concat' embeddings.")
+        # Recursively load and concatenate
+        genept = _load_raw_embeddings("genept", path1)
+        esm2 = _load_raw_embeddings("esm2", path2)
+        common_genes = set(genept.keys()) & set(esm2.keys())
+        return {g: np.concatenate([genept[g], esm2[g]]) for g in common_genes}
+
+    raise ValueError(f"Unknown embed_type: {embed_type}")
+
+
+def load_pert_embeddings(
+    embed_type: Literal["gears", "genept", "esm2", "concat"],
+    adata: AnnData,
+    path1: str,
+    path2: Optional[str] = None,
+    intersect_type: Literal["common", "source"] = "common",
+    filter_by_human: bool = False
+) -> dict:
+    """
+    Unified loader for GEARS, GenePT, ESM2, or concatenated perturbation embeddings.
+    """
+    # 1. Standardize inputs to a dictionary
+    emb_dict = _load_raw_embeddings(embed_type, path1, path2)
+    if filter_by_human:
+        human_genes = [g.split(',')[0].split(' ')[0].split('\t')[0].rstrip() for g in open(filter_by_human)]
+        emb_dict = {g:emb_dict[g] for g in emb_dict if g in human_genes}
+    source_genes = list(emb_dict.keys())
+    adata_genotypes = adata.obs['genotype'].unique()
+
+    # 2. Resolve intersections
+    valid_genes = np.intersect1d(adata_genotypes, source_genes) if intersect_type == 'common' else source_genes
+    valid_genes = [g for g in valid_genes if g in emb_dict]
+
+    if not valid_genes:
+        raise ValueError("No common genes found between the embeddings and the AnnData object.")
+
+    # Optional: Keep print statements concise
+    missing = [x for x in adata_genotypes if x not in emb_dict]
+    print(f"Matched {len(valid_genes)} genes. Missing from embeddings: {len(missing)}")
+
+    # 3. Construct embedding matrix & mapping
+    emb_matrix = np.vstack([emb_dict[g] for g in valid_genes])
+    emb_matrix = np.vstack([emb_matrix, np.zeros(emb_matrix.shape[1], dtype=np.float32)]) # Append WT zeros
+
+    genotype_idx = {g: i for i, g in enumerate(valid_genes)}
+    genotype_idx['WT'] = len(genotype_idx)
+
+    # 4. Return formatted data
+    return {
+        'pert_embedding': emb_matrix,
+        'adata_subset': adata[adata.obs['genotype'].isin(genotype_idx.keys())].copy(),
+        'genotype_index_gears': genotype_idx
+    }
 
 
 def generate_pert_embeddings(adata_target, adata_wt, candidate_genes,
