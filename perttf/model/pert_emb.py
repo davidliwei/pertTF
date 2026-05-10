@@ -200,7 +200,7 @@ def generate_pert_embeddings(adata_target, adata_wt, candidate_genes,
       a_eva: evaluated AnnData object from the last round of evaluation
     """
     # expand
-    adata_bwmerge=sc.concat([adata_target]*n_expands_per_epoch + [adata_wt],axis=0)
+    adata_bwmerge=sc.concat([adata_target]*n_expands_per_epoch + [adata_wt], axis=0, merge='same')
     cell_emb_data_all = None
     perturb_info_all = None
 
