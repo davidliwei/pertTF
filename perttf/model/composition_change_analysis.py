@@ -1,6 +1,7 @@
 import torch
 import scanpy as sc
 import numpy as np
+import pandas as pd
 from perttf.model.train_function import eval_testdata
 
 def calculate_lonESS_score(adata, overall_fraction_dict=None,
