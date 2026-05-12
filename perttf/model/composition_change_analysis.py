@@ -110,11 +110,12 @@ def generate_lochness_ranking( adata_wt, candidate_genes,
 
         perturb_info['round']=n_round
         # Check if pred_ps_score is 2D and select the first column if so
-        if pred_ps_score.ndim == 2 & pred_ps_score.shape[1]>1:
+        if pred_ps_score.ndim == 2 and pred_ps_score.shape[1] > 1:
             print('WARNING: pred_ps_score is 2D, probably due to the model pred_lochness_next parameter not properly set up. Selecting the first column.')
-            perturb_info['pred_ps'] = pred_ps_score[:, 0]
+            pred_ps_score_1d = np.asarray(pred_ps_score[:, 0]).ravel()
         else:
-            perturb_info['pred_ps'] = pred_ps_score
+            pred_ps_score_1d = np.asarray(pred_ps_score).ravel()
+        perturb_info['pred_ps'] = pred_ps_score_1d
         #perturb_info['type']=['pert_source']*adata_target.shape[0]*n_expands_per_epoch + ['pert_dest']*adata_wt.shape[0]
 
         if perturb_info_all is None:
