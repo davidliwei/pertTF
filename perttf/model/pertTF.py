@@ -106,7 +106,12 @@ class PerturbationTFModel(BaseModel):
         else:
             self.ps_decoder = None
         if self.pred_lochness_next:
-            self.ps_decoder2 = PSDecoder(d_model, 1, nlayers = ps_decoder2_nlayer, geneinput = True)
+            self.ps_decoder2 = PSDecoder(
+                d_model,
+                1,
+                nlayers = ps_decoder2_nlayer,
+                geneinput = self.pert_dim if self.pert_dim is not None else 0,
+            )
         else:
             self.ps_decoder2 = None
 

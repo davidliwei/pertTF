@@ -1,6 +1,7 @@
 import torch
 import scanpy as sc
 import numpy as np
+import pandas as pd
 from perttf.model.train_function import eval_testdata
 
 def calculate_lonESS_score(adata, overall_fraction_dict=None,
@@ -80,7 +81,7 @@ def generate_lochness_ranking( adata_wt, candidate_genes,
       a_eva: evaluated AnnData object from the last round of evaluation
     """
     # expand
-    adata_bwmerge=sc.concat([adata_wt]*n_expands_per_epoch,axis=0)
+    adata_bwmerge=sc.concat([adata_wt]*n_expands_per_epoch,axis=0,)
     adata_bwmerge.var=adata_wt.var
     #cell_emb_data_all = None
     perturb_info_all = None
@@ -95,6 +96,7 @@ def generate_lochness_ranking( adata_wt, candidate_genes,
 
         # feed into model
         model.to(device)
+        #import pdb; pdb.set_trace()
         eval_results_0 = eval_testdata(model, adata_bwmerge, gene_ids,
                                     train_data_dict={"cell_type_to_index":cell_type_to_index,
                                                       "genotype_to_index":genotype_to_index,
@@ -104,10 +106,16 @@ def generate_lochness_ranking( adata_wt, candidate_genes,
         #
         a_eva=eval_results_0 #['adata']
         pred_ps_score = a_eva.obsm['ps_pred_next']
-        perturb_info=a_eva.obs[['genotype','genotype_next']]
+        perturb_info=a_eva.obs[['genotype','genotype_next','celltype',]]
 
         perturb_info['round']=n_round
-        perturb_info['pred_ps'] = pred_ps_score
+        # Check if pred_ps_score is 2D and select the first column if so
+        if pred_ps_score.ndim == 2 and pred_ps_score.shape[1] > 1:
+            print('WARNING: pred_ps_score is 2D, probably due to the model pred_lochness_next parameter not properly set up. Selecting the first column.')
+            pred_ps_score_1d = np.asarray(pred_ps_score[:, 0]).ravel()
+        else:
+            pred_ps_score_1d = np.asarray(pred_ps_score).ravel()
+        perturb_info['pred_ps'] = pred_ps_score_1d
         #perturb_info['type']=['pert_source']*adata_target.shape[0]*n_expands_per_epoch + ['pert_dest']*adata_wt.shape[0]
 
         if perturb_info_all is None:
@@ -118,3 +126,29 @@ def generate_lochness_ranking( adata_wt, candidate_genes,
 
     perturb_info_all.reset_index(inplace=True)
     return  perturb_info_all,  a_eva
+
+
+
+def aggregate_lochness_scores(perturb_info_src):
+    avg_lochness_fp = perturb_info_src.groupby('genotype_next')['pred_ps'].agg(
+        mean='mean',
+        median='median',
+        count='count',
+        percentile_90=lambda x: np.percentile(x, 90),
+        percentile_10=lambda x: np.percentile(x, 10),)
+
+    # Sort the result
+    avg_lochness_fp = avg_lochness_fp.sort_values(by='mean',ascending=True)
+
+    # Add ranking
+    avg_lochness_fp = avg_lochness_fp.reset_index()
+    avg_lochness_fp['rank'] = avg_lochness_fp['mean'].rank(ascending=True, method='dense')
+    avg_lochness_fp['rank_median'] = avg_lochness_fp['median'].rank(ascending=True, method='dense')
+    avg_lochness_fp['rank_percentile90'] = avg_lochness_fp['percentile_90'].rank(ascending=True, method='dense')
+    avg_lochness_fp['rank_percentile10'] = avg_lochness_fp['percentile_10'].rank(ascending=True, method='dense')
+
+    avg_lochness_fp.set_index('genotype_next', inplace=True)
+    avg_lochness_fp = avg_lochness_fp.sort_values(by='median',ascending=True)
+    return avg_lochness_fp
+
+

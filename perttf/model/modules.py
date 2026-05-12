@@ -591,15 +591,14 @@ class PSDecoder(nn.Module):
         n_pert: int,
         nlayers: int = 3,
         activation: callable = nn.ReLU,
-        geneinput: bool = False,
+        geneinput: int = 0,
     ):
         super().__init__()
         # module list
         self._decoder = nn.ModuleList()
-        if geneinput:
-            self.input_dim =  d_model * 2 #this is a concatenation of cell embedding and perturbation embedding
-        else:
-            self.input_dim = d_model # just cell embedding
+
+        self.input_dim =  d_model + geneinput # * 2 #this is a concatenation of cell embedding and perturbation embedding
+
         
         for i in range(nlayers - 1):
             if i == 0:
