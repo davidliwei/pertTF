@@ -20,7 +20,8 @@ from .modules import (
     PerturbationDecoder,
     PSDecoder,
     Batch2LabelEncoder,
-    PertLabelEncoder
+    PertLabelEncoder,
+    FeaturePertEncoder
     )
 
 
@@ -34,13 +35,22 @@ class PerturbationTFModel(BaseModel):
         ps_decoder2_nlayer = kwargs.pop("ps_decoder2_nlayer",3) # additional parameter to specify ps_decoder2 nlayer
         self.pert_pad_id = kwargs.pop("pert_pad_id", None) # get the pert_pad_id
         self.pert_dim = kwargs.pop('pert_dim', None)
+        # optional perturbation FEATURE matrix (n_pert, feat_dim). When provided, the
+        # perturbation encoder maps each genotype index through its feature vector + an
+        # MLP instead of an independent lookup row, so novel (unseen-in-training)
+        # conditions get a meaningful embedding -> enables zero-shot (regime-A) prediction.
+        self.pert_features = kwargs.pop("pert_features", None)
         super().__init__(*args, **kwargs)
         # add perturbation encoder
         # variables are defined in super class
-        d_model = self.d_model 
+        d_model = self.d_model
         pert_dim = d_model if self.pert_dim is None else self.pert_dim
         #self.pert_encoder = nn.Embedding(3, d_model, padding_idx=pert_pad_id)
-        self.pert_encoder = PertLabelEncoder(n_pert, pert_dim, padding_idx=self.pert_pad_id)
+        if self.pert_features is not None:
+            self.pert_encoder = FeaturePertEncoder(
+                self.pert_features, pert_dim, padding_idx=self.pert_pad_id)
+        else:
+            self.pert_encoder = PertLabelEncoder(n_pert, pert_dim, padding_idx=self.pert_pad_id)
         self.pert_exp_encoder = PertExpEncoder(d_model, self.pert_dim) 
         # the following is the perturbation decoder
         #n_pert = kwargs.get("n_perturb", 1) 
