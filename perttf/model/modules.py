@@ -673,7 +673,63 @@ class PertLabelEncoder(nn.Module):
         x = self.enc_norm(x)
         return x
 
-    
+
+class FeaturePertEncoder(nn.Module):
+    """
+    Feature-conditioned perturbation encoder.
+
+    Drop-in replacement for ``PertLabelEncoder`` with an identical
+    ``forward(LongTensor idx) -> (batch, embedding_dim)`` interface, so the rest of
+    ``PerturbationTFModel`` needs no change. Instead of looking up an independently
+    learned row per genotype index (``nn.Embedding``), it maps a *fixed feature
+    vector* for each perturbation through a small trainable MLP. Because the
+    embedding is a smooth function of features (gene/drug identity), a perturbation
+    that was NEVER seen in training still receives a meaningful embedding from its
+    feature row -> this is what enables zero-shot (regime-A) prediction of novel
+    conditions, which the index-lookup encoder structurally cannot do.
+
+    Args:
+        pert_features: array-like, shape (n_pert, feat_dim). Row i is the feature
+            vector for the perturbation whose ``genotype_to_index`` value is i.
+            Held-out/novel conditions MUST be assigned an index + row here too.
+        embedding_dim: output embedding size (must match ``pert_dim`` / d_model use).
+        hidden_dim: MLP hidden width (defaults to embedding_dim).
+        padding_idx: optional index whose embedding is forced to zero (e.g. a pad
+            perturbation), mirroring nn.Embedding's padding_idx semantics.
+    """
+
+    def __init__(
+        self,
+        pert_features,
+        embedding_dim: int,
+        hidden_dim: Optional[int] = None,
+        padding_idx: Optional[int] = None,
+    ):
+        super().__init__()
+        feats = torch.as_tensor(pert_features, dtype=torch.float32)
+        if feats.dim() != 2:
+            raise ValueError(f"pert_features must be 2-D (n_pert, feat_dim), got {tuple(feats.shape)}")
+        # fixed (non-trained) feature table; moves with .to(device) and is saved in state_dict
+        self.register_buffer("features", feats)
+        feat_dim = feats.shape[1]
+        hidden_dim = embedding_dim if hidden_dim is None else hidden_dim
+        self.proj = nn.Sequential(
+            nn.Linear(feat_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, embedding_dim),
+        )
+        self.enc_norm = nn.LayerNorm(embedding_dim)
+        self.padding_idx = padding_idx
+
+    def forward(self, x: Tensor) -> Tensor:
+        feats = self.features[x]          # (batch, feat_dim) — gathers rows by index
+        emb = self.proj(feats)            # (batch, embedding_dim)
+        emb = self.enc_norm(emb)
+        if self.padding_idx is not None:
+            emb = emb.masked_fill((x == self.padding_idx).unsqueeze(-1), 0.0)
+        return emb
+
+
 class PertExpEncoder(nn.Module):
     """
     Concatenating gene expression embeddings (from transformers) with perturbation embeddings (from scGPT's PertEncoder)

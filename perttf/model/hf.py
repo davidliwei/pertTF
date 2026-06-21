@@ -124,6 +124,12 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             self.ps_names = kwargs.pop('ps_names')
             self._hub_mixin_config['n_ps'] = len(self.ps_names)
 
+        # Optional perturbation FEATURE matrix (n_pert, feat_dim). Like the other
+        # running params it is a tensor/array (not JSON-serializable), so it is kept
+        # out of the HF config and forwarded directly to the parent, which builds a
+        # FeaturePertEncoder when it is not None (enables zero-shot prediction).
+        self.pert_features = kwargs.pop('pert_features', None)
+
                 # fix up some old configurations and param names
         if kwargs.get('layer_size', False):
             self._hub_mixin_config['d_model'] = kwargs.pop('layer_size')
@@ -185,6 +191,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             ps_decoder2_nlayer=ps_decoder2_nlayer,
             pert_pad_id=pert_pad_id,
             pert_dim=pert_dim,
+            pert_features=self.pert_features,
             # Note: We do NOT pass **kwargs here, so parent doesn't see extra params.
         )
 
@@ -230,7 +237,10 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             'cell_type_to_index': getattr(self, 'cell_type_to_index', None),
             'genotype_to_index': getattr(self, 'genotype_to_index', None),
             'ps_names': getattr(self, 'ps_names', None),
-            'num_batch_labels': getattr(self, 'num_batch_labels', 1)
+            'num_batch_labels': getattr(self, 'num_batch_labels', 1),
+            # Needed at from_pretrained time to rebuild FeaturePertEncoder BEFORE
+            # weights load, otherwise pert_encoder.proj/features keys are dropped.
+            'pert_features': getattr(self, 'pert_features', None),
         }
         # Filter None values
         running_params_to_save = {k: v for k, v in running_params_to_save.items() if v is not None}
@@ -341,6 +351,14 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             print(f'WARNING: ps column names provided by user, ps score prediction head may be different from pretrained model, this is okay for finetuning')
         elif 'ps_names' in running_params:
             config['ps_names'] = running_params['ps_names']
+
+        # Restore the perturbation feature matrix so the parent builds a
+        # FeaturePertEncoder before weights are loaded (zero-shot encoder).
+        if kwargs.get('pert_features', None) is not None:
+            config['pert_features'] = kwargs['pert_features']
+            print(f'WARNING: pert_features provided by user, perturbation encoder may be different from pretrained model, this is okay for finetuning')
+        elif running_params.get('pert_features', None) is not None:
+            config['pert_features'] = running_params['pert_features']
 
         # let user option to choose attention backend
         if 'use_fast_transformer' in kwargs:
