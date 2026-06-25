@@ -78,7 +78,7 @@ All these tutorials can run on Google Colab.
 
 ### Modeling other types of perturbation beyond genetic perturbation
 
-- [Feature-conditioned perturbation encoder (zero-shot)](demos/tutorials/feature_pert_encoder_demo.ipynb) and [Google Colab notebook](https://colab.research.google.com/drive/1Dr8W8WxmKybCe79MJT27vCVO8q7vuAKG?usp=sharing): train pertTF with the `FeaturePertEncoder` (via the `pert_features` option) so it can embed perturbations never seen in training. Using a small LARRY cytokine dataset (downloaded from Google Drive) with one condition held out, the notebook runs a mini training/validation loop and shows that the held-out condition stays at random init under the default `PertLabelEncoder` but becomes informed under the feature-conditioned encoder.
+- [Feature-conditioned perturbation encoder (zero-shot)](demos/tutorials/feature_pert_encoder_demo.ipynb) and [Google Colab notebook](https://colab.research.google.com/drive/1Dr8W8WxmKybCe79MJT27vCVO8q7vuAKG?usp=sharing): train pertTF with the `FeaturePertEncoder` (via the `pert_features` option) so it can embed perturbations beyond genetic perturbations, and never seen in training. Using a small LARRY cytokine dataset with one condition held out, the notebook runs a mini training/validation loop and shows that the held-out condition stays at random init under the default `PertLabelEncoder` but becomes informed under the feature-conditioned encoder.
 
 ## References
 
