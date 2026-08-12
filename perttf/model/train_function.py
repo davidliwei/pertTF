@@ -40,6 +40,13 @@ from ..utils.misc import get_config_value as _cfg
 from ..utils.misc import init_plot_worker
 from ..utils.misc import to_numpy as _to_numpy
 from ..utils.pert_data_loader import PertBatchCollator, PertTFDataset
+from ..utils.pert_metrics import (
+    GroupMoments,
+    compute_perturbation_metrics,
+    labels_to_names,
+    normalize_expression,
+    prediction_scale,
+)
 from .expr_sampler import DistributionGenerator
 
 
@@ -432,11 +439,17 @@ def _run_evaluation_batches(
     device,
     apply_next_perturbation=False,
     compute_losses=True,
+    real_groups=None,
+    cell_type_to_index=None,
+    genotype_to_index=None,
+    prediction_modes=("mean",),
     collect_outputs=False,
     predict_expr=False,
     use_full_mvc_src=False,
     use_size_factor=True,
     output_prediction_mode="mean",
+    target_sum=10000.0,
+    sample_seed=None,
 ):
     """Shared DataLoader-backed eval/inference loop used by evaluate() and eval_testdata()."""
     criterion = masked_mse_loss
@@ -446,6 +459,10 @@ def _run_evaluation_batches(
     criterion_ps = nn.MSELoss()
     criterion_mvc = GenerativeExpressionLoss()
     generator = DistributionGenerator(getattr(model, "distribution", None))
+    prediction_modes = [prediction_modes] if isinstance(prediction_modes, str) else list(prediction_modes)
+    moments = {mode: GroupMoments() for mode in prediction_modes} if real_groups is not None else {}
+    index_to_celltype = {value: key for key, value in (cell_type_to_index or {}).items()}
+    index_to_genotype = {value: key for key, value in (genotype_to_index or {}).items()}
     outputs = {} if collect_outputs else None
 
     total_loss = 0.0
@@ -470,8 +487,13 @@ def _run_evaluation_batches(
         ps_next_training_weight = _cfg(config, "ps_weight", 0) * _cfg(config, "next_weight", 0)
 
     model.eval()
+    fork_devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
     autocast_context = torch.cuda.amp.autocast if device.type == "cuda" else nullcontext
-    with torch.no_grad():
+    with torch.no_grad(), torch.random.fork_rng(devices=fork_devices):
+        if sample_seed is not None:
+            torch.manual_seed(sample_seed)
+            if device.type == "cuda":
+                torch.cuda.manual_seed_all(sample_seed)
         for batch_data in loader:
             input_gene_ids = batch_data["gene_ids"].to(device)
             input_values = batch_data["values"].to(device)
@@ -483,7 +505,7 @@ def _run_evaluation_batches(
             sf_next = batch_data["sf_next"].to(device) if compute_losses and use_size_factor else sf
             src_key_padding_mask = input_gene_ids.eq(vocab[config.pad_token])
             mvc_src = batch_data["full_gene_ids"].to(device) if (use_full_mvc_src or not _cfg(config, "mvc_masked_train", True)) and "full_gene_ids" in batch_data else None
-            use_mvc = predict_expr or _cfg(config, "GEPC", False)
+            use_mvc = predict_expr or real_groups is not None or _cfg(config, "GEPC", False)
 
             with autocast_context(enabled=_cfg(config, "amp", False)) if device.type == "cuda" else autocast_context():
                 output_dict = model(
@@ -539,6 +561,18 @@ def _run_evaluation_batches(
                 total_ps_next += loss_ps_next.item() * batch_size
                 total_num += batch_size
 
+            if real_groups is not None:
+                contexts = labels_to_names(batch_data["celltype_labels"], index_to_celltype)
+                perturbations = labels_to_names(batch_data["perturbation_labels_next"], index_to_genotype)
+                for mode in prediction_modes:
+                    predicted = generator.generate(output_dict["mvc_output_next"], sample=mode == "sample", device=device)["pred"][:, 1:]
+                    normalized = normalize_expression(
+                        _to_numpy(predicted),
+                        target_sum=target_sum,
+                        input_scale=prediction_scale(getattr(model, "distribution", None)),
+                    )
+                    moments[mode].update(normalized, contexts, perturbations)
+
             if collect_outputs:
                 cell_embedding = output_dict["transformer_output"][:, 0, :]
                 next_emb = output_dict["cell_emb_next"]
@@ -560,6 +594,7 @@ def _run_evaluation_batches(
 
     result = {
         "losses": None,
+        "metrics": {},
         "outputs": _concat_outputs(outputs) if collect_outputs else {},
     }
     if compute_losses:
@@ -576,6 +611,17 @@ def _run_evaluation_batches(
             total_ps / total_num,
             total_ps_next / total_num,
         )
+    if real_groups is not None:
+        result["metrics"] = {
+            mode: compute_perturbation_metrics(
+                real_groups,
+                mode_moments.finalize(),
+                control_value=_cfg(config, "perturbation_control_value", "WT"),
+                fdr_threshold=_cfg(config, "perturbation_metric_fdr", 0.05),
+                min_cells=_cfg(config, "perturbation_metric_min_cells", 3),
+            )
+            for mode, mode_moments in moments.items()
+        }
     return result
 
 
@@ -584,7 +630,13 @@ def evaluate(model: nn.Module,
             config,
             vocab,
             epoch = 0,
-            device = None) -> Any:
+            device = None,
+            perturbation_reference_groups = None,
+            cell_type_to_index = None,
+            genotype_to_index = None,
+            prediction_modes = None,
+            target_sum = None,
+            sample_seed = None) -> Any:
     """Evaluate the model using the shared DataLoader-backed inference loop."""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -596,7 +648,16 @@ def evaluate(model: nn.Module,
         vocab,
         device,
         apply_next_perturbation=apply_next_perturbation,
+        compute_losses=perturbation_reference_groups is None,
+        real_groups=perturbation_reference_groups,
+        cell_type_to_index=cell_type_to_index,
+        genotype_to_index=genotype_to_index,
+        prediction_modes=prediction_modes or _cfg(config, "perturbation_metric_modes", ["mean"]),
+        target_sum=_cfg(config, "perturbation_metric_target_sum", 10000.0) if target_sum is None else target_sum,
+        sample_seed=sample_seed,
     )
+    if perturbation_reference_groups is not None:
+        return result
     losses = result["losses"]
     wandb.log(
         {

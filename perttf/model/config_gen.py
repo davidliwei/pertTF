@@ -35,6 +35,24 @@ def generate_config(parameter_dict,
     parameter_dict['sampling_mode']  = parameter_dict.get('sampling_mode', 'simple')
     parameter_dict['fix_nonzero_prop'] = parameter_dict.get('fix_nonzero_prop', False)
     parameter_dict['nonzero_prop'] = parameter_dict.get('nonzero_prop', 0.9)
+    parameter_dict['perturbation_metric_modes'] = parameter_dict.get(
+      'perturbation_metric_modes', ['mean', 'sample']
+    )
+    parameter_dict['perturbation_metric_target_sum'] = parameter_dict.get(
+      'perturbation_metric_target_sum', 10000.0
+    )
+    parameter_dict['perturbation_metric_real_scale'] = parameter_dict.get(
+      'perturbation_metric_real_scale', 'log1p'
+    )
+    parameter_dict['perturbation_metric_fdr'] = parameter_dict.get(
+      'perturbation_metric_fdr', 0.05
+    )
+    parameter_dict['perturbation_metric_min_cells'] = parameter_dict.get(
+      'perturbation_metric_min_cells', 3
+    )
+    parameter_dict['perturbation_metric_sample_seed'] = parameter_dict.get(
+      'perturbation_metric_sample_seed', parameter_dict.get('seed')
+    )
     if parameter_dict['next_cell_pred_type'] == 'identity':
       parameter_dict['next_weight'] = 0
     #mask_ratio = config.mask_ratio
@@ -71,4 +89,3 @@ def generate_config(parameter_dict,
     #DAB_separate_optim = True if config.dab_weight >0 else False
 
     return (config, run)
-
