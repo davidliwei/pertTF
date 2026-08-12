@@ -385,7 +385,8 @@ def tokenize_and_pad_batch(
     nonzero_prop: float = 0.7,
     fix_nonzero_prop: bool = False,
     hvg_inds = None,
-    non_hvg_size = 1000
+    non_hvg_size = 1000,
+    rng: default_rng = None,
 ) -> Tuple[Dict[str, torch.Tensor], List[np.ndarray]]:
     """
     Tokenize and pad a batch of data.
@@ -433,7 +434,8 @@ def tokenize_and_pad_batch(
         nonzero_prop = nonzero_prop,
         fix_nonzero_prop = fix_nonzero_prop,
         hvg_inds = hvg_inds,
-        non_hvg_size = non_hvg_size # if this is set to True, the data may contain padding
+        non_hvg_size = non_hvg_size, # if this is set to True, the data may contain padding
+        rng=rng,
     )
     return batch_padded, used_indices
 
@@ -459,7 +461,7 @@ def random_mask_value(
     Returns:
         torch.Tensor: A tensor of masked data.
     """
-    rng = default_rng() or rng # much faster sampling without replacement
+    rng = default_rng() if rng is None else rng # much faster sampling without replacement
     if isinstance(values, torch.Tensor):
         # it is crutial to clone the tensor, otherwise it changes the original tensor
         values = values.clone().detach().numpy()

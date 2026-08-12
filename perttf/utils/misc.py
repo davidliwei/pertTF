@@ -2,6 +2,30 @@ import numpy as np
 from typing import Literal
 from scipy import sparse
 
+
+def get_config_value(config, key, default=None):
+    return config.get(key, default) if hasattr(config, "get") else getattr(config, key, default)
+
+
+def to_numpy(value):
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    return value
+
+
+def append_tensor(output_store, key, value):
+    if value is not None:
+        output_store.setdefault(key, []).append(to_numpy(value))
+
+
+def concatenate_outputs(output_store):
+    return {
+        key: np.concatenate(values, axis=0) if values else values
+        for key, values in output_store.items()
+    }
+
 # Courtesy of Gemini AI, unbin predicted expr values if they were binned prior to scGPT
 def unbin_matrix(
     binned_matrix: np.ndarray,

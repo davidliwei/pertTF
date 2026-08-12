@@ -4,13 +4,14 @@ import random
 import warnings
 from pathlib import Path
 import copy
+from contextlib import nullcontext
 import numpy as np
 import pandas as pd
 from typing import Dict, Mapping, Optional, Tuple, Any, Union
 from typing import List, Tuple
 
 from torch import nn, Tensor
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 
 from anndata import AnnData
 import scanpy as sc
@@ -19,10 +20,8 @@ from concurrent.futures import ProcessPoolExecutor
 from omegaconf import OmegaConf 
 #multiprocessing.set_start_method('spawn', force=True)
 import wandb
-from scipy.sparse import issparse
 
 
-from ..utils.custom_tokenizer import tokenize_and_pad_batch, random_mask_value
 from ..utils.logger import create_logger
 import matplotlib.pyplot as plt
 
@@ -35,7 +34,13 @@ from ..custom_loss import (
     GenerativeExpressionLoss
 )
 from ..utils.plot import process_and_log_umaps
+from ..utils.misc import append_tensor as _append_tensor
+from ..utils.misc import concatenate_outputs as _concat_outputs
+from ..utils.misc import get_config_value as _cfg
 from ..utils.misc import init_plot_worker
+from ..utils.misc import to_numpy as _to_numpy
+from ..utils.pert_data_loader import PertBatchCollator, PertTFDataset
+from .expr_sampler import DistributionGenerator
 
 
 def train(model: nn.Module,
@@ -419,26 +424,30 @@ def define_wandb_metrcis():
     wandb.define_metric("test/avg_bio", summary="max")
 
 
-def evaluate(model: nn.Module,
-            loader: DataLoader,
-            config,
-            vocab,
-            epoch = 0,
-            device = None) -> float:
-    """
-    Evaluate the model on the evaluation data.
-    """
+def _run_evaluation_batches(
+    model: nn.Module,
+    loader: DataLoader,
+    config,
+    vocab,
+    device,
+    evaluate_next=True,
+    compute_standard_losses=True,
+    collect_outputs=False,
+    predict_expr=False,
+    use_full_mvc_src=False,
+    use_size_factor=True,
+    output_prediction_mode="mean",
+):
+    """Shared DataLoader-backed eval/inference loop used by evaluate() and eval_testdata()."""
     criterion = masked_mse_loss
     criterion_dab = nn.CrossEntropyLoss()
     criterion_cls = nn.CrossEntropyLoss()
     criterion_pert = nn.CrossEntropyLoss()
-    criterion_adv = nn.CrossEntropyLoss()  # consider using label smoothing
-    criterion_ps = nn.MSELoss() # this is the loss for predicting PS scores
+    criterion_ps = nn.MSELoss()
     criterion_mvc = GenerativeExpressionLoss()
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    generator = DistributionGenerator(getattr(model, "distribution", None))
+    outputs = {} if collect_outputs else None
 
-    model.eval()
     total_loss = 0.0
     total_loss_next = 0.0
     total_error = 0.0
@@ -448,146 +457,170 @@ def evaluate(model: nn.Module,
     total_pert = 0.0
     total_ps = 0.0
     total_ps_next = 0.0
+    total_mvc = 0.0
+    total_mvc_next = 0.0
     total_num = 0
-    total_mvc = 0
-    total_mvc_next = 0
 
-    if hasattr(config, "pred_lochness_next"):
+    pred_lochness_next = _cfg(config, "pred_lochness_next", None)
+    if pred_lochness_next is not None:
         has_lochness_next_pred = True
-        ps_next_training_weight = config.pred_lochness_next
+        ps_next_training_weight = pred_lochness_next
     else:
         has_lochness_next_pred = False
-        ps_next_training_weight = config.ps_weight * config.next_weight
+        ps_next_training_weight = _cfg(config, "ps_weight", 0) * _cfg(config, "next_weight", 0)
 
+    model.eval()
+    autocast_context = torch.cuda.amp.autocast if device.type == "cuda" else nullcontext
     with torch.no_grad():
-        for batch, batch_data in enumerate(loader):
+        for batch_data in loader:
             input_gene_ids = batch_data["gene_ids"].to(device)
             input_values = batch_data["values"].to(device)
-            target_values = batch_data["target_values"].to(device)
-            target_values_next = batch_data["target_values_next"].to(device)
-            batch_labels = batch_data["batch_labels"].to(device)
-            celltype_labels = batch_data["celltype_labels"].to(device) #added
-            perturbation_labels = batch_data["perturbation_labels"].to(device) #added
-            perturbation_labels_next = batch_data["perturbation_labels_next"].to(device) #added
-            ps_score = batch_data["ps"].to(device) #added
-            ps_score_next = batch_data["ps_next"].to(device) #added
-            sf = batch_data['sf'].to(device)
-            sf_next = batch_data['sf_next'].to(device)
+            batch_labels = batch_data["batch_labels"].to(device) if "batch_labels" in batch_data else None
+            celltype_labels = batch_data["celltype_labels"].to(device) if "celltype_labels" in batch_data else None
+            perturbation_labels = batch_data["perturbation_labels"].to(device) if "perturbation_labels" in batch_data else None
+            perturbation_labels_next = batch_data["perturbation_labels_next"].to(device) if "perturbation_labels_next" in batch_data else None
+            sf = batch_data["sf"].to(device) if use_size_factor and "sf" in batch_data else None
+            sf_next = batch_data["sf_next"].to(device) if compute_standard_losses and use_size_factor else sf
             src_key_padding_mask = input_gene_ids.eq(vocab[config.pad_token])
-            mvc_src = None if config.get('mvc_masked_train', True) else batch_data['full_gene_ids'].to(device)
-            with torch.cuda.amp.autocast(enabled=config.amp):
+            mvc_src = batch_data["full_gene_ids"].to(device) if (use_full_mvc_src or not _cfg(config, "mvc_masked_train", True)) and "full_gene_ids" in batch_data else None
+            use_mvc = predict_expr or _cfg(config, "GEPC", False)
+            use_next_label = perturbation_labels_next is not None and (
+                (predict_expr and evaluate_next)
+                or (evaluate_next and (_cfg(config, "next_weight", 0) > 0 or has_lochness_next_pred))
+            )
+
+            with autocast_context(enabled=_cfg(config, "amp", False)) if device.type == "cuda" else autocast_context():
                 output_dict = model(
                     input_gene_ids,
                     input_values,
                     src_key_padding_mask=src_key_padding_mask,
-                    batch_labels=batch_labels if config.use_batch_label else None, # if config.DSBN else None,
-                    pert_labels = perturbation_labels if config.perturbation_input else None,
-                    pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
-                    sf = sf,
-                    sf_next = sf_next,
-                    MVC=config.GEPC,
-                    ECS=config.ecs_thres > 0,
-                    CLS=config.get('cell_type_classifier', True),
-                    PERTPRED = config.get('genotype_classifier', True),
-                    PSPRED = config.ps_weight>0,
-                    mvc_src = mvc_src
+                    batch_labels=batch_labels if _cfg(config, "use_batch_label", False) else None,
+                    pert_labels=perturbation_labels if _cfg(config, "perturbation_input", False) else None,
+                    pert_labels_next=perturbation_labels_next if use_next_label else None,
+                    sf=sf,
+                    sf_next=sf_next,
+                    MVC=use_mvc,
+                    ECS=_cfg(config, "ecs_thres", 0) > 0 and compute_standard_losses,
+                    CLS=_cfg(config, "cell_type_classifier", True) or collect_outputs,
+                    PERTPRED=_cfg(config, "genotype_classifier", True) or collect_outputs,
+                    PSPRED=_cfg(config, "ps_weight", 0) > 0 or collect_outputs,
+                    mvc_src=mvc_src,
                 )
-                output_values = output_dict["mlm_output"]
 
-                masked_positions = input_values.eq(config.mask_value)
-                loss = criterion(output_values, target_values, masked_positions)
-                #import pdb; pdb.set_trace()
-                #print(f"total mask:{sum(masked_positions)}")
-                #print(f"output_values_shape: {output_values.shape}")
-                #print(output_values * masked_positions )
-                #print(f"target_values_shape: {target_values.shape}")
-                #print(target_values * masked_positions )
+                batch_size = input_gene_ids.shape[0]
+                if compute_standard_losses:
+                    target_values = batch_data["target_values"].to(device)
+                    target_values_next = batch_data["target_values_next"].to(device)
+                    output_values = output_dict["mlm_output"]
+                    masked_positions = input_values.eq(config.mask_value)
+                    loss = criterion(output_values, target_values, masked_positions)
+                    loss_mse_next = criterion(output_values, target_values_next, masked_positions) if evaluate_next else output_values.new_tensor(0.0)
+                    if _cfg(config, "GEPC", False):
+                        mvc_target_values = target_values if _cfg(config, "mvc_masked_train", True) else batch_data["full_expr"].to(device)
+                        mvc_target_values_next = target_values_next if _cfg(config, "mvc_masked_train", True) else batch_data["full_expr_next"].to(device)
+                        loss_gepc = criterion_mvc(output_dict["mvc_output"], mvc_target_values, scale_factor=sf)
+                        loss_gepc_next = criterion_mvc(output_dict["mvc_output_next"], mvc_target_values_next, scale_factor=sf_next) if evaluate_next else output_values.new_tensor(0.0)
+                    else:
+                        loss_gepc = output_values.new_tensor(0.0)
+                        loss_gepc_next = output_values.new_tensor(0.0)
+                    loss_dab = criterion_dab(output_dict["dab_output"], batch_labels) if _cfg(config, "dab_weight", 0) > 0 else output_values.new_tensor(0.0)
+                    loss_cls = criterion_cls(output_dict["cls_output"], celltype_labels) if _cfg(config, "cell_type_classifier", True) else output_values.new_tensor(0.0)
+                    loss_pert = criterion_pert(output_dict["pert_output"], perturbation_labels) if _cfg(config, "genotype_classifier", True) else output_values.new_tensor(0.0)
+                    loss_ps = criterion_ps(output_dict["ps_output"], batch_data["ps"].to(device)) if _cfg(config, "ps_weight", 0) > 0 else output_values.new_tensor(0.0)
+                    loss_ps_next = criterion_ps(output_dict["ps_output_next"], batch_data["ps_next"].to(device)) if ps_next_training_weight > 0 else output_values.new_tensor(0.0)
 
-                loss_mse_next = criterion(output_values, target_values_next, masked_positions)
-                #print(f"target_values_next_shape: {target_values_next.shape}")
-                #print(target_values_next * masked_positions)
-                if config.GEPC:
-                    mvc_target_values = target_values if config.get('mvc_masked_train', True) else batch_data["full_expr"].to(device)
-                    mvc_target_values_next = target_values_next if config.get('mvc_masked_train', True) else batch_data["full_expr_next"].to(device)
-                    #mvc_masked_positions = masked_positions if config.get('mvc_masked_train', True) else None
+            if compute_standard_losses:
+                total_loss += loss.item() * batch_size
+                total_loss_next += loss_mse_next.item() * batch_size
+                total_mvc += loss_gepc.item() * batch_size
+                total_mvc_next += loss_gepc_next.item() * batch_size
+                total_error += masked_relative_error(output_values, target_values, masked_positions).item() * batch_size
+                if evaluate_next:
+                    total_error_next += masked_relative_error(output_values, target_values_next, masked_positions).item() * batch_size
+                total_dab += loss_dab.item() * batch_size
+                total_cls += loss_cls.item() * batch_size
+                total_pert += loss_pert.item() * batch_size
+                total_ps += loss_ps.item() * batch_size
+                total_ps_next += loss_ps_next.item() * batch_size
+                total_num += batch_size
 
-                    loss_gepc = loss_gepc = criterion_mvc(
-                        output_dict["mvc_output"], 
-                        mvc_target_values, 
-                        scale_factor = sf,
-                    )
-                    loss_gepc_next = criterion_mvc(
-                        output_dict["mvc_output_next"], 
-                        mvc_target_values_next, 
-                        scale_factor = sf_next,
-                    )
-                    
+            if collect_outputs:
+                cell_embedding = output_dict["transformer_output"][:, 0, :]
+                next_emb = output_dict["cell_emb_next"] if use_next_label else cell_embedding
+                _append_tensor(outputs, "X_scGPT", cell_embedding)
+                _append_tensor(outputs, "X_scGPT_next", next_emb)
+                _append_tensor(outputs, "pert_logits", output_dict.get("pert_output"))
+                _append_tensor(outputs, "cls_logits", output_dict.get("cls_output"))
+                _append_tensor(outputs, "ps_pred", output_dict.get("ps_output"))
+                _append_tensor(outputs, "ps_pred_next", output_dict.get("ps_output_next"))
+                if predict_expr:
+                    _append_tensor(outputs, "mlm_expr", output_dict.get("mlm_output")[:, 1:])
+                    for prefix, expr_output in (("mvc", output_dict["mvc_output"]), ("mvc_next", output_dict["mvc_output_next"])):
+                        generated = generator.generate(expr_output, sample=output_prediction_mode == "sample", device=device)
+                        outputs.setdefault(f"{prefix}_expr", []).append(_to_numpy(generated["pred"][:, 1:]))
+                        if generated.get("zero_probs") is not None:
+                            outputs.setdefault(f"{prefix}_expr_zero", []).append(_to_numpy(generated["zero_probs"][:, 1:]))
+                        if generated.get("param2") is not None:
+                            outputs.setdefault(f"{prefix}_param2", []).append(_to_numpy(generated["param2"][:, 1:]))
 
-                if config.dab_weight > 0:
-                    loss_dab = criterion_dab(output_dict["dab_output"], batch_labels)
-                if config.get('cell_type_classifier', True): #added
-                    loss_cls = criterion_cls(output_dict["cls_output"], celltype_labels)
-                    # = loss + loss_cls
-                if config.get('genotype_classifier', True):
-                    loss_pert = criterion_pert(output_dict["pert_output"], perturbation_labels)
-                    # = loss + loss_pert
+    result = {
+        "losses": None,
+        "outputs": _concat_outputs(outputs) if collect_outputs else {},
+    }
+    if compute_standard_losses:
+        result["losses"] = (
+            total_loss / total_num,
+            total_loss_next / total_num,
+            total_mvc / total_num,
+            total_mvc_next / total_num,
+            total_error / total_num,
+            total_error_next / total_num,
+            total_dab / total_num,
+            total_cls / total_num,
+            total_pert / total_num,
+            total_ps / total_num,
+            total_ps_next / total_num,
+        )
+    return result
 
-                if config.ps_weight > 0:
-                    loss_ps = criterion_ps(output_dict["ps_output"], ps_score)
-                    # = loss + loss_pert
-                if ps_next_training_weight >0:
-                    loss_ps_next = criterion_ps(output_dict["ps_output_next"], ps_score_next)
 
-            total_loss += loss.item() * len(input_gene_ids)
-            total_loss_next += loss_mse_next.item() * len(input_gene_ids)
-            if config.GEPC:
-                total_mvc += loss_gepc.item() * len(input_gene_ids)
-                total_mvc_next += loss_gepc_next.item() * len(input_gene_ids)
-            total_error += masked_relative_error(output_values, target_values, masked_positions).item() * len(input_gene_ids)
-            total_error_next += masked_relative_error(output_values, target_values_next, masked_positions).item() * len(input_gene_ids)
-            if config.dab_weight > 0:
-                total_dab += loss_dab.item() * len(input_gene_ids)
-            if config.get('cell_type_classifier', True): #added
-                total_cls += loss_cls.item() * len(input_gene_ids)
-            if config.get('genotype_classifier', True):
-                total_pert += loss_pert.item() * len(input_gene_ids)
-            if config.ps_weight > 0:
-                total_ps += loss_ps.item() * len(input_gene_ids)
-            if ps_next_training_weight >0:
-                total_ps_next += loss_ps_next.item() * len(input_gene_ids)
-            total_num += len(input_gene_ids)
-
+def evaluate(model: nn.Module,
+            loader: DataLoader,
+            config,
+            vocab,
+            epoch = 0,
+            device = None,
+            evaluate_next = True) -> Any:
+    """Evaluate the model using the shared DataLoader-backed inference loop."""
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    result = _run_evaluation_batches(
+        model,
+        loader,
+        config,
+        vocab,
+        device,
+        evaluate_next=evaluate_next,
+    )
+    losses = result["losses"]
     wandb.log(
         {
-            "valid/mse": total_loss / total_num,
-            "valid/mse_next": total_loss_next / total_num,
-            "valid/mvc": total_mvc / total_num,
-            "valid/mvc_next": total_mvc_next / total_num,
-            "valid/mre": total_error / total_num,
-            "valid/mre_next": total_error_next / total_num,
-            "valid/dab": total_dab / total_num,
-            "valid/cls": total_cls / total_num,
-            "valid/pert": total_pert / total_num,
-            "valid/ps": total_ps / total_num,
-            "valid/ps_next": total_ps_next / total_num,
-            "valid/sum_mse_dab": (total_loss + config.dab_weight * total_dab)/ total_num,
+            "valid/mse": losses[0],
+            "valid/mse_next": losses[1],
+            "valid/mvc": losses[2],
+            "valid/mvc_next": losses[3],
+            "valid/mre": losses[4],
+            "valid/mre_next": losses[5],
+            "valid/dab": losses[6],
+            "valid/cls": losses[7],
+            "valid/pert": losses[8],
+            "valid/ps": losses[9],
+            "valid/ps_next": losses[10],
+            "valid/sum_mse_dab": losses[0] + config.dab_weight * losses[6],
             "epoch": epoch,
         },
     )
-
-    return (
-        total_loss / total_num, 
-        total_loss_next / total_num, 
-        total_mvc / total_num,
-        total_mvc_next / total_num,
-        total_error / total_num, 
-        total_error_next / total_num, 
-        total_dab / total_num, 
-        total_cls / total_num, 
-        total_pert / total_num,
-        total_ps / total_num, 
-        total_ps_next / total_num
-    )
+    return losses
 
 def eval_testdata(
     model: nn.Module,
@@ -605,233 +638,125 @@ def eval_testdata(
     predict_expr = False,
     mvc_full_expr = False,
     sizefactor = False,
-    sample = False
-) -> Optional[Dict]: # Returns a dictionary containing the AnnData object
+    sample = False,
+    device = None,
+) -> AnnData:
     """
     Evaluate the model on test data and return an AnnData object with embeddings.
     Plotting and UMAP are offloaded to a separate process.
     """
     logger = create_logger() if logger is None else logger
-    model.eval()
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # copy adata_t to avoid reuse previously computed results stored in adata_t
-    adata_t = adata_t.copy()# make sure it is a independent copy for faster loading
-    
+    adata_t = adata_t.copy()
     cell_type_to_index = train_data_dict["cell_type_to_index"]
     genotype_to_index = train_data_dict["genotype_to_index"]
-    vocab=train_data_dict['vocab']
-    # make sure adata_t is ready for training
+    vocab = train_data_dict["vocab"]
     shared_genes = adata_t.var.index.isin(list(vocab.stoi.keys()))
     logger.info(f"{sum(shared_genes)} genes shared between model vocab's {len(vocab)} and anndata's {adata_t.shape[1]} genes")
-    adata_t = adata_t[:, shared_genes] 
-    #adata_t = adata_t[adata_t.obs['celltype'].isin(cell_type_to_index)] if 'celltype' in adata_t.obs.columns else adata_t
-    #adata_t = adata_t[adata_t.obs['genotype'].isin(genotype_to_index)] if 'genotype' in adata_t.obs.columns else adata_t
-    gene_ids = vocab(adata_t.var.index.tolist())
-    if 'genotype_next' in adata_t.obs.keys():
-        adata_t = adata_t[adata_t.obs['genotype_next'].isin(genotype_to_index)]
-    all_counts = (
-        adata_t.layers[input_layer_key].toarray()
-        if issparse(adata_t.layers[input_layer_key])
-        else adata_t.layers[input_layer_key]
-    )
-    from ..utils.pert_data_loader import _get_sf
-    sf = _get_sf(all_counts) if sizefactor else None
-    if next_layer_key in adata_t.layers:
-        all_counts_next = (
-            adata_t.layers[next_layer_key].toarray()
-            if issparse(adata_t.layers[next_layer_key])
-            else adata_t.layers[next_layer_key]
-        )
-    else:
-        all_counts_next = None
+    adata_t = adata_t[:, shared_genes].copy()
+    gene_ids = np.array(vocab(adata_t.var.index.tolist()), dtype=int)
+    if "genotype_next" in adata_t.obs.keys():
+        adata_t = adata_t[adata_t.obs["genotype_next"].isin(genotype_to_index)].copy()
 
-    if "celltype" in adata_t.obs.columns and config.cell_type_classifier and adata_t.obs["celltype"].isin(cell_type_to_index).all():
-        celltypes_labels = adata_t.obs["celltype"].tolist()  # make sure count from 0
-        celltypes_labels = np.array(celltypes_labels)
-        celltypes_labels = np.array([cell_type_to_index[ctype] if ctype in genotype_to_index else 0 for ctype in celltypes_labels])
-    else:
-        #celltypes_labels = np.array(random.choices( [0,1], k=adata_t.shape[0]))
-        celltypes_labels = None
-
-
-
-    if "genotype" in adata_t.obs.columns and (config.perturbation_classifier_weight > 0 or config.perturbation_input):
-        perturbation_labels = adata_t.obs["genotype"].tolist()  # make sure count from 0
-        perturbation_labels = np.array(perturbation_labels)
-        perturbation_labels = np.array([genotype_to_index[pert] if pert in genotype_to_index else 0 for pert in perturbation_labels])
-    else:
-        #perturbation_labels = np.array(random.choices( [0,1], k=adata_t.shape[0]))
-        perturbation_labels = None
-
-    perturbation_indexes = perturbation_labels
-
-
-    # evaluate the next prediction?
     next_cell_prediction = False
-    perturbation_labels_next = None
-    if config.next_cell_pred_type == "pert":
-        if "genotype_next" in adata_t.obs.columns:
-            # this is the pred_next  
-            #if config.perturbation_classifier_weight > 0:
-            next_cell_prediction = True
-        else:
-            logger.warning('next cell pred is set to pert but the provided adata does not have genotype_next column')
-            next_cell_prediction = False
-        if next_cell_prediction:
-            perturbation_labels_next = adata_t.obs["genotype_next"].tolist()  # make sure count from 0
-    if config.next_cell_pred_type ==  'lochness':
-        if hasattr(config, "pred_lochness_next") and config.pred_lochness_next >0:
-            next_cell_prediction = True
-        else:
-            next_cell_prediction = False
-        if next_cell_prediction:
-            perturbation_labels_next = adata_t.obs["genotype_next"].tolist()  # make sure count from 0
+    if _cfg(config, "next_cell_pred_type", "identity") == "pert":
+        next_cell_prediction = "genotype_next" in adata_t.obs.columns
+        if not next_cell_prediction:
+            logger.warning("next cell pred is set to pert but the provided adata does not have genotype_next column")
+    elif _cfg(config, "next_cell_pred_type", "identity") == "lochness":
+        next_cell_prediction = _cfg(config, "pred_lochness_next", 0) > 0 and "genotype_next" in adata_t.obs.columns
 
-    if next_cell_prediction:
-        perturbation_labels_next = np.array(perturbation_labels_next)
-        perturbation_labels_next = np.array([genotype_to_index[perturbation_type] for perturbation_type in perturbation_labels_next])
-    else:
-        #perturbation_labels_next = random.choices( [0,1], k=adata_t.shape[0])
-        perturbation_labels_next = None
-    perturbation_indexes_next = perturbation_labels_next
+    sampling_mode = _cfg(config, "sampling_mode", "simple")
+    hvg_inds = None
+    max_seq_len = _cfg(config, "max_seq_len", 3000)
+    if sampling_mode == "expressed":
+        max_seq_len = 10000
+    elif sampling_mode == "hvg":
+        hvg_col = _cfg(config, "hvg_col", "highly_variable")
+        assert hvg_col in adata_t.var.keys(), "adata must have calculated HVGs or adata.var must have hvg_col"
+        hvg_inds = (np.where(adata_t.var[hvg_col])[0], np.where(~adata_t.var[hvg_col])[0])
+        max_seq_len = int(adata_t.var[hvg_col].sum()) + _cfg(config, "non_hvg_size", 1000)
+    collator_config = dict(config)
+    collator_config.update({
+        "max_seq_len": max_seq_len,
+        "deterministic": True,
+        "prediction_only": True,
+    })
 
-    if "batch_id" in adata_t.obs.columns: # and config.DSBN:
-        batch_ids = adata_t.obs["batch_id"].tolist()
-    else:
-        batch_ids=random.choices( [0,1], k=adata_t.shape[0])
+    dataset = PertTFDataset(
+        adata_t,
+        indices=np.arange(adata_t.n_obs),
+        expr_layer=input_layer_key,
+        cell_type_to_index=cell_type_to_index,
+        genotype_to_index=genotype_to_index,
+        next_cell_pred=_cfg(config, "next_cell_pred_type", "identity"),
+        size_factor_col=_cfg(config, "size_factor_col", None),
+        prediction_only=True,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=_cfg(config, "batch_size", 32),
+        shuffle=False,
+        num_workers=0,
+        collate_fn=PertBatchCollator(vocab, gene_ids, hvg_inds=hvg_inds, **collator_config),
+        pin_memory=True,
+    )
+    prediction_mode = "sample" if sample is True else "mean"
 
-    batch_ids = np.array(batch_ids)
+    result = _run_evaluation_batches(
+        model,
+        loader,
+        config,
+        vocab,
+        device,
+        evaluate_next=next_cell_prediction,
+        compute_standard_losses=False,
+        collect_outputs="cls" in include_types,
+        predict_expr=predict_expr,
+        use_full_mvc_src=mvc_full_expr,
+        use_size_factor=sizefactor,
+        output_prediction_mode=prediction_mode,
+    )
+    outputs = result["outputs"]
+    if not outputs:
+        return adata_t
 
-    if mvc_full_expr: # if we want to get full expression from mvc decoder
-        cls_gene_ids = np.insert(gene_ids, 0, vocab[config.cls_token]) # default should always be to insert a cls token at the front
-        full_gene_ids = torch.stack([torch.from_numpy(cls_gene_ids).long() for i in range(adata_t.shape[0])], dim = 0)
-    else:
-        full_gene_ids = None
-    # Evaluate cls cell embeddings
-    if "cls" in include_types:
-        sampling_mode = config.get('sampling_mode', 'simple')
-        hvg_inds = None
-        max_seq_len = config.max_seq_len
-        if sampling_mode == 'expressed':
-            max_seq_len = 10000 #10k genes should include all expressed genes for most 10X data 
-        elif sampling_mode == 'hvg':
-            hvg_col = config.get('hvg_col', 'highly_variable')
-            assert hvg_col in adata_t.var.keys(), 'adata must have calculated HVGs or adata.var must have hvg_col'
-            hvg_inds = (np.where(adata_t.var[hvg_col])[0], np.where(~adata_t.var[hvg_col])[0])
-            max_seq_len = adata_t.var[hvg_col].sum()+config.get('non_hvg_size', 1000)
+    cell_embeddings = outputs["X_scGPT"]
+    cell_embeddings = cell_embeddings / np.linalg.norm(cell_embeddings, axis=1, keepdims=True)
+    cell_embeddings_next = outputs["X_scGPT_next"]
+    cell_embeddings_next = cell_embeddings_next / np.linalg.norm(cell_embeddings_next, axis=1, keepdims=True)
+    adata_t.obsm["X_scGPT"] = cell_embeddings
+    adata_t.obsm["X_scGPT_next"] = cell_embeddings_next
+    if "ps_pred" in outputs and _cfg(config, "ps_weight", 0) > 0:
+        adata_t.obsm["ps_pred"] = outputs["ps_pred"]
+    if "ps_pred_next" in outputs and _cfg(config, "next_cell_pred_type", "identity") == "lochness":
+        adata_t.obsm["ps_pred_next"] = outputs["ps_pred_next"]
+    for key, value in outputs.items():
+        if key not in {"X_scGPT", "X_scGPT_next", "pert_logits", "cls_logits", "ps_pred", "ps_pred_next"}:
+            adata_t.obsm[key] = value
 
-        tokenized_all, gene_idx_list= tokenize_and_pad_batch(
-            all_counts,
-            gene_ids,
-            max_len=max_seq_len,
-            vocab=vocab,
-            pad_token=config.pad_token,
-            pad_value=config.pad_value,
-            append_cls=True,  # append <cls> token at the beginning
-            include_zero_gene=True,
-            sampling_mode = config.get('sampling_mode', 'simple'),
-            nonzero_prop = config.get('nonzero_prop', 0.7),
-            fix_nonzero_prop =  config.get('fix_nonzero_prop', False),
-            hvg_inds = hvg_inds, 
-            non_hvg_size= config.get('non_hvg_size', 1000)
-        )
+    pert_preds = outputs["pert_logits"]
+    pert_shift = pert_preds - pert_preds.max(axis=1, keepdims=True)
+    X_genotype_cls_probs = np.exp(pert_shift) / np.sum(np.exp(pert_shift), axis=1, keepdims=True)
+    adata_t.obsm["X_pert_pred_probs"] = X_genotype_cls_probs
+    adata_t.obsm["genotype_pred_probs"] = X_genotype_cls_probs
+    index_to_genotype = {v: k for k, v in genotype_to_index.items()}
+    adata_t.obs["predicted_genotype"] = [index_to_genotype[i] for i in np.argmax(X_genotype_cls_probs, axis=1)]
+    if "genotype" in adata_t.obs.columns:
+        adata_t.obs["genotype_id"] = adata_t.obs["genotype"].map(genotype_to_index).astype(pd.CategoricalDtype(categories=list(genotype_to_index.values())))
 
+    cls_preds = outputs["cls_logits"]
+    cls_shift = cls_preds - cls_preds.max(axis=1, keepdims=True)
+    X_celltype_cls_probs = np.exp(cls_shift) / np.sum(np.exp(cls_shift), axis=1, keepdims=True)
+    adata_t.obsm["X_cls_pred_probs"] = X_celltype_cls_probs
+    adata_t.obsm["celltype_pred_probs"] = X_celltype_cls_probs
+    index_to_celltype = {v: k for k, v in cell_type_to_index.items()}
+    adata_t.obs["predicted_celltype"] = [index_to_celltype[i] for i in np.argmax(X_celltype_cls_probs, axis=1)]
+    if "celltype" in adata_t.obs.columns:
+        adata_t.obs["celltype_id"] = adata_t.obs["celltype"].map(cell_type_to_index).astype(pd.CategoricalDtype(categories=list(cell_type_to_index.values())))
 
-        all_gene_ids, all_values = tokenized_all["genes"], tokenized_all["values"]
-        if logger is not None:
-            logger.info(f"Evaluating data using {all_gene_ids.shape[1]} tokens for each cell")
-
-        if next_layer_key in adata_t.layers:
-            tokenized_all_next, _ = tokenize_and_pad_batch(
-                all_counts_next,
-                gene_ids,
-                max_len=max_seq_len,
-                vocab=vocab,
-                pad_token=config.pad_token,
-                pad_value=config.pad_value,
-                append_cls=True,  # append <cls> token at the beginning
-                include_zero_gene=True,
-                sample_indices=gene_idx_list,
-                sampling_mode = config.get('sampling_mode', 'simple'),
-                nonzero_prop = config.get('nonzero_prop', 0.7),
-                fix_nonzero_prop =  config.get('fix_nonzero_prop', False),
-                hvg_inds = hvg_inds, 
-                non_hvg_size= config.get('non_hvg_size', 1000)
-            )
-            all_gene_ids_next, all_values_next = tokenized_all_next["genes"], tokenized_all_next["values"]
-
-        src_key_padding_mask = all_gene_ids.eq(vocab[config.pad_token])
-        with torch.no_grad(), torch.amp.autocast('cuda', enabled=config.amp):
-            #cell_embeddings = model.encode_batch(all_gene_ids,all_values.float(),
-            #    src_key_padding_mask=src_key_padding_mask,
-            #    batch_size=config.batch_size,
-            #    batch_labels=torch.from_numpy(batch_ids).long() if config.use_batch_label else None, # if config.DSBN else None,
-            #    time_step=0,
-            #    return_np=True,
-            #)
-            cell_embeddings, cell_embeddings_next, pert_preds, cls_preds, ps_preds, ps_preds_next, expr_dict = model.encode_batch_with_perturb(
-                all_gene_ids,
-                all_values.float(),
-                src_key_padding_mask=src_key_padding_mask,
-                batch_size=config.batch_size,
-                batch_labels=torch.from_numpy(batch_ids).long() if config.use_batch_label else None, # if config.DSBN else None,
-                pert_labels = torch.from_numpy(perturbation_indexes).long() if config.perturbation_input else None,
-                pert_labels_next = torch.from_numpy(perturbation_indexes_next).long() if next_cell_prediction else None,
-                sf = torch.Tensor(sf) if sizefactor else None,
-                time_step=0,
-                return_np=True,
-                predict_expr = predict_expr,
-                mvc_src = full_gene_ids,
-                sample = sample
-            )
-
-        cell_embeddings = cell_embeddings / np.linalg.norm(
-            cell_embeddings, axis=1, keepdims=True
-        )
-        cell_embeddings_next = cell_embeddings_next / np.linalg.norm(
-            cell_embeddings_next, axis=1, keepdims=True
-        )
-        adata_t.obsm["X_scGPT"] = cell_embeddings
-
-        adata_t.obsm["X_scGPT_next"] = cell_embeddings_next
-        #adata_t.obsm["X_pert_pred"] = pert_preds
-        if config.ps_weight >0:
-            adata_t.obsm["ps_pred"] = ps_preds
-        if config.next_cell_pred_type ==  'lochness':
-            adata_t.obsm["ps_pred_next"] = ps_preds_next 
-        for k in expr_dict:
-            adata_t.obsm[k] = expr_dict[k]
-        # require: genotype_to_index
-
-        # Assuming ret_adata.obsm['X_pert_pred'] is a numpy array or can be converted to one
-
-        # TODO: This is hardcoded to for genotype and celltype, change to a function in the future (will require major refactor of model and loader code)
-        # Convert logits to probabilities using softmax
-        X_genotype_cls_probs = np.exp(pert_preds) / np.sum(np.exp(pert_preds), axis=1, keepdims=True)
-        # Assign the probabilities back to the AnnData object
-        adata_t.obsm['X_pert_pred_probs'] = X_genotype_cls_probs  # backward compatibility
-        adata_t.obsm['genotype_pred_probs'] = X_genotype_cls_probs
-        # prompt: convert X_pert_pred_probs, which is the probabilities of each label, into label predictions, whose order is defined in genotype_to_index
-        # Convert probabilities to predicted labels
-        label_predictions = np.argmax(X_genotype_cls_probs, axis=1)
-        # Map predicted indices back to genotypes using genotype_to_index
-        # Assuming genotype_to_index is a dictionary where keys are indices and values are genotypes
-        index_to_genotype = {v: k for k, v in genotype_to_index.items()}
-        predicted_genotypes = [index_to_genotype[i] for i in label_predictions]
-        # Add the predicted genotypes to the AnnData object
-        adata_t.obs['predicted_genotype'] = predicted_genotypes
-        if perturbation_labels is not None:
-            adata_t.obs['genotype_id'] = adata_t.obs['genotype'].map(genotype_to_index).astype(pd.CategoricalDtype(categories=list(genotype_to_index.values())))
- 
-        X_celltype_cls_probs = np.exp(cls_preds) / np.sum(np.exp(cls_preds), axis=1, keepdims=True)
-        adata_t.obsm['X_cls_pred_probs'] = X_celltype_cls_probs # backward compatibility
-        adata_t.obsm['celltype_pred_probs'] = X_celltype_cls_probs
-        label_predictions_cls = np.argmax(X_celltype_cls_probs, axis=1)
-        index_to_celltype = {v: k for k, v in cell_type_to_index.items()}
-        predicted_celltypes = [index_to_celltype[i] for i in label_predictions_cls]
-        adata_t.obs['predicted_celltype'] = predicted_celltypes
-        if celltypes_labels is not None:
-            adata_t.obs['celltype_id'] = adata_t.obs['celltype'].map(cell_type_to_index).astype(pd.CategoricalDtype(categories=list(cell_type_to_index.values())))
     return adata_t
 
 
@@ -890,7 +815,7 @@ def wrapper_train(model, config, data_gen,
                     result = p.result()
                     metrics_to_log = result['metrics']
                     for key, img_path in result['images'].items():
-                        metrics_to_log[key]= wandb.Image(img_path)  
+                        metrics_to_log[key]= wandb.Image(img_path)
                     if metrics_to_log:
                         wandb.log(metrics_to_log)
                     logger.info(f'Finished {result["eval_dict_key"]} UMAP for epoch {result["epoch"]}')
@@ -913,13 +838,13 @@ def wrapper_train(model, config, data_gen,
                 logger = logger,
                 device = device
             )
-        val_loss, val_loss_next,  val_mvc, val_mvc_next, val_mre, val_mre_next, val_dab, val_cls, val_pert, val_ps, val_ps_next = evaluate(
+        val_loss, val_loss_next, val_mvc, val_mvc_next, val_mre, val_mre_next, val_dab, val_cls, val_pert, val_ps, val_ps_next = evaluate(
             model,
             loader=valid_loader,
             config=config,
-            vocab = vocab,
-            epoch = epoch,
-            device = device
+            vocab=vocab,
+            epoch=epoch,
+            device=device,
         )
         elapsed = time.time() - epoch_start_time
         if logger is not None:
@@ -937,7 +862,7 @@ def wrapper_train(model, config, data_gen,
             loss += (val_cls*int(config.cell_type_classifier)
                       + val_pert*int(config.genotype_classifier))
         elif config.next_cell_pred_type == 'pert':
-            loss += val_mvc_next 
+            loss += val_mvc_next
         else:
             loss += val_ps + val_ps_next 
         best_model_epoch =0
@@ -1017,7 +942,7 @@ def wrapper_train(model, config, data_gen,
                     result = p.result()
                     metrics_to_log = result['metrics']
                     for key, img_path in result['images'].items():
-                        metrics_to_log[key]= wandb.Image(img_path)  
+                        metrics_to_log[key]= wandb.Image(img_path)
                     if metrics_to_log:
                         wandb.log(metrics_to_log)
                     logger.info(f'Finished {result["eval_dict_key"]} UMAP for epoch {result["epoch"]}')
