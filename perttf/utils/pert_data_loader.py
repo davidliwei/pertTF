@@ -28,6 +28,54 @@ def add_batch_info(adata):
         adata.obs["batch_id"] = adata.obs["str_batch"].astype("category").cat.codes.values
 
 
+def build_fixed_perturbation_pairs(
+    adata: AnnData,
+    target_indices: np.ndarray,
+    control_indices: np.ndarray,
+    context_col: str = "celltype",
+    perturbation_col: str = "genotype",
+    control_value: str = "WT",
+    seed: Optional[int] = None,
+) -> np.ndarray:
+    """Pair every perturbed target with a fixed same-context control cell."""
+    target_indices = np.asarray(target_indices, dtype=np.int64)
+    control_indices = np.asarray(control_indices, dtype=np.int64)
+    if target_indices.size == 0 or control_indices.size == 0:
+        raise ValueError("Both target_indices and control_indices must be non-empty")
+    if target_indices.min() < 0 or control_indices.min() < 0 or target_indices.max() >= adata.n_obs or control_indices.max() >= adata.n_obs:
+        raise IndexError("Fixed perturbation pair indices are outside the AnnData bounds")
+
+    obs = adata.obs
+    controls = control_indices[
+        obs.iloc[control_indices][perturbation_col].to_numpy() == control_value
+    ]
+    if controls.size != control_indices.size:
+        raise ValueError(f"All control_indices must have {perturbation_col} == {control_value!r}")
+
+    target_perts = obs.iloc[target_indices][perturbation_col].to_numpy()
+    target_indices = target_indices[target_perts != control_value]
+    if target_indices.size == 0:
+        raise ValueError("No non-control perturbation targets were provided")
+
+    rng = np.random.default_rng(seed)
+    pairs = []
+    target_contexts = obs.iloc[target_indices][context_col].to_numpy()
+    for context in sorted(np.unique(target_contexts), key=str):
+        context_targets = target_indices[target_contexts == context]
+        control_contexts = obs.iloc[controls][context_col].to_numpy()
+        context_controls = controls[control_contexts == context]
+        if context_controls.size == 0:
+            raise ValueError(f"No {control_value!r} controls available for context {context!r}")
+
+        context_perts = obs.iloc[context_targets][perturbation_col].to_numpy()
+        for perturbation in sorted(np.unique(context_perts), key=str):
+            pert_targets = context_targets[context_perts == perturbation]
+            shuffled_controls = rng.permutation(context_controls)
+            selected_controls = np.resize(shuffled_controls, pert_targets.size)
+            pairs.extend(zip(selected_controls, pert_targets))
+
+    return np.asarray(pairs, dtype=np.int64)
+
 """
 STEPS TO TRAIN:
 create a PertTFDataManager First and use it generate loaders, validation and data_gen dictionary
@@ -61,6 +109,7 @@ class PertTFDataset(Dataset):
                  additional_ps_dict: dict = None, 
                  only_sample_wt_pert: bool = False,
                  size_factor_col: str = None,
+                 fixed_pairs: np.ndarray = None,
                  prediction_only: bool = False,
                  ):
         """
@@ -85,6 +134,18 @@ class PertTFDataset(Dataset):
         self.indices = indices if indices is not None else np.arange(len(self.adata.obs.index))
         self.next_cell_pred = next_cell_pred
         self.prediction_only = prediction_only
+        self.fixed_pairs = None if fixed_pairs is None else np.asarray(fixed_pairs, dtype=np.int64)
+        if self.fixed_pairs is not None:
+            if self.next_cell_pred != "pert":
+                raise ValueError("fixed_pairs are only supported when next_cell_pred='pert'")
+            if self.fixed_pairs.ndim != 2 or self.fixed_pairs.shape[1] != 2:
+                raise ValueError("fixed_pairs must have shape (n_pairs, 2)")
+            if self.fixed_pairs.size and (self.fixed_pairs.min() < 0 or self.fixed_pairs.max() >= self.adata.n_obs):
+                raise IndexError("fixed_pairs contain indices outside the AnnData bounds")
+            source_contexts = self.adata.obs.iloc[self.fixed_pairs[:, 0]]['celltype'].to_numpy()
+            target_contexts = self.adata.obs.iloc[self.fixed_pairs[:, 1]]['celltype'].to_numpy()
+            if not np.array_equal(source_contexts, target_contexts):
+                raise ValueError("Every fixed source-target pair must have the same celltype")
         self.use_ot = use_ot
         self.ot_params = ot_params
         self.ot_pickle_path = self.ot_params.get('ot_pickle_path', './._temp_ot.pickle')
@@ -219,7 +280,7 @@ class PertTFDataset(Dataset):
 
 
     def __len__(self):
-        return len(self.indices)
+        return len(self.fixed_pairs) if self.fixed_pairs is not None else len(self.indices)
 
     def _create_next_cell_pool(self):
         """Pre-computes a dictionary for fast sampling of the next cell."""
@@ -294,7 +355,7 @@ class PertTFDataset(Dataset):
         """
 
         # 1. Get the index for the current cell
-        current_cell_global_idx = self.indices[idx]
+        current_cell_global_idx = self.fixed_pairs[idx, 0] if self.fixed_pairs is not None else self.indices[idx]
 
         #current_cell_obs = self.adata.obs.iloc[current_cell_global_idx] # too slow
 
@@ -327,8 +388,13 @@ class PertTFDataset(Dataset):
             return sample
 
         # 3. Sample the next cell and its metadata
-        next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_idx, current_cell_celltype,  current_cell_genotype)
-        next_cell_global_idx = self.adata.obs.index.get_loc(next_cell_id)
+        if self.fixed_pairs is not None:
+            next_cell_global_idx = self.fixed_pairs[idx, 1]
+            next_cell_id = self.adata.obs.index[next_cell_global_idx]
+            next_pert_label_str = self.adata.obs.at[next_cell_id, 'genotype']
+        else:
+            next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_idx, current_cell_celltype,  current_cell_genotype)
+            next_cell_global_idx = self.adata.obs.index.get_loc(next_cell_id)
         
         # 4. Get expression data for the next cell
         next_expr = self.adata.layers[binned_layer_key][next_cell_global_idx]
@@ -590,11 +656,12 @@ class PertTFUniDataManager:
                 
         return data_gen
 
-    def _create_dataset_from_indices(self, indices):
+    def _create_dataset_from_indices(self, indices, fixed_pairs=None):
         """A helper function to create PertTFDataset from underlying adata."""
         perttf_dataset = PertTFDataset(
             self.adata, 
             indices=indices, 
+            fixed_pairs=fixed_pairs,
             # ot parameters
             use_ot=self.config.use_ot, 
             ot_params= self.config.get('ot_params', {}),
@@ -611,11 +678,21 @@ class PertTFUniDataManager:
         )
         return perttf_dataset
 
-    def _create_loaders_from_dataset(self, dataset, full_token_collator = False):
+    def _create_loaders_from_dataset(self, dataset, full_token_collator = False, shuffle=True, deterministic=False, seed=0):
         """A helper function to create dataloaders from PertTFDataset."""    
-        collator = self.collator if not full_token_collator else self.full_token_collator
+        if deterministic:
+            collator_config = dict(self.config)
+            collator_config.update({'deterministic': True, 'seed': seed})
+            collator = PertBatchCollator(
+                self.vocab,
+                self.gene_ids,
+                hvg_inds=self.hvg_inds,
+                **collator_config,
+            )
+        else:
+            collator = self.collator if not full_token_collator else self.full_token_collator
         loader = DataLoader(
-            dataset, batch_size=self.config.batch_size, shuffle=True,
+            dataset, batch_size=self.config.batch_size, shuffle=shuffle,
             num_workers=8, collate_fn=collator, pin_memory=True
         )
         return loader
@@ -625,6 +702,33 @@ class PertTFUniDataManager:
         data = self._create_dataset_from_indices(indices)
         loader = self._create_loaders_from_dataset(data, full_token)
         return data, loader
+
+    def get_fixed_perturbation_validation_loader(
+        self,
+        target_indices,
+        control_indices,
+        seed=None,
+        context_col="celltype",
+        perturbation_col="genotype",
+        control_value="WT",
+    ):
+        pairs = build_fixed_perturbation_pairs(
+            self.adata,
+            target_indices=target_indices,
+            control_indices=control_indices,
+            context_col=context_col,
+            perturbation_col=perturbation_col,
+            control_value=control_value,
+            seed=seed,
+        )
+        data = self._create_dataset_from_indices(target_indices, fixed_pairs=pairs)
+        loader = self._create_loaders_from_dataset(
+            data,
+            shuffle=False,
+            deterministic=True,
+            seed=0 if seed is None else seed,
+        )
+        return data, loader, pairs
 
     def get_train_valid_loaders(self, test_size: float = 0.1, train_indices = None, valid_indices = None, full_token_validate  = False, random_state = None):
         """Provides a single, standard train/validation split."""

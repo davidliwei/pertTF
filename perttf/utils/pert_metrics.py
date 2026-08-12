@@ -250,3 +250,25 @@ def labels_to_names(labels, index_to_name):
     if hasattr(labels, "detach"):
         labels = labels.detach().cpu().numpy()
     return np.asarray([index_to_name.get(int(value), str(int(value))) for value in labels])
+
+
+def flatten_native_metrics(mvc_next, metrics):
+    flattened = {"mvc_next": float(mvc_next)}
+    for mode, mode_results in metrics.items():
+        for name, value in mode_results["aggregate"].items():
+            flattened[f"{name}_{mode}"] = value
+    return flattened
+
+
+def resolve_native_checkpoint_score(native_metrics, metric_name, metric_mode):
+    namespace, name = metric_name.split("/", 1) if "/" in metric_name else ("native", metric_name)
+    if namespace != "native":
+        raise ValueError("Asynchronous cell_eval metrics cannot select checkpoints; use a native metric")
+    if metric_mode not in {"min", "max"}:
+        raise ValueError("perturbation_checkpoint_mode must be 'min' or 'max'")
+    if name not in native_metrics:
+        raise ValueError(f"Configured native checkpoint metric {name!r} was not produced")
+    value = float(native_metrics[name])
+    if not np.isfinite(value):
+        raise ValueError(f"Checkpoint metric {metric_name!r} is not finite: {value}")
+    return value, metric_name, metric_mode

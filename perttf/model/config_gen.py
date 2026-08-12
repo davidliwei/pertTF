@@ -53,6 +53,12 @@ def generate_config(parameter_dict,
     parameter_dict['perturbation_metric_sample_seed'] = parameter_dict.get(
       'perturbation_metric_sample_seed', parameter_dict.get('seed')
     )
+    parameter_dict['perturbation_checkpoint_metric'] = parameter_dict.get(
+      'perturbation_checkpoint_metric', 'native/mvc_next'
+    )
+    parameter_dict['perturbation_checkpoint_mode'] = parameter_dict.get(
+      'perturbation_checkpoint_mode', 'min'
+    )
     if parameter_dict['next_cell_pred_type'] == 'identity':
       parameter_dict['next_weight'] = 0
     #mask_ratio = config.mask_ratio

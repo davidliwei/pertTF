@@ -43,9 +43,12 @@ from ..utils.pert_data_loader import PertBatchCollator, PertTFDataset
 from ..utils.pert_metrics import (
     GroupMoments,
     compute_perturbation_metrics,
+    flatten_native_metrics,
+    group_moments_from_anndata,
     labels_to_names,
     normalize_expression,
     prediction_scale,
+    resolve_native_checkpoint_score,
 )
 from .expr_sampler import DistributionGenerator
 
@@ -439,6 +442,7 @@ def _run_evaluation_batches(
     device,
     apply_next_perturbation=False,
     compute_losses=True,
+    compute_fixed_perturbation=False,
     real_groups=None,
     cell_type_to_index=None,
     genotype_to_index=None,
@@ -460,7 +464,7 @@ def _run_evaluation_batches(
     criterion_mvc = GenerativeExpressionLoss()
     generator = DistributionGenerator(getattr(model, "distribution", None))
     prediction_modes = [prediction_modes] if isinstance(prediction_modes, str) else list(prediction_modes)
-    moments = {mode: GroupMoments() for mode in prediction_modes} if real_groups is not None else {}
+    moments = {mode: GroupMoments() for mode in prediction_modes} if compute_fixed_perturbation else {}
     index_to_celltype = {value: key for key, value in (cell_type_to_index or {}).items()}
     index_to_genotype = {value: key for key, value in (genotype_to_index or {}).items()}
     outputs = {} if collect_outputs else None
@@ -476,7 +480,9 @@ def _run_evaluation_batches(
     total_ps_next = 0.0
     total_mvc = 0.0
     total_mvc_next = 0.0
+    fixed_mvc_next = 0.0
     total_num = 0
+    fixed_num = 0
 
     pred_lochness_next = _cfg(config, "pred_lochness_next", None)
     if pred_lochness_next is not None:
@@ -502,10 +508,10 @@ def _run_evaluation_batches(
             perturbation_labels = batch_data["perturbation_labels"].to(device) if "perturbation_labels" in batch_data else None
             perturbation_labels_next = batch_data["perturbation_labels_next"].to(device) if apply_next_perturbation else None
             sf = batch_data["sf"].to(device) if use_size_factor and "sf" in batch_data else None
-            sf_next = batch_data["sf_next"].to(device) if compute_losses and use_size_factor else sf
+            sf_next = batch_data["sf_next"].to(device) if (compute_losses or compute_fixed_perturbation) and use_size_factor else sf
             src_key_padding_mask = input_gene_ids.eq(vocab[config.pad_token])
-            mvc_src = batch_data["full_gene_ids"].to(device) if (use_full_mvc_src or not _cfg(config, "mvc_masked_train", True)) and "full_gene_ids" in batch_data else None
-            use_mvc = predict_expr or real_groups is not None or _cfg(config, "GEPC", False)
+            mvc_src = batch_data["full_gene_ids"].to(device) if (compute_fixed_perturbation or use_full_mvc_src or not _cfg(config, "mvc_masked_train", True)) and "full_gene_ids" in batch_data else None
+            use_mvc = predict_expr or compute_fixed_perturbation or _cfg(config, "GEPC", False)
 
             with autocast_context(enabled=_cfg(config, "amp", False)) if device.type == "cuda" else autocast_context():
                 output_dict = model(
@@ -547,6 +553,10 @@ def _run_evaluation_batches(
                     loss_ps = criterion_ps(output_dict["ps_output"], batch_data["ps"].to(device)) if _cfg(config, "ps_weight", 0) > 0 else output_values.new_tensor(0.0)
                     loss_ps_next = criterion_ps(output_dict["ps_output_next"], batch_data["ps_next"].to(device)) if ps_next_training_weight > 0 else output_values.new_tensor(0.0)
 
+                if compute_fixed_perturbation:
+                    fixed_target_values_next = batch_data["full_expr_next"].to(device)
+                    fixed_loss_mvc_next = criterion_mvc(output_dict["mvc_output_next"], fixed_target_values_next, scale_factor=sf_next)
+
             if compute_losses:
                 total_loss += loss.item() * batch_size
                 total_loss_next += loss_mse_next.item() * batch_size
@@ -561,7 +571,9 @@ def _run_evaluation_batches(
                 total_ps_next += loss_ps_next.item() * batch_size
                 total_num += batch_size
 
-            if real_groups is not None:
+            if compute_fixed_perturbation:
+                fixed_mvc_next += fixed_loss_mvc_next.item() * batch_size
+                fixed_num += batch_size
                 contexts = labels_to_names(batch_data["celltype_labels"], index_to_celltype)
                 perturbations = labels_to_names(batch_data["perturbation_labels_next"], index_to_genotype)
                 for mode in prediction_modes:
@@ -594,6 +606,7 @@ def _run_evaluation_batches(
 
     result = {
         "losses": None,
+        "fixed_mvc_next": fixed_mvc_next / fixed_num if fixed_num else None,
         "metrics": {},
         "outputs": _concat_outputs(outputs) if collect_outputs else {},
     }
@@ -611,7 +624,7 @@ def _run_evaluation_batches(
             total_ps / total_num,
             total_ps_next / total_num,
         )
-    if real_groups is not None:
+    if compute_fixed_perturbation:
         result["metrics"] = {
             mode: compute_perturbation_metrics(
                 real_groups,
@@ -649,6 +662,7 @@ def evaluate(model: nn.Module,
         device,
         apply_next_perturbation=apply_next_perturbation,
         compute_losses=perturbation_reference_groups is None,
+        compute_fixed_perturbation=perturbation_reference_groups is not None,
         real_groups=perturbation_reference_groups,
         cell_type_to_index=cell_type_to_index,
         genotype_to_index=genotype_to_index,
@@ -829,7 +843,7 @@ def wrapper_train(model, config, data_gen,
     vocab = data_gen['vocab']
 
     optimizer_dict = create_optimizer_dict(model, device, config, num_batch_types)
-    best_val_loss = float("inf")
+    best_val_score = None
     best_avg_bio = 0.0
     best_model = None
     define_wandb_metrcis()
@@ -854,6 +868,22 @@ def wrapper_train(model, config, data_gen,
     # later, use the following to load json file
     #config_data = json.load(open(save_dir / 'config.json', 'r'))
     train_loader, valid_loader = data_gen['train_loader'], data_gen['valid_loader']
+    perturbation_validation = data_gen.get('perturbation_validation', False)
+    perturbation_reference_groups = None
+    if perturbation_validation:
+        reference_indices = np.unique(
+            np.concatenate([
+                data_gen['pert_valid_target_indices'],
+                data_gen['pert_valid_reference_control_indices'],
+            ])
+        )
+        perturbation_reference_groups = group_moments_from_anndata(
+            data_gen['adata_manager'].adata,
+            reference_indices,
+            layer=config.get('perturbation_metric_real_layer', None),
+            input_scale=config.get('perturbation_metric_real_scale', 'log1p'),
+            target_sum=config.get('perturbation_metric_target_sum', 10000.0),
+        ).finalize()
     executor = ProcessPoolExecutor(
         max_workers=4,
         initializer=init_plot_worker,
@@ -894,16 +924,51 @@ def wrapper_train(model, config, data_gen,
                 logger = logger,
                 device = device
             )
-        val_loss, val_loss_next, val_mvc, val_mvc_next, val_mre, val_mre_next, val_dab, val_cls, val_pert, val_ps, val_ps_next = evaluate(
-            model,
-            loader=valid_loader,
-            config=config,
-            vocab=vocab,
-            epoch=epoch,
-            device=device,
-        )
+        pert_validation = None
+        if perturbation_validation:
+            pert_validation = evaluate(
+                model,
+                loader=valid_loader,
+                config=config,
+                vocab=vocab,
+                perturbation_reference_groups=perturbation_reference_groups,
+                cell_type_to_index=data_gen['cell_type_to_index'],
+                genotype_to_index=data_gen['genotype_to_index'],
+                prediction_modes=config.get('perturbation_metric_modes', ['mean']),
+                target_sum=config.get('perturbation_metric_target_sum', 10000.0),
+                sample_seed=config.get('perturbation_metric_sample_seed', config.get('seed', None)),
+                device=device,
+            )
+            native_metrics = flatten_native_metrics(
+                pert_validation['fixed_mvc_next'],
+                pert_validation['metrics'],
+            )
+            score, selected_metric, selected_mode = resolve_native_checkpoint_score(
+                native_metrics,
+                config.get('perturbation_checkpoint_metric', 'native/mvc_next'),
+                config.get('perturbation_checkpoint_mode', 'min'),
+            )
+            pert_validation['checkpoint_score'] = score
+            pert_validation['checkpoint_metric'] = selected_metric
+            pert_validation['checkpoint_mode'] = selected_mode
+            metric_log = {'valid/mvc_next_fixed': pert_validation['fixed_mvc_next'], 'epoch': epoch}
+            for mode, mode_results in pert_validation['metrics'].items():
+                for name, value in mode_results['aggregate'].items():
+                    metric_log[f'valid/{name}_{mode}'] = value
+            metric_log['valid/checkpoint_score'] = score
+            wandb.log(metric_log)
+            logger.info(f"Fixed-pair perturbation validation: {metric_log}; checkpoint metric={selected_metric} mode={selected_mode}")
+        else:
+            val_loss, val_loss_next, val_mvc, val_mvc_next, val_mre, val_mre_next, val_dab, val_cls, val_pert, val_ps, val_ps_next = evaluate(
+                model,
+                loader=valid_loader,
+                config=config,
+                vocab=vocab,
+                epoch=epoch,
+                device=device,
+            )
         elapsed = time.time() - epoch_start_time
-        if logger is not None:
+        if logger is not None and not perturbation_validation:
             logger.info("-" * 89)
             logger.info(
                 f"| end of epoch {epoch:3d} | time: {elapsed:5.2f}s | "
@@ -913,21 +978,28 @@ def wrapper_train(model, config, data_gen,
                 f"valid ps {val_ps:5.4f} | valid ps_next {val_ps_next:5.4f} |"
             )
             logger.info("-" * 89)
-        loss = val_loss * 0.1
+        loss = val_loss * 0.1 if not perturbation_validation else pert_validation['checkpoint_score']
+        checkpoint_mode = 'min'
+        checkpoint_metric = 'legacy/validation_loss'
         if config.next_cell_pred_type == 'identity':
             loss += (val_cls*int(config.cell_type_classifier)
                       + val_pert*int(config.genotype_classifier))
         elif config.next_cell_pred_type == 'pert':
-            loss += val_mvc_next
+            if pert_validation is not None:
+                checkpoint_mode = pert_validation['checkpoint_mode']
+                checkpoint_metric = pert_validation['checkpoint_metric']
+            else:
+                loss += val_mvc_next
         else:
             loss += val_ps + val_ps_next 
         best_model_epoch =0
-        if loss < best_val_loss:
-            best_val_loss = loss
+        improved = best_val_score is None or (checkpoint_mode == 'min' and loss < best_val_score) or (checkpoint_mode == 'max' and loss > best_val_score)
+        if improved:
+            best_val_score = loss
             best_model = copy.deepcopy(model)
             best_model_epoch = epoch
             if logger is not None:
-                logger.info(f"Best model with score {best_val_loss:5.4f}")
+                logger.info(f"Best model with {checkpoint_metric} ({checkpoint_mode}) score {best_val_score:5.4f}")
 
         #if epoch % config.save_eval_interval == 0 or epoch == config.epochs:
         eval_expr_interval = max(round(2e5/len(train_loader.dataset)), abs(config.get('eval_expr_interval', 2))//2*2) # this must be even to match the save interval below

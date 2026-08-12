@@ -28,7 +28,9 @@ def produce_training_datasets(adata_input, config,
                               train_val_split = 0.2,
                               train_indices = None,
                               valid_indices = None,
-                              logger = None):
+                              logger = None,
+                              perturbation_validation_control_indices = None,
+                              perturbation_validation_reference_control_indices = None):
     """
     produce training datasets for from scRNA-seq 
     Args:
@@ -52,13 +54,33 @@ def produce_training_datasets(adata_input, config,
                                      expr_layer= input_layer_key)
     random_state = config.get('seed', None)
     t_data, t_loader, v_data, v_loader, data_info = test_manager.get_train_valid_loaders(test_size=train_val_split, train_indices=train_indices, valid_indices=valid_indices, full_token_validate=full_token_validate, random_state = random_state)
+    effective_next_cell_pred = config.get('next_cell_pred_type', next_cell_pred)
     data_info['train_loader'] = t_loader
     data_info['valid_loader'] = v_loader
     data_info['train_data'] = t_data
     data_info['valid_data'] = v_data
     data_info['cell_ids_train'] = t_data.get_adata_subset().obs.index
-    data_info['adata_sorted'] = v_data.get_adata_subset(next_cell_pred=next_cell_pred)
+    data_info['adata_sorted'] = v_data.get_adata_subset(next_cell_pred=effective_next_cell_pred)
     data_info['adata_manager'] = test_manager
+    if effective_next_cell_pred == "pert" and perturbation_validation_control_indices is not None:
+        perturbation_validation_target_indices = valid_indices if valid_indices is not None else v_data.indices
+        fixed_valid_data, fixed_valid_loader, fixed_pairs = test_manager.get_fixed_perturbation_validation_loader(
+            target_indices=perturbation_validation_target_indices,
+            control_indices=perturbation_validation_control_indices,
+            seed=random_state,
+        )
+        data_info['valid_data'] = fixed_valid_data
+        data_info['valid_loader'] = fixed_valid_loader
+        data_info['perturbation_validation'] = True
+        data_info['pert_valid_pairs'] = fixed_pairs
+        data_info['pert_valid_target_indices'] = np.asarray(perturbation_validation_target_indices)
+        data_info['pert_valid_control_indices'] = np.asarray(perturbation_validation_control_indices)
+        reference_control_indices = (
+            perturbation_validation_control_indices
+            if perturbation_validation_reference_control_indices is None
+            else perturbation_validation_reference_control_indices
+        )
+        data_info['pert_valid_reference_control_indices'] = np.asarray(reference_control_indices)
     data_info['n_perturb'] = data_info['num_genotypes']
     data_info['n_cls'] = data_info['num_cell_types']
     return data_info
