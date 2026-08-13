@@ -121,7 +121,7 @@ def train(model: nn.Module,
                 pert_labels = perturbation_labels if config.perturbation_input else None,
                 pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
                 sf = sf,
-                sf_next = sf,
+                sf_next = sf_next,
                 MVC=config.GEPC,
                 ECS=config.ecs_thres > 0,
                 CLS=config.get('cell_type_classifier', True),
@@ -295,7 +295,7 @@ def train(model: nn.Module,
                 pert_labels = perturbation_labels if config.perturbation_input else None,
                 pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
                 sf = sf,
-                sf_next = sf,
+                sf_next = sf_next,
                 MVC=config.GEPC,
                 ECS=config.ecs_thres > 0,
                 CLS=config.get('cell_type_classifier', True),
@@ -472,7 +472,7 @@ def evaluate(model: nn.Module,
             ps_score = batch_data["ps"].to(device) #added
             ps_score_next = batch_data["ps_next"].to(device) #added
             sf = batch_data['sf'].to(device)
-            sf_next = batch_data['sf'].to(device)
+            sf_next = batch_data['sf_next'].to(device)
             src_key_padding_mask = input_gene_ids.eq(vocab[config.pad_token])
             mvc_src = None if config.get('mvc_masked_train', True) else batch_data['full_gene_ids'].to(device)
             with torch.cuda.amp.autocast(enabled=config.amp):
@@ -484,7 +484,7 @@ def evaluate(model: nn.Module,
                     pert_labels = perturbation_labels if config.perturbation_input else None,
                     pert_labels_next = perturbation_labels_next if (config.next_weight >0 or has_lochness_next_pred )  else None,
                     sf = sf,
-                    sf_next = sf,
+                    sf_next = sf_next,
                     MVC=config.GEPC,
                     ECS=config.ecs_thres > 0,
                     CLS=config.get('cell_type_classifier', True),
