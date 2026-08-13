@@ -391,6 +391,7 @@ class PerturbationTFModel(BaseModel):
         pert_labels_next: Optional[Tensor] = None, # the second perturbation
         sf: Optional[Tensor] = None,
         output_to_cpu: bool = True,
+        time_step: Optional[int] = None,
         return_np: bool = False,
         predict_expr = False,
         mvc_src: Tensor = None, # optional MVC tensor of gene ids for MVC decoder
@@ -406,6 +407,8 @@ class PerturbationTFModel(BaseModel):
             batch_size (int): batch size for encoding
             batch_labels (Tensor): shape [N, n_batch_labels]
             output_to_cpu (bool): whether to move the output to cpu
+            time_step (int): the transformer token index to return. If None,
+                return the full transformer output.
             return_np (bool): whether to return numpy array
 
         Returns:
@@ -417,7 +420,11 @@ class PerturbationTFModel(BaseModel):
         # initialize the output tensor
         array_func = np.zeros if return_np else torch.zeros
         float32_ = np.float32 if return_np else torch.float32
-        shape = (N, self.d_model)
+        shape = (
+            (N, self.d_model)
+            if time_step is not None
+            else (N, src.size(1), self.d_model)
+        )
         outputs = array_func(shape, dtype=float32_)
         outputs_next = array_func(shape, dtype=float32_)
         # added for perturbation predictions
@@ -472,11 +479,13 @@ class PerturbationTFModel(BaseModel):
                 mvc_src=mvc_src_d,
             )
             raw_output = batch_output["transformer_output"].detach()
-            output = raw_output[:, 0, :].detach()
+            output = raw_output.detach()
             if output_to_cpu:
                 output = output.cpu()
             if return_np:
                 output = output.numpy()
+            if time_step is not None:
+                output = output[:, time_step, :]
             outputs[i : i + batch_size] = output
 
             cell_emb_next = batch_output["cell_emb_next"].detach()

@@ -107,7 +107,7 @@ class PertTFDataset(Dataset):
         self.sf = _get_sf(self.adata.layers[self.expr_layer]) if size_factor_col is None else adata.obs[size_factor_col].values.reshape(-1,1)
         self.next_cell_dict = None if self.prediction_only else self._create_next_cell_pool()
         self.only_sample_wt_pert = only_sample_wt_pert
-        if self.use_ot and self.next_cell_pred == "pert":
+        if self.use_ot and self.next_cell_pred == "pert" and not self.prediction_only:
             self._recalculate_ot()
         if self.next_cell_pred == "lochness" and not self.prediction_only:
             if ps_columns is None:
