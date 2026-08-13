@@ -430,8 +430,8 @@ def _run_evaluation_batches(
     config,
     vocab,
     device,
-    evaluate_next=True,
-    compute_standard_losses=True,
+    apply_next_perturbation=False,
+    compute_losses=True,
     collect_outputs=False,
     predict_expr=False,
     use_full_mvc_src=False,
@@ -478,16 +478,12 @@ def _run_evaluation_batches(
             batch_labels = batch_data["batch_labels"].to(device) if "batch_labels" in batch_data else None
             celltype_labels = batch_data["celltype_labels"].to(device) if "celltype_labels" in batch_data else None
             perturbation_labels = batch_data["perturbation_labels"].to(device) if "perturbation_labels" in batch_data else None
-            perturbation_labels_next = batch_data["perturbation_labels_next"].to(device) if "perturbation_labels_next" in batch_data else None
+            perturbation_labels_next = batch_data["perturbation_labels_next"].to(device) if apply_next_perturbation else None
             sf = batch_data["sf"].to(device) if use_size_factor and "sf" in batch_data else None
-            sf_next = batch_data["sf_next"].to(device) if compute_standard_losses and use_size_factor else sf
+            sf_next = batch_data["sf_next"].to(device) if compute_losses and use_size_factor else sf
             src_key_padding_mask = input_gene_ids.eq(vocab[config.pad_token])
             mvc_src = batch_data["full_gene_ids"].to(device) if (use_full_mvc_src or not _cfg(config, "mvc_masked_train", True)) and "full_gene_ids" in batch_data else None
             use_mvc = predict_expr or _cfg(config, "GEPC", False)
-            use_next_label = perturbation_labels_next is not None and (
-                (predict_expr and evaluate_next)
-                or (evaluate_next and (_cfg(config, "next_weight", 0) > 0 or has_lochness_next_pred))
-            )
 
             with autocast_context(enabled=_cfg(config, "amp", False)) if device.type == "cuda" else autocast_context():
                 output_dict = model(
@@ -496,11 +492,11 @@ def _run_evaluation_batches(
                     src_key_padding_mask=src_key_padding_mask,
                     batch_labels=batch_labels if _cfg(config, "use_batch_label", False) else None,
                     pert_labels=perturbation_labels if _cfg(config, "perturbation_input", False) else None,
-                    pert_labels_next=perturbation_labels_next if use_next_label else None,
+                    pert_labels_next=perturbation_labels_next,
                     sf=sf,
                     sf_next=sf_next,
                     MVC=use_mvc,
-                    ECS=_cfg(config, "ecs_thres", 0) > 0 and compute_standard_losses,
+                    ECS=_cfg(config, "ecs_thres", 0) > 0 and compute_losses,
                     CLS=_cfg(config, "cell_type_classifier", True) or collect_outputs,
                     PERTPRED=_cfg(config, "genotype_classifier", True) or collect_outputs,
                     PSPRED=_cfg(config, "ps_weight", 0) > 0 or collect_outputs,
@@ -508,18 +504,18 @@ def _run_evaluation_batches(
                 )
 
                 batch_size = input_gene_ids.shape[0]
-                if compute_standard_losses:
+                if compute_losses:
                     target_values = batch_data["target_values"].to(device)
                     target_values_next = batch_data["target_values_next"].to(device)
                     output_values = output_dict["mlm_output"]
                     masked_positions = input_values.eq(config.mask_value)
                     loss = criterion(output_values, target_values, masked_positions)
-                    loss_mse_next = criterion(output_values, target_values_next, masked_positions) if evaluate_next else output_values.new_tensor(0.0)
+                    loss_mse_next = criterion(output_values, target_values_next, masked_positions)
                     if _cfg(config, "GEPC", False):
                         mvc_target_values = target_values if _cfg(config, "mvc_masked_train", True) else batch_data["full_expr"].to(device)
                         mvc_target_values_next = target_values_next if _cfg(config, "mvc_masked_train", True) else batch_data["full_expr_next"].to(device)
                         loss_gepc = criterion_mvc(output_dict["mvc_output"], mvc_target_values, scale_factor=sf)
-                        loss_gepc_next = criterion_mvc(output_dict["mvc_output_next"], mvc_target_values_next, scale_factor=sf_next) if evaluate_next else output_values.new_tensor(0.0)
+                        loss_gepc_next = criterion_mvc(output_dict["mvc_output_next"], mvc_target_values_next, scale_factor=sf_next)
                     else:
                         loss_gepc = output_values.new_tensor(0.0)
                         loss_gepc_next = output_values.new_tensor(0.0)
@@ -529,14 +525,13 @@ def _run_evaluation_batches(
                     loss_ps = criterion_ps(output_dict["ps_output"], batch_data["ps"].to(device)) if _cfg(config, "ps_weight", 0) > 0 else output_values.new_tensor(0.0)
                     loss_ps_next = criterion_ps(output_dict["ps_output_next"], batch_data["ps_next"].to(device)) if ps_next_training_weight > 0 else output_values.new_tensor(0.0)
 
-            if compute_standard_losses:
+            if compute_losses:
                 total_loss += loss.item() * batch_size
                 total_loss_next += loss_mse_next.item() * batch_size
                 total_mvc += loss_gepc.item() * batch_size
                 total_mvc_next += loss_gepc_next.item() * batch_size
                 total_error += masked_relative_error(output_values, target_values, masked_positions).item() * batch_size
-                if evaluate_next:
-                    total_error_next += masked_relative_error(output_values, target_values_next, masked_positions).item() * batch_size
+                total_error_next += masked_relative_error(output_values, target_values_next, masked_positions).item() * batch_size
                 total_dab += loss_dab.item() * batch_size
                 total_cls += loss_cls.item() * batch_size
                 total_pert += loss_pert.item() * batch_size
@@ -546,7 +541,7 @@ def _run_evaluation_batches(
 
             if collect_outputs:
                 cell_embedding = output_dict["transformer_output"][:, 0, :]
-                next_emb = output_dict["cell_emb_next"] if use_next_label else cell_embedding
+                next_emb = output_dict["cell_emb_next"]
                 _append_tensor(outputs, "X_scGPT", cell_embedding)
                 _append_tensor(outputs, "X_scGPT_next", next_emb)
                 _append_tensor(outputs, "pert_logits", output_dict.get("pert_output"))
@@ -567,7 +562,7 @@ def _run_evaluation_batches(
         "losses": None,
         "outputs": _concat_outputs(outputs) if collect_outputs else {},
     }
-    if compute_standard_losses:
+    if compute_losses:
         result["losses"] = (
             total_loss / total_num,
             total_loss_next / total_num,
@@ -589,18 +584,18 @@ def evaluate(model: nn.Module,
             config,
             vocab,
             epoch = 0,
-            device = None,
-            evaluate_next = True) -> Any:
+            device = None) -> Any:
     """Evaluate the model using the shared DataLoader-backed inference loop."""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    apply_next_perturbation = _cfg(config, "next_cell_pred_type", "identity") != "identity"
     result = _run_evaluation_batches(
         model,
         loader,
         config,
         vocab,
         device,
-        evaluate_next=evaluate_next,
+        apply_next_perturbation=apply_next_perturbation,
     )
     losses = result["losses"]
     wandb.log(
@@ -660,13 +655,13 @@ def eval_testdata(
     if "genotype_next" in adata_t.obs.keys():
         adata_t = adata_t[adata_t.obs["genotype_next"].isin(genotype_to_index)].copy()
 
-    next_cell_prediction = False
+    apply_next_perturbation = False
     if _cfg(config, "next_cell_pred_type", "identity") == "pert":
-        next_cell_prediction = "genotype_next" in adata_t.obs.columns
-        if not next_cell_prediction:
+        apply_next_perturbation = "genotype_next" in adata_t.obs.columns
+        if not apply_next_perturbation:
             logger.warning("next cell pred is set to pert but the provided adata does not have genotype_next column")
     elif _cfg(config, "next_cell_pred_type", "identity") == "lochness":
-        next_cell_prediction = _cfg(config, "pred_lochness_next", 0) > 0 and "genotype_next" in adata_t.obs.columns
+        apply_next_perturbation = _cfg(config, "pred_lochness_next", 0) > 0 and "genotype_next" in adata_t.obs.columns
 
     sampling_mode = _cfg(config, "sampling_mode", "simple")
     hvg_inds = None
@@ -711,8 +706,8 @@ def eval_testdata(
         config,
         vocab,
         device,
-        evaluate_next=next_cell_prediction,
-        compute_standard_losses=False,
+        apply_next_perturbation=apply_next_perturbation,
+        compute_losses=False,
         collect_outputs="cls" in include_types,
         predict_expr=predict_expr,
         use_full_mvc_src=mvc_full_expr,

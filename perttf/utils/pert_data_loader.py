@@ -311,22 +311,20 @@ class PertTFDataset(Dataset):
             current_expr = current_expr.toarray().flatten()
 
         if self.prediction_only:
-            next_pert = (
-                self.adata.obs.at[current_cell_idx, 'genotype_next']
-                if 'genotype_next' in self.adata.obs.columns
-                else current_cell_genotype
-            )
-            return {
+            sample = {
                 "expr": current_expr,
                 "genes": curr_gene,
                 "celltype_labels": self.cell_type_to_index.get(current_cell_celltype, 0),
                 "perturbation_labels": self.genotype_to_index.get(current_cell_genotype, 0),
-                "perturbation_labels_next": self.genotype_to_index.get(next_pert, 0),
                 "batch_labels": current_cell_batch_label,
                 "sf": self.sf[current_cell_global_idx],
                 "index": current_cell_global_idx,
                 "name": current_cell_idx,
             }
+            if 'genotype_next' in self.adata.obs.columns:
+                next_pert = self.adata.obs.at[current_cell_idx, 'genotype_next']
+                sample["perturbation_labels_next"] = self.genotype_to_index.get(next_pert, 0)
+            return sample
 
         # 3. Sample the next cell and its metadata
         next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_idx, current_cell_celltype,  current_cell_genotype)
