@@ -1,7 +1,6 @@
 from torch import nn, Tensor
 from typing import Dict, Mapping, Optional, Tuple, Any, Union
 from tqdm import trange
-
 import numpy as np
 
 import torch
@@ -266,6 +265,7 @@ class PerturbationTFModel(BaseModel):
         transformer_output=transformer_output_0
             
         output = {}
+        output["transformer_output"] = transformer_output
         output["contrastive_dict"] = {}
         mlm_output = self.decoder(
             transformer_output
@@ -379,6 +379,7 @@ class PerturbationTFModel(BaseModel):
                 output["ps_output_next"] = self.ps_decoder(cell_emb_next)  # (batch, n_cls)
         return output
 
+    @torch.no_grad()
     def encode_batch_with_perturb(
         self,
         src: Tensor,
@@ -406,12 +407,12 @@ class PerturbationTFModel(BaseModel):
             batch_size (int): batch size for encoding
             batch_labels (Tensor): shape [N, n_batch_labels]
             output_to_cpu (bool): whether to move the output to cpu
-            time_step (int): the time step index in the transformer output to return.
-                The time step is along the second dimenstion. If None, return all.
+            time_step (int): the transformer token index to return. If None,
+                return the full transformer output.
             return_np (bool): whether to return numpy array
 
         Returns:
-            output Tensor tuple of shape [N, seq_len, embsize] and [N, n_pert]
+            output Tensor tuple containing cell embeddings and model predictions.
         """
         N = src.size(0)
         device = next(self.parameters()).device
@@ -427,15 +428,15 @@ class PerturbationTFModel(BaseModel):
         outputs = array_func(shape, dtype=float32_)
         outputs_next = array_func(shape, dtype=float32_)
         # added for perturbation predictions
-        shape_perts = (N, self.n_pert) if time_step is not None else (N, src.size(1), self.n_pert)
+        shape_perts = (N, self.n_pert)
         pert_outputs = array_func(shape_perts, dtype=float32_)
         
         # add for cls predictions
-        shape_cls = (N, self.n_cls) if time_step is not None else (N, src.size(1), self.n_cls)
+        shape_cls = (N, self.n_cls)
         cls_outputs = array_func(shape_cls, dtype=float32_)
 
         # added for PS score predictions
-        shape_ps = (N, self.n_ps) if time_step is not None else (N, src.size(1), self.n_ps)
+        shape_ps = (N, self.n_ps)
         ps_outputs =  array_func(shape_ps, dtype=float32_)
 
         if self.pred_lochness_next:
@@ -460,15 +461,24 @@ class PerturbationTFModel(BaseModel):
             batch_labels_d = batch_labels[i : i + batch_size].to(device) if batch_labels is not None else None
             pert_labels_d = pert_labels[i : i + batch_size].to(device) if pert_labels is not None else None
             pert_labels_next_d = pert_labels_next[i : i + batch_size].to(device) if pert_labels_next is not None else None
-            mvc_src_d = mvc_src[i:i+batch_size].to(device) if mvc_src is not None else None
-            sf_d = sf[i:i+batch_size].to(device) if sf is not None else None
-            raw_output = self._encode(
+            mvc_src_d = mvc_src[i : i + batch_size].to(device) if mvc_src is not None else None
+            sf_d = sf[i : i + batch_size].to(device) if sf is not None else None
+            batch_output = self(
                 src_d,
                 values_d,
                 src_key_padding_mask_d,
-                batch_labels_d,
-                input_pert_flags= pert_labels_d, # Do we use pert_flags for transformer input?
+                batch_labels=batch_labels_d,
+                pert_labels=pert_labels_d,
+                pert_labels_next=pert_labels_next_d,
+                sf=sf_d,
+                sf_next=sf_d,
+                CLS=True,
+                MVC=predict_expr,
+                PERTPRED=True,
+                PSPRED=self.ps_decoder is not None,
+                mvc_src=mvc_src_d,
             )
+            raw_output = batch_output["transformer_output"].detach()
             output = raw_output.detach()
             if output_to_cpu:
                 output = output.cpu()
@@ -478,35 +488,21 @@ class PerturbationTFModel(BaseModel):
                 output = output[:, time_step, :]
             outputs[i : i + batch_size] = output
 
-            #import pdb; pdb.set_trace()
-            cell_emb = self._get_cell_emb_from_layer(raw_output, values_d)
-            tf_concat = None
-            if pert_labels_next_d is not None:
-                pert_emb_next = self.pert_encoder(pert_labels_next_d)
-                tf_concat=torch.cat(
-                    [cell_emb,pert_emb_next], dim=1,
-                )
-                #tf_concat = cell_emb + pert_emb_next
-                cell_emb_next=self.pert_exp_encoder(tf_concat)
-                if output_to_cpu:
-                    cell_emb_next_cpu = cell_emb_next.cpu()
-                if return_np:
-                    cell_emb_next_cpu = cell_emb_next_cpu.numpy()
-                outputs_next[i : i + batch_size] = cell_emb_next_cpu
-            else:
-                #cell_emb_next=None
-                outputs_next[i : i + batch_size] = output
+            cell_emb_next = batch_output["cell_emb_next"].detach()
+            if output_to_cpu:
+                cell_emb_next = cell_emb_next.cpu()
+            if return_np:
+                cell_emb_next = cell_emb_next.numpy()
+            outputs_next[i : i + batch_size] = cell_emb_next if pert_labels_next_d is not None else output
             
-            pert_output = self.pert_decoder(cell_emb)
+            pert_output = batch_output["pert_output"].detach()
             if output_to_cpu:
                 pert_output = pert_output.cpu()
             if return_np:
                 pert_output = pert_output.numpy()
-            #if time_step is not None:
-            #    pert_output = pert_output[:, time_step, :]
             pert_outputs[i : i + batch_size] = pert_output
 
-            cls_output = self.cls_decoder(cell_emb)
+            cls_output = batch_output["cls_output"].detach()
             if output_to_cpu:
                 cls_output = cls_output.cpu()
             if return_np:
@@ -515,72 +511,43 @@ class PerturbationTFModel(BaseModel):
 
             # always check if ps decoder is used or not
             if self.ps_decoder is not None:
-                ps_output = self.ps_decoder(cell_emb)
+                ps_output = batch_output["ps_output"].detach()
                 if output_to_cpu:
                     ps_output = ps_output.cpu()
                 if return_np:
                     ps_output = ps_output.numpy()
-                ps_outputs[i : i + batch_size] = ps_output   
-            if self.pred_lochness_next:
-                if self.ps_decoder2 is not None:
-                    #import pdb; pdb.set_trace()
-                    ps_output_next = self.ps_decoder2(tf_concat)
+                ps_outputs[i : i + batch_size] = ps_output
+                ps_output_next = (
+                    batch_output["ps_output_next"].detach()
+                    if self.pred_lochness_next
+                    else batch_output["ps_output"].detach()
+                )
                 if output_to_cpu:
                     ps_output_next = ps_output_next.cpu()
                 if return_np:
                     ps_output_next = ps_output_next.numpy()
-                ps_outputs_next[i : i + batch_size] = ps_output_next   
-            else:
-                ps_outputs_next[i : i + batch_size] = ps_outputs[i : i + batch_size]
+                ps_outputs_next[i : i + batch_size] = ps_output_next
             
             if predict_expr:
-                if self.use_batch_labels:
-                    batch_emb = self.batch_encoder(batch_labels) 
-                
-                mlm_output = self.decoder(
-                    raw_output
-                    if not self.use_batch_labels
-                    else torch.cat(
-                    [
-                       raw_output,
-                       batch_emb.unsqueeze(1).repeat(1, raw_output.shape[1], 1),
-                    ],
-                    dim=2,
-                ),
-                # else transformer_output + batch_emb.unsqueeze(1),
-                )
-                cur_gene_token_embs = self.encoder(mvc_src_d) if mvc_src_d is not None else self.cur_gene_token_embs
-                mvc_output = self.mvc_decoder(
-                                cell_emb if not self.use_batch_labels
-                                else torch.cat([cell_emb, batch_emb], 
-                                dim=1
-                                ), # else cell_emb + batch_emb,
-                                cur_gene_token_embs,
-                                target_size_factor=sf_d,)
-                if pert_labels_next_d is not None:
-                    mvc_output_next = self.mvc_decoder(
-                                cell_emb_next if not self.use_batch_labels
-                                else torch.cat([cell_emb_next, batch_emb], 
-                                dim=1
-                                ), # else cell_emb + batch_emb,
-                                cur_gene_token_embs,
-                                target_size_factor=sf_d,)
-                else:
-                    mvc_output_next = mvc_output
-
-                mlm_pred, mlm_zero_probs = mlm_output['pred'], mlm_output['zero_probs'] if self.explicit_zero_prob else torch.ones_like(mlm_output['pred'])
+                mlm_pred = batch_output['mlm_output'].detach()
+                mlm_zero_probs = batch_output.get('mlm_zero_probs', torch.ones_like(mlm_pred)).detach()
+                if output_to_cpu:
+                    mlm_pred, mlm_zero_probs = mlm_pred.cpu(), mlm_zero_probs.cpu()
                 if return_np:
-                    mlm_pred, mlm_zero_probs = mlm_pred.cpu().numpy(), mlm_zero_probs.cpu().numpy() 
+                    mlm_pred, mlm_zero_probs = mlm_pred.numpy(), mlm_zero_probs.numpy()
                 mvc_generator = DistributionGenerator(self.distribution)
-                mvc_output = mvc_generator.generate(mvc_output, sample = sample, to_numpy = return_np, device = next(self.parameters()).device)
-                mvc_output_next = mvc_generator.generate(mvc_output_next, sample = sample, to_numpy = return_np, device = next(self.parameters()).device)
+                mvc_output = mvc_generator.generate(batch_output["mvc_output"], sample = sample, to_numpy = return_np, device = next(self.parameters()).device)
+                mvc_output_next = mvc_generator.generate(batch_output["mvc_output_next"], sample = sample, to_numpy = return_np, device = next(self.parameters()).device)
+                if output_to_cpu and not return_np:
+                    mvc_output = {key: value.cpu() if torch.is_tensor(value) else value for key, value in mvc_output.items()}
+                    mvc_output_next = {key: value.cpu() if torch.is_tensor(value) else value for key, value in mvc_output_next.items()}
                 mvc_pred, mvc_param2, mvc_zero_probs = mvc_output['pred'], mvc_output['param2'], mvc_output['zero_probs']
                 mvc_pred_next, mvc_param2_next, mvc_zero_probs_next = mvc_output_next['pred'], mvc_output_next['param2'], mvc_output_next['zero_probs']
-                mlm_outputs[i:i+batch_size], mvc_outputs[i:i+batch_size], mvc_next_outputs[i:i+batch_size] = mlm_pred, mvc_pred, mvc_pred_next
+                mlm_outputs[i : i + batch_size], mvc_outputs[i : i + batch_size], mvc_next_outputs[i : i + batch_size] = mlm_pred, mvc_pred, mvc_pred_next
                 if mvc_param2 is not None and mvc_param2_next is not None:
-                    mvc_param2_outputs[i:i+batch_size], mvc_next_param2_outputs[i:i+batch_size]  = mvc_param2, mvc_param2_next
+                    mvc_param2_outputs[i : i + batch_size], mvc_next_param2_outputs[i : i + batch_size]  = mvc_param2, mvc_param2_next
                 if self.explicit_zero_prob:
-                    mlm_zero_outputs[i:i+batch_size], mvc_zero_outputs[i:i+batch_size], mvc_next_zero_outputs[i:i+batch_size] = mlm_zero_probs, mvc_zero_probs,  mvc_zero_probs_next
+                    mlm_zero_outputs[i : i + batch_size], mvc_zero_outputs[i : i + batch_size], mvc_next_zero_outputs[i : i + batch_size] = mlm_zero_probs, mvc_zero_probs,  mvc_zero_probs_next
                 
 
         if predict_expr:
@@ -590,4 +557,3 @@ class PerturbationTFModel(BaseModel):
             if self.distribution in ['nb', 'hnb', 'zinb', 'zig']:
                 expr_dict['mvc_param2'], expr_dict['mvc_next_param2'] = (mvc_param2_outputs[:, 1:], mvc_next_param2_outputs[:, 1:])
         return outputs, outputs_next, pert_outputs, cls_outputs, ps_outputs, ps_outputs_next, expr_dict
-

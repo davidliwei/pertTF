@@ -1,7 +1,6 @@
 from typing import List, Tuple, Dict, Union, Optional, Literal
 import os
 import pickle
-from operator import itemgetter
 from sklearn.model_selection import train_test_split, KFold
 import torch
 import numpy as np
@@ -27,6 +26,7 @@ def add_batch_info(adata):
         adata.obs["str_batch"] = adata.obs["batch"]
         adata.obs["str_batch"] = adata.obs["str_batch"].astype(str)
         adata.obs["batch_id"] = adata.obs["str_batch"].astype("category").cat.codes.values
+
 
 """
 STEPS TO TRAIN:
@@ -60,7 +60,8 @@ class PertTFDataset(Dataset):
                  next_cell_pred: str = "identity", 
                  additional_ps_dict: dict = None, 
                  only_sample_wt_pert: bool = False,
-                 size_factor_col: str = None
+                 size_factor_col: str = None,
+                 prediction_only: bool = False,
                  ):
         """
         The PertTFDataset serves to interface with pytorch Dataloaders 
@@ -82,6 +83,8 @@ class PertTFDataset(Dataset):
         self.adata = adata
         self._check_anndata_content()
         self.indices = indices if indices is not None else np.arange(len(self.adata.obs.index))
+        self.next_cell_pred = next_cell_pred
+        self.prediction_only = prediction_only
         self.use_ot = use_ot
         self.ot_params = ot_params
         self.ot_pickle_path = self.ot_params.get('ot_pickle_path', './._temp_ot.pickle')
@@ -92,7 +95,6 @@ class PertTFDataset(Dataset):
         self.ot_cache = {} # Holds the map for the CURRENT indices
         
         self.expr_layer = expr_layer
-        self.next_cell_pred = next_cell_pred
         
         # Mappings
         self.cell_type_to_index = cell_type_to_index if cell_type_to_index is not None else {t: i for i, t in enumerate(self.adata.obs['celltype'].unique())}
@@ -103,11 +105,11 @@ class PertTFDataset(Dataset):
         # IMPORTANT: This dictionary only contains cells from the current data split (train/valid)
         # to prevent data leakage.
         self.sf = _get_sf(self.adata.layers[self.expr_layer]) if size_factor_col is None else adata.obs[size_factor_col].values.reshape(-1,1)
-        self.next_cell_dict = self._create_next_cell_pool()
+        self.next_cell_dict = None if self.prediction_only else self._create_next_cell_pool()
         self.only_sample_wt_pert = only_sample_wt_pert
-        if self.use_ot and self.next_cell_pred == "pert":
+        if self.use_ot and self.next_cell_pred == "pert" and not self.prediction_only:
             self._recalculate_ot()
-        if self.next_cell_pred == "lochness":
+        if self.next_cell_pred == "lochness" and not self.prediction_only:
             if ps_columns is None:
                 raise ValueError("PS columns must be provided for lochness prediction")
             if len(ps_columns) != len(ps_columns_perturbed_genes):
@@ -308,6 +310,22 @@ class PertTFDataset(Dataset):
         if issparse(current_expr):
             current_expr = current_expr.toarray().flatten()
 
+        if self.prediction_only:
+            sample = {
+                "expr": current_expr,
+                "genes": curr_gene,
+                "celltype_labels": self.cell_type_to_index.get(current_cell_celltype, 0),
+                "perturbation_labels": self.genotype_to_index.get(current_cell_genotype, 0),
+                "batch_labels": current_cell_batch_label,
+                "sf": self.sf[current_cell_global_idx],
+                "index": current_cell_global_idx,
+                "name": current_cell_idx,
+            }
+            if 'genotype_next' in self.adata.obs.columns:
+                next_pert = self.adata.obs.at[current_cell_idx, 'genotype_next']
+                sample["perturbation_labels_next"] = self.genotype_to_index.get(next_pert, 0)
+            return sample
+
         # 3. Sample the next cell and its metadata
         next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_idx, current_cell_celltype,  current_cell_genotype)
         next_cell_global_idx = self.adata.obs.index.get_loc(next_cell_id)
@@ -393,16 +411,18 @@ class PertBatchCollator:
         self.fix_nonzero_prop = config.get('fix_nonzero_prop', False)
         self.non_hvg_size = min(config.get('non_hvg_size', 1000), len(hvg_inds[1])) if hvg_inds is not None else 0
         self.hvg_inds = hvg_inds
+        self.deterministic = config.get('deterministic', False)
+        self.prediction_only = config.get('prediction_only', False)
+        self.seed = config.get('seed', 0)
 
     def __call__(self, batch: list) -> dict:
         """
         Processes a list of samples from the Dataset into a single batch tensor.
         """
 
-        # Define which items to get from each dictionary
-        get_values = itemgetter('expr', 'expr_next', 'genes', 'next_genes')
-        # Create an iterator of tuples, then unzip them into four separate lists
-        expr_list, expr_next_list, gene_list, gene_next_list = map(list, zip(*(get_values(item) for item in batch)))
+        expr_list = [item['expr'] for item in batch]
+        if not self.prediction_only:
+            expr_next_list = [item['expr_next'] for item in batch]
 
         # 2. Tokenize and pad the expression data for the current batch
         # max seq len determines the context window for pertTF transformer modeling
@@ -410,30 +430,34 @@ class PertBatchCollator:
         max_seq_len = self.max_seq_len if not self.full_tokenize else len(self.gene_ids) + self.append_cls
 
         # TODO: These functions may need to be modified to accomodate inputs w differing number of genes in the future
-        expr_mat, expr_mat_next = np.array(expr_list), np.array(expr_next_list)
+        expr_mat = np.array(expr_list)
+        rng = np.random.default_rng(self.seed) if self.deterministic else None
         tokenized, gene_idx_list = tokenize_and_pad_batch(
             expr_mat, self.gene_ids, max_len=max_seq_len,cls_token=self.cls_token,
             vocab=self.vocab, pad_token=self.pad_token, pad_value=self.pad_value,
             append_cls=self.append_cls, include_zero_gene=self.include_zero_gene, 
             cls_value=self.cls_value, sampling_mode = self.sampling_mode,
             fix_nonzero_prop=self.fix_nonzero_prop, nonzero_prop=self.nonzero_prop,
-            hvg_inds = self.hvg_inds, non_hvg_size= self.non_hvg_size
+            hvg_inds = self.hvg_inds, non_hvg_size= self.non_hvg_size,
+            rng=rng,
         )
-        tokenized_next, _ = tokenize_and_pad_batch(
-            expr_mat_next, self.gene_ids, max_len=max_seq_len, cls_token=self.cls_token,
-            vocab=self.vocab, pad_token=self.pad_token, pad_value=self.pad_value,
-            append_cls=self.append_cls, include_zero_gene=self.include_zero_gene, 
-            sample_indices=gene_idx_list, 
-            cls_value=self.cls_value, sampling_mode = self.sampling_mode,
-            fix_nonzero_prop=self.fix_nonzero_prop, nonzero_prop=self.nonzero_prop,
-            hvg_inds = self.hvg_inds, non_hvg_size= self.non_hvg_size
-        )
+        if not self.prediction_only:
+            expr_mat_next = np.array(expr_next_list)
+            tokenized_next, _ = tokenize_and_pad_batch(
+                expr_mat_next, self.gene_ids, max_len=max_seq_len, cls_token=self.cls_token,
+                vocab=self.vocab, pad_token=self.pad_token, pad_value=self.pad_value,
+                append_cls=self.append_cls, include_zero_gene=self.include_zero_gene,
+                sample_indices=gene_idx_list,
+                cls_value=self.cls_value, sampling_mode = self.sampling_mode,
+                fix_nonzero_prop=self.fix_nonzero_prop, nonzero_prop=self.nonzero_prop,
+                hvg_inds = self.hvg_inds, non_hvg_size= self.non_hvg_size
+            )
         
         # 3. Apply random masking for this batch
         masked_values = random_mask_value(
-            tokenized["values"], mask_ratio=self.mask_ratio,
+            tokenized["values"], mask_ratio=0 if self.deterministic or self.prediction_only else self.mask_ratio,
             mask_value=self.mask_value, pad_value=self.pad_value,
-            cls_value= self.cls_value
+            cls_value= self.cls_value, rng=rng,
         )
 
         # 4. Collate all other labels into tensors
@@ -441,18 +465,21 @@ class PertBatchCollator:
         full_gene_id = np.insert(self.gene_ids, 0, self.vocab[self.cls_token]) if self.append_cls else self.gene_ids
         full_gene_id = torch.from_numpy(full_gene_id).long()
         expr_mat = expr_mat if not self.append_cls else np.hstack([cls_vec, expr_mat])
-        expr_mat_next = expr_mat_next if not self.append_cls else np.hstack([cls_vec, expr_mat_next])
 
         collated_batch = {
             "gene_ids": tokenized["genes"],
-            "next_gene_ids": tokenized_next["genes"],
             "values": masked_values,
             "target_values": tokenized["values"],
-            "target_values_next": tokenized_next["values"],
             "full_expr": torch.Tensor(expr_mat),
-            "full_expr_next": torch.Tensor(expr_mat_next),
             "full_gene_ids": torch.stack([full_gene_id for i in range(len(batch))], dim = 0)
         }
+        if not self.prediction_only:
+            expr_mat_next = expr_mat_next if not self.append_cls else np.hstack([cls_vec, expr_mat_next])
+            collated_batch.update({
+                "next_gene_ids": tokenized_next["genes"],
+                "target_values_next": tokenized_next["values"],
+                "full_expr_next": torch.Tensor(expr_mat_next),
+            })
         
         # Stack scalar or vector labels from each item in the batch
         for key in batch[0].keys():
@@ -586,7 +613,7 @@ class PertTFUniDataManager:
 
     def _create_loaders_from_dataset(self, dataset, full_token_collator = False):
         """A helper function to create dataloaders from PertTFDataset."""    
-        collator = self.collator if not full_token_collator else self.full_token_collator 
+        collator = self.collator if not full_token_collator else self.full_token_collator
         loader = DataLoader(
             dataset, batch_size=self.config.batch_size, shuffle=True,
             num_workers=8, collate_fn=collator, pin_memory=True
