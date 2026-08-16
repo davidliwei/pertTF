@@ -48,7 +48,11 @@ def generate_config(parameter_dict,
       'perturbation_metric_fdr', 0.05
     )
     parameter_dict['perturbation_metric_min_cells'] = parameter_dict.get(
-      'perturbation_metric_min_cells', 3
+      'perturbation_metric_min_cells', 30
+    )
+    pairing_config = parameter_dict.get('pairing_config', {}) or {}
+    parameter_dict['perturbation_control_value'] = pairing_config.get(
+      'control_value', parameter_dict.get('perturbation_control_value', 'WT')
     )
     parameter_dict['perturbation_metric_sample_seed'] = parameter_dict.get(
       'perturbation_metric_sample_seed', parameter_dict.get('seed')

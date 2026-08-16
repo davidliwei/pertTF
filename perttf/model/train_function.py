@@ -629,9 +629,11 @@ def _run_evaluation_batches(
             mode: compute_perturbation_metrics(
                 real_groups,
                 mode_moments.finalize(),
-                control_value=_cfg(config, "perturbation_control_value", "WT"),
+                control_value=(_cfg(config, "pairing_config", {}) or {}).get(
+                    "control_value", _cfg(config, "perturbation_control_value", "WT")
+                ),
                 fdr_threshold=_cfg(config, "perturbation_metric_fdr", 0.05),
-                min_cells=_cfg(config, "perturbation_metric_min_cells", 3),
+                min_cells=_cfg(config, "perturbation_metric_min_cells", 30),
             )
             for mode, mode_moments in moments.items()
         }
@@ -764,6 +766,7 @@ def eval_testdata(
         next_cell_pred=_cfg(config, "next_cell_pred_type", "identity"),
         size_factor_col=_cfg(config, "size_factor_col", None),
         prediction_only=True,
+        config=config,
     )
     loader = DataLoader(
         dataset,
@@ -874,7 +877,7 @@ def wrapper_train(model, config, data_gen,
         reference_indices = np.unique(
             np.concatenate([
                 data_gen['pert_valid_target_indices'],
-                data_gen['pert_valid_reference_control_indices'],
+                data_gen['pert_valid_control_indices'],
             ])
         )
         perturbation_reference_groups = group_moments_from_anndata(

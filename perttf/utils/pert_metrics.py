@@ -133,7 +133,7 @@ def compute_perturbation_metrics(
     predicted_groups: Dict[Tuple[str, str], GroupStats],
     control_value="WT",
     fdr_threshold=0.05,
-    min_cells=3,
+    min_cells=30,
 ):
     """Compute perturbation metrics per context and macro-average them."""
     per_group = {}
@@ -209,7 +209,7 @@ def compute_metrics_from_anndata(
     target_sum=10000.0,
     control_value="WT",
     fdr_threshold=0.05,
-    min_cells=3,
+    min_cells=30,
 ):
     """Apply the same metric core to real and predicted AnnData outputs."""
     real_groups = group_moments_from_anndata(

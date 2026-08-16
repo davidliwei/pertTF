@@ -33,6 +33,19 @@ Pass train_loader, valid_loader and data_gen to the wrapper_train either once or
 
 """
 
+DEFAULT_PAIRING_CONFIG = {
+    "pairing_anchor": "source",
+    "source_indices": None,
+    "target_indices": None,
+    "source_selection": "all",
+    "target_selection": "all",
+    "identity_condition": "source",
+    "pair_schedule": "dynamic",
+    "target_sampling": "perturbation",
+    "pairing_seed": None,
+    "control_value": "WT",
+}
+
 class PertTFDataset(Dataset):
     """
     A PyTorch Dataset for AnnData objects that performs next-cell sampling on the fly.
@@ -60,16 +73,8 @@ class PertTFDataset(Dataset):
                  only_sample_wt_pert: bool = False,
                  size_factor_col: str = None,
                  prediction_only: bool = False,
-                 pairing_anchor: Literal["source", "target"] = "source",
-                 source_indices: Optional[np.ndarray] = None,
-                 target_indices: Optional[np.ndarray] = None,
-                 source_selection: Literal["strict", "all"] = "all",
-                 target_selection: Literal["strict", "all"] = "all",
-                 identity_condition: Optional[Literal["source"]] = "source",
-                 pair_schedule: Literal["dynamic", "fixed"] = "dynamic",
-                 target_sampling: Literal["cell", "perturbation"] = "perturbation",
-                 pairing_seed: Optional[int] = None,
-                 control_value: str = "WT",
+                 config=None,
+                 pairing_config=None,
                  ):
         """
         The PertTFDataset serves to interface with pytorch Dataloaders 
@@ -87,12 +92,7 @@ class PertTFDataset(Dataset):
             next_cell_pred (str): The mode for next cell prediction ("identity" or "pert" or "lochness").
             additional_ps_dict (dict): a dictionary {gene_name:ps} the pass the additional ps score for other genes to the training.
             only_sample_wt_pert: Legacy argument retained for callers; identity pairs now always reuse the source row.
-            pairing_anchor: Whether each dataset row starts from a source or target index.
-            source_selection: "strict" keeps only controls; "all" keeps all eligible sources.
-            target_selection: "strict" keeps only perturbed targets; "all" keeps all eligible targets.
-            identity_condition: "source" uses the source genotype; None uses the control condition.
-            pair_schedule: Resolve pairs once with "fixed" or per item with "dynamic".
-            target_sampling: Sample target cells directly or sample a perturbation before its target cell.
+            pairing_config: Loader-specific pairing overrides.
         """
         self.adata = adata
         self._check_anndata_content()
@@ -101,15 +101,30 @@ class PertTFDataset(Dataset):
         self.prediction_only = prediction_only
         self.use_ot = use_ot
         self.ot_params = ot_params
+        resolved_pairing_config = dict(DEFAULT_PAIRING_CONFIG)
+        if config is not None:
+            resolved_pairing_config["pairing_seed"] = config.get("seed", None)
+            resolved_pairing_config["control_value"] = config.get(
+                "perturbation_control_value", resolved_pairing_config["control_value"]
+            )
+            if not prediction_only:
+                resolved_pairing_config.update(dict(config.get("pairing_config", {}) or {}))
+        if not prediction_only:
+            resolved_pairing_config.update(dict(pairing_config or {}))
+        unknown_pairing_keys = set(resolved_pairing_config) - set(DEFAULT_PAIRING_CONFIG)
+        if unknown_pairing_keys:
+            raise ValueError(f"Unknown pairing_config keys: {sorted(unknown_pairing_keys)}")
+        source_indices = resolved_pairing_config.pop("source_indices")
+        target_indices = resolved_pairing_config.pop("target_indices")
         self._pairing_config = {
-            "pairing_anchor": pairing_anchor,
-            "source_selection": source_selection,
-            "target_selection": target_selection,
-            "identity_condition": identity_condition,
-            "pair_schedule": pair_schedule,
-            "target_sampling": target_sampling,
-            "seed": pairing_seed,
-            "control_value": control_value,
+            "pairing_anchor": resolved_pairing_config["pairing_anchor"],
+            "source_selection": resolved_pairing_config["source_selection"],
+            "target_selection": resolved_pairing_config["target_selection"],
+            "identity_condition": resolved_pairing_config["identity_condition"],
+            "pair_schedule": resolved_pairing_config["pair_schedule"],
+            "target_sampling": resolved_pairing_config["target_sampling"],
+            "seed": resolved_pairing_config["pairing_seed"],
+            "control_value": resolved_pairing_config["control_value"],
             "perturbation_mode": next_cell_pred == "pert" and not prediction_only,
             "ot_params": ot_params if use_ot and next_cell_pred == "pert" and not prediction_only else None,
         }
@@ -504,13 +519,13 @@ class PertTFUniDataManager:
                 
         return data_gen
 
-    def _create_dataset_from_indices(self, indices, **pairing_config):
+    def _create_dataset_from_indices(self, indices, use_ot=None, pairing_config=None):
         """A helper function to create PertTFDataset from underlying adata."""
         perttf_dataset = PertTFDataset(
             self.adata, 
             indices=indices, 
             # ot parameters
-            use_ot=self.config.use_ot, 
+            use_ot=self.config.use_ot if use_ot is None else use_ot,
             ot_params= self.config.get('ot_params', {}),
             # other parameters
             cell_type_to_index=self.cell_type_to_index, 
@@ -522,7 +537,8 @@ class PertTFUniDataManager:
             expr_layer=self.expr_layer, 
             only_sample_wt_pert=self.only_sample_wt_pert,
             size_factor_col = self.config.get('size_factor_col', None),
-            **pairing_config,
+            config=self.config,
+            pairing_config=pairing_config,
         )
         return perttf_dataset
 
@@ -534,6 +550,7 @@ class PertTFUniDataManager:
             collator = PertBatchCollator(
                 self.vocab,
                 self.gene_ids,
+                full_tokenize=full_token_collator,
                 hvg_inds=self.hvg_inds,
                 **collator_config,
             )
@@ -554,11 +571,13 @@ class PertTFUniDataManager:
         shuffle=True,
         deterministic=False,
         seed=0,
+        use_ot=None,
     ):
         indices = self.indices if indices is None and full_data else indices
         data = self._create_dataset_from_indices(
             indices,
-            **(pairing_config or {}),
+            use_ot=use_ot,
+            pairing_config=pairing_config,
         )
         loader = self._create_loaders_from_dataset(
             data,
@@ -570,17 +589,21 @@ class PertTFUniDataManager:
         return data, loader
 
     def get_train_valid_loaders(self, test_size: float = 0.1, train_indices = None, valid_indices = None, full_token_validate  = False, random_state = None):
-        """Provides a single, standard train/validation split."""
+        """Provides a standard identity or lochness train/validation split."""
+        if self.next_cell_pred_type == "pert":
+            raise ValueError("Perturbation splits must be provided through produce_training_datasets")
+        if (train_indices is None) != (valid_indices is None):
+            raise ValueError("train_indices and valid_indices must either both be provided or both be omitted")
         print(f"Creating a single train/validation split (test_size={test_size})...")
-        if train_indices is None or valid_indices is None:
+        if train_indices is None:
             indices = np.arange(self.adata.n_obs)
             train_indices, valid_indices = train_test_split(indices, test_size=test_size, shuffle=True, random_state=random_state)
         else:
             if len(set(train_indices).intersection(valid_indices)) > 0:
-                print('WARNING: training data and validation data are not separate, this may be okay for perturbation if the shared samples are ctrls')
+                raise ValueError("Training and validation indices overlap")
             print('overiding random train/valid split with provided indices')
         train_data, train_loader = self.get_data_w_loader(train_indices)
-        valid_data, valid_loader = self.get_data_w_loader(valid_indices, full_token=full_token_validate)
+        valid_data, valid_loader = self.get_data_w_loader(valid_indices, full_token=full_token_validate, shuffle=False)
         return train_data, train_loader, valid_data, valid_loader, self.get_adata_info_dict()
 
     def get_k_fold_split_loaders(self, cv = 5):
