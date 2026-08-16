@@ -64,11 +64,27 @@ def produce_training_datasets(adata_input, config,
     data_info['adata_manager'] = test_manager
     if effective_next_cell_pred == "pert" and perturbation_validation_control_indices is not None:
         perturbation_validation_target_indices = valid_indices if valid_indices is not None else v_data.indices
-        fixed_valid_data, fixed_valid_loader, fixed_pairs = test_manager.get_fixed_perturbation_validation_loader(
-            target_indices=perturbation_validation_target_indices,
-            control_indices=perturbation_validation_control_indices,
-            seed=random_state,
+        fixed_valid_data, fixed_valid_loader = test_manager.get_data_w_loader(
+            perturbation_validation_target_indices,
+            pairing_config={
+                'pairing_anchor': 'target',
+                'source_indices': perturbation_validation_control_indices,
+                'target_indices': perturbation_validation_target_indices,
+                'source_selection': 'strict',
+                'target_selection': 'strict',
+                'identity_condition': None,
+                'pair_schedule': 'fixed',
+                'target_sampling': 'cell',
+                'pairing_seed': random_state,
+                'control_value': 'WT',
+            },
+            shuffle=False,
+            deterministic=True,
+            seed=0 if random_state is None else random_state,
         )
+        if fixed_valid_data.pairs is None:
+            raise RuntimeError("Fixed perturbation validation did not produce stored pairs")
+        fixed_pairs = np.asarray([[pair.source_idx, pair.target_idx] for pair in fixed_valid_data.pairs], dtype=np.int64)
         data_info['valid_data'] = fixed_valid_data
         data_info['valid_loader'] = fixed_valid_loader
         data_info['perturbation_validation'] = True

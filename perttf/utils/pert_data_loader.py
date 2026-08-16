@@ -1,6 +1,4 @@
 from typing import List, Tuple, Dict, Union, Optional, Literal
-import os
-import pickle
 from sklearn.model_selection import train_test_split, KFold
 import torch
 import numpy as np
@@ -10,11 +8,11 @@ from torch import nn, Tensor
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from anndata import AnnData
-import anndata
 from scipy.sparse import issparse
 from sklearn.model_selection._split import _BaseKFold
 from .custom_tokenizer import tokenize_and_pad_batch, random_mask_value, SimpleVocab
 from .misc import _get_sf
+from .pert_pairing import ContextAwarePairing
 
 # add batch info 
 def add_batch_info(adata):
@@ -27,54 +25,6 @@ def add_batch_info(adata):
         adata.obs["str_batch"] = adata.obs["str_batch"].astype(str)
         adata.obs["batch_id"] = adata.obs["str_batch"].astype("category").cat.codes.values
 
-
-def build_fixed_perturbation_pairs(
-    adata: AnnData,
-    target_indices: np.ndarray,
-    control_indices: np.ndarray,
-    context_col: str = "celltype",
-    perturbation_col: str = "genotype",
-    control_value: str = "WT",
-    seed: Optional[int] = None,
-) -> np.ndarray:
-    """Pair every perturbed target with a fixed same-context control cell."""
-    target_indices = np.asarray(target_indices, dtype=np.int64)
-    control_indices = np.asarray(control_indices, dtype=np.int64)
-    if target_indices.size == 0 or control_indices.size == 0:
-        raise ValueError("Both target_indices and control_indices must be non-empty")
-    if target_indices.min() < 0 or control_indices.min() < 0 or target_indices.max() >= adata.n_obs or control_indices.max() >= adata.n_obs:
-        raise IndexError("Fixed perturbation pair indices are outside the AnnData bounds")
-
-    obs = adata.obs
-    controls = control_indices[
-        obs.iloc[control_indices][perturbation_col].to_numpy() == control_value
-    ]
-    if controls.size != control_indices.size:
-        raise ValueError(f"All control_indices must have {perturbation_col} == {control_value!r}")
-
-    target_perts = obs.iloc[target_indices][perturbation_col].to_numpy()
-    target_indices = target_indices[target_perts != control_value]
-    if target_indices.size == 0:
-        raise ValueError("No non-control perturbation targets were provided")
-
-    rng = np.random.default_rng(seed)
-    pairs = []
-    target_contexts = obs.iloc[target_indices][context_col].to_numpy()
-    for context in sorted(np.unique(target_contexts), key=str):
-        context_targets = target_indices[target_contexts == context]
-        control_contexts = obs.iloc[controls][context_col].to_numpy()
-        context_controls = controls[control_contexts == context]
-        if context_controls.size == 0:
-            raise ValueError(f"No {control_value!r} controls available for context {context!r}")
-
-        context_perts = obs.iloc[context_targets][perturbation_col].to_numpy()
-        for perturbation in sorted(np.unique(context_perts), key=str):
-            pert_targets = context_targets[context_perts == perturbation]
-            shuffled_controls = rng.permutation(context_controls)
-            selected_controls = np.resize(shuffled_controls, pert_targets.size)
-            pairs.extend(zip(selected_controls, pert_targets))
-
-    return np.asarray(pairs, dtype=np.int64)
 
 """
 STEPS TO TRAIN:
@@ -109,8 +59,17 @@ class PertTFDataset(Dataset):
                  additional_ps_dict: dict = None, 
                  only_sample_wt_pert: bool = False,
                  size_factor_col: str = None,
-                 fixed_pairs: np.ndarray = None,
                  prediction_only: bool = False,
+                 pairing_anchor: Literal["source", "target"] = "source",
+                 source_indices: Optional[np.ndarray] = None,
+                 target_indices: Optional[np.ndarray] = None,
+                 source_selection: Literal["strict", "all"] = "all",
+                 target_selection: Literal["strict", "all"] = "all",
+                 identity_condition: Optional[Literal["source"]] = "source",
+                 pair_schedule: Literal["dynamic", "fixed"] = "dynamic",
+                 target_sampling: Literal["cell", "perturbation"] = "perturbation",
+                 pairing_seed: Optional[int] = None,
+                 control_value: str = "WT",
                  ):
         """
         The PertTFDataset serves to interface with pytorch Dataloaders 
@@ -127,34 +86,34 @@ class PertTFDataset(Dataset):
             ps_columns_perturbed_genes (list, optional): List of perturbed genes for ps_columns. Only active if next_cell_red is "lochness". Have to be have the same length as ps_columns.
             next_cell_pred (str): The mode for next cell prediction ("identity" or "pert" or "lochness").
             additional_ps_dict (dict): a dictionary {gene_name:ps} the pass the additional ps score for other genes to the training.
-            only_sample_wt_pert: only random sample next cell for wild type cells
+            only_sample_wt_pert: Legacy argument retained for callers; identity pairs now always reuse the source row.
+            pairing_anchor: Whether each dataset row starts from a source or target index.
+            source_selection: "strict" keeps only controls; "all" keeps all eligible sources.
+            target_selection: "strict" keeps only perturbed targets; "all" keeps all eligible targets.
+            identity_condition: "source" uses the source genotype; None uses the control condition.
+            pair_schedule: Resolve pairs once with "fixed" or per item with "dynamic".
+            target_sampling: Sample target cells directly or sample a perturbation before its target cell.
         """
         self.adata = adata
         self._check_anndata_content()
-        self.indices = indices if indices is not None else np.arange(len(self.adata.obs.index))
+        indices = np.asarray(indices if indices is not None else np.arange(self.adata.n_obs), dtype=np.int64)
         self.next_cell_pred = next_cell_pred
         self.prediction_only = prediction_only
-        self.fixed_pairs = None if fixed_pairs is None else np.asarray(fixed_pairs, dtype=np.int64)
-        if self.fixed_pairs is not None:
-            if self.next_cell_pred != "pert":
-                raise ValueError("fixed_pairs are only supported when next_cell_pred='pert'")
-            if self.fixed_pairs.ndim != 2 or self.fixed_pairs.shape[1] != 2:
-                raise ValueError("fixed_pairs must have shape (n_pairs, 2)")
-            if self.fixed_pairs.size and (self.fixed_pairs.min() < 0 or self.fixed_pairs.max() >= self.adata.n_obs):
-                raise IndexError("fixed_pairs contain indices outside the AnnData bounds")
-            source_contexts = self.adata.obs.iloc[self.fixed_pairs[:, 0]]['celltype'].to_numpy()
-            target_contexts = self.adata.obs.iloc[self.fixed_pairs[:, 1]]['celltype'].to_numpy()
-            if not np.array_equal(source_contexts, target_contexts):
-                raise ValueError("Every fixed source-target pair must have the same celltype")
         self.use_ot = use_ot
         self.ot_params = ot_params
-        self.ot_pickle_path = self.ot_params.get('ot_pickle_path', './._temp_ot.pickle')
-        self.ot_top_k = self.ot_params.get('ot_top_k', 10)
-        self.ot_epsilon = self.ot_params.get('ot_epsilon', 0.5)
-        self.ot_max_dist = self.ot_params.get('ot_max_dist', np.inf)
-        self.ot_epsilon_scaler = self.ot_params.get('ot_epsilon_scaler', 0.01)
-        self.ot_cache = {} # Holds the map for the CURRENT indices
-        
+        self._pairing_config = {
+            "pairing_anchor": pairing_anchor,
+            "source_selection": source_selection,
+            "target_selection": target_selection,
+            "identity_condition": identity_condition,
+            "pair_schedule": pair_schedule,
+            "target_sampling": target_sampling,
+            "seed": pairing_seed,
+            "control_value": control_value,
+            "perturbation_mode": next_cell_pred == "pert" and not prediction_only,
+            "ot_params": ot_params if use_ot and next_cell_pred == "pert" and not prediction_only else None,
+        }
+        self._set_pairing(indices, source_indices, target_indices)
         self.expr_layer = expr_layer
         
         # Mappings
@@ -162,14 +121,9 @@ class PertTFDataset(Dataset):
         self.genotype_to_index = genotype_to_index if genotype_to_index is not None else {t: i for i, t in enumerate(self.adata.obs['genotype'].unique())}
         self.ps_columns = ps_columns or [] 
         self.ps_columns = list(self.ps_columns) # must be a list 
-        # For efficient next-cell sampling, pre-compute a dictionary of valid choices
-        # IMPORTANT: This dictionary only contains cells from the current data split (train/valid)
-        # to prevent data leakage.
         self.sf = _get_sf(self.adata.layers[self.expr_layer]) if size_factor_col is None else adata.obs[size_factor_col].values.reshape(-1,1)
-        self.next_cell_dict = None if self.prediction_only else self._create_next_cell_pool()
+        # Kept in the signature for existing callers; identity pairs now always use the source row itself.
         self.only_sample_wt_pert = only_sample_wt_pert
-        if self.use_ot and self.next_cell_pred == "pert" and not self.prediction_only:
-            self._recalculate_ot()
         if self.next_cell_pred == "lochness" and not self.prediction_only:
             if ps_columns is None:
                 raise ValueError("PS columns must be provided for lochness prediction")
@@ -200,162 +154,59 @@ class PertTFDataset(Dataset):
     def _check_anndata_content(self):
         assert 'genotype' in self.adata.obs.columns and 'celltype' in self.adata.obs.columns, 'no genotype or celltype column found in anndata'
         add_batch_info(self.adata)
-        
-    def set_new_indices(self, indices, next_cell_pool = True):
-        self.indices = indices
-        if next_cell_pool:
-            self.next_cell_dict = self._create_next_cell_pool()
 
-        if self.use_ot and self.next_cell_pred == "pert":
-            print(f"--- Indices Updated (N={len(indices)}). Recalculating OT Maps... ---")
-            self._recalculate_ot()
+    def _set_pairing(self, indices, source_indices=None, target_indices=None):
+        self.pairing = ContextAwarePairing(
+            self.adata,
+            indices,
+            source_indices=source_indices,
+            target_indices=target_indices,
+            **self._pairing_config,
+        )
+        self.indices = self.pairing.anchor_indices
+
+    @property
+    def pairs(self):
+        return self.pairing.pairs
+
+    def set_new_indices(self, indices):
+        self._set_pairing(np.asarray(indices, dtype=np.int64))
 
     def get_adata_subset(self, next_cell_pred = 'identity'):
         assert next_cell_pred in ['pert', 'identity', "lochness"], 'next_cell_pred can only be identity or pert or lochness'
 
-        adata_small = self.adata[self.indices,].copy()
         if next_cell_pred == "identity" :
-            return adata_small
+            return self.adata[self.indices,].copy()
         elif next_cell_pred == "lochness":
+            adata_small = self.adata[self.indices,].copy()
             adata_small.obs['genotype_next'] = adata_small.obs['genotype']
             return adata_small
         else:
-            #adata_small = self.adata[self.indices,].copy()
-            next_cell_id_list = []
-            next_pert_list = []
-            next_cell_global_idx_list = []
-            for i in self.indices:
-                current_cell_idx = self.adata.obs.index[i]
-                current_cell_celltype = self.adata.obs.at[current_cell_idx, 'celltype']
-                current_cell_genotype = self.adata.obs.at[current_cell_idx, 'genotype']
-                next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_idx, current_cell_celltype, current_cell_genotype)
-                next_cell_id_list.append(next_cell_id)
-                next_pert_list.append(next_pert_label_str)
-                next_cell_global_idx_list.append(self.adata.obs.index.get_loc(next_cell_id))
-            adata_small.obs['genotype_next'] = next_pert_list
-            adata_small.obs['next_cell_id'] = next_cell_id_list
-            adata_small.layers['next_expr'] = self.adata.layers[self.expr_layer][next_cell_global_idx_list]
-        return adata_small
+            pairs = self.pairing.pairs or tuple(self.pairing.resolve(i) for i in range(len(self.pairing)))
+            source_indices = [pair.source_idx for pair in pairs]
+            target_indices = [pair.target_idx for pair in pairs]
+            adata_small = self.adata[source_indices,].copy()
+            adata_small.obs['genotype_next'] = [pair.condition_label for pair in pairs]
+            adata_small.obs['next_cell_id'] = self.adata.obs.index[target_indices]
+            adata_small.layers['next_expr'] = self.adata.layers[self.expr_layer][target_indices]
+            return adata_small
     
 
-    def _recalculate_ot(self):
-        # 1. Create View
-        try:
-            from .ot import compute_ot_for_subset
-        except:
-            print('ott-jax import failed, please pip install ott-jax if use_ot = True; default back to random pairings')
-            self.use_ot = False
-            self.next_cell_dict = self._create_next_cell_pool()
-            return None
-        adata_subset = self.adata[self.indices]
-
-        # 2. Compute Maps (Pass the calculated threshold)
-        new_maps = compute_ot_for_subset(
-            adata_subset, 
-            top_k=self.ot_top_k, 
-            epsilon=self.ot_epsilon,
-            max_dist_sq=self.ot_max_dist, 
-            red_key='X_pca',
-            epsilon_scaler=self.ot_epsilon_scaler
-        )
-        
-        # 3. Update Cache & Pickle (Same as before)
-        self.ot_cache = new_maps
-        
-        if self.ot_pickle_path:
-            full_cache = {}
-            if os.path.exists(self.ot_pickle_path):
-                try:
-                    with open(self.ot_pickle_path, 'rb') as f:
-                        full_cache = pickle.load(f)
-                except Exception:
-                    pass # handle read error
-            
-            full_cache.update(new_maps)
-            try:
-                with open(self.ot_pickle_path, 'wb') as f:
-                    pickle.dump(full_cache, f)
-            except Exception as e:
-                print(f"Warning: Could not save OT pickle: {e}")
-
-
     def __len__(self):
-        return len(self.fixed_pairs) if self.fixed_pairs is not None else len(self.indices)
-
-    def _create_next_cell_pool(self):
-        """Pre-computes a dictionary for fast sampling of the next cell."""
-        if self.next_cell_pred != "pert":
-            return None
-            
-        next_cell_dict = {}
-        # Use only the subset of adata relevant to this dataset split
-        obs_subset = self.adata.obs.iloc[self.indices]
-        
-        for cell_type in obs_subset['celltype'].unique():
-            next_cell_dict[cell_type] = {}
-            for genotype in obs_subset['genotype'].unique():
-                # Find cells matching the criteria within the current split
-                mask = (obs_subset['celltype'] == cell_type) & (obs_subset['genotype'] == genotype)
-                included_cells_indices = obs_subset[mask].index.tolist()
-                if included_cells_indices:
-                    next_cell_dict[cell_type][genotype] = included_cells_indices
-        return next_cell_dict
-
-    def _sample_next_cell(self,  current_cell_idx, current_cell_celltype, current_cell_genotype):
-        """Samples a 'next cell' for a given current cell."""
-        #current_cell_id = current_cell_obs.name
-        #current_cell_type = current_cell_obs['celltype']
-        #current_genotype = current_cell_obs['genotype']
-
-        current_cell_id = current_cell_idx
-        current_cell_type = current_cell_celltype
-        current_genotype = current_cell_genotype
-
-        if self.next_cell_pred == "identity" or self.next_cell_pred == "lochness":
-            return current_cell_id, current_genotype
-
-        # Logic for perturbation prediction
-        valid_genotypes = self.next_cell_dict.get(current_cell_type, {})
-        if not valid_genotypes:
-             return current_cell_id, current_genotype # Fallback
-
-        if current_genotype == 'WT':
-            # Randomly select a different genotype
-            next_pert_value = random.choice(list(valid_genotypes.keys()))
-        else:
-            # Perturbed cells map to themselves (logic handled later)
-            next_pert_value = current_cell_genotype
-
-        # 2. OT Sampling (WT -> Perturbation only)
-        if self.use_ot and current_cell_genotype == 'WT' and next_pert_value != 'WT':
-            # Check if we have a valid OT map for this specific cell and target
-            if current_cell_idx in self.ot_cache:
-                if next_pert_value in self.ot_cache[current_cell_idx]:
-                    candidates, weights = self.ot_cache[current_cell_idx][next_pert_value]
-                    # Sample weighted choice
-                    next_cell_id = random.choices(candidates, weights=weights, k=1)[0]
-                    return next_cell_id, next_pert_value
-                else:
-                    return current_cell_idx, current_cell_genotype
-            else:
-                return current_cell_idx, current_cell_genotype
-        # 3. Fallback / Standard Logic
-        if next_pert_value == current_cell_genotype and self.only_sample_wt_pert:
-            # Perturbed cells (or WT mapped to WT) return themselves
-            return current_cell_idx, next_pert_value
-        else:
-            # Sample a random cell with the target cell type and genotype
-            possible_next_cells = valid_genotypes.get(next_pert_value, [current_cell_id])
-            next_cell_id = random.choice(possible_next_cells)
-            return next_cell_id, next_pert_value
+        return len(self.pairing)
     
     def __getitem__(self, idx: int):
         """
         Retrieves one sample from the dataset. This is where on-the-fly processing happens.
         """
 
-        # 1. Get the index for the current cell
-        current_cell_global_idx = self.fixed_pairs[idx, 0] if self.fixed_pairs is not None else self.indices[idx]
+        anchor_idx = self.indices[idx]
+        pair = None
+        if self.prediction_only:
+            current_cell_global_idx = int(anchor_idx)
+        else:
+            pair = self.pairing.resolve(idx)
+            current_cell_global_idx = pair.source_idx
 
         #current_cell_obs = self.adata.obs.iloc[current_cell_global_idx] # too slow
 
@@ -387,14 +238,11 @@ class PertTFDataset(Dataset):
                 sample["perturbation_labels_next"] = self.genotype_to_index.get(next_pert, 0)
             return sample
 
-        # 3. Sample the next cell and its metadata
-        if self.fixed_pairs is not None:
-            next_cell_global_idx = self.fixed_pairs[idx, 1]
-            next_cell_id = self.adata.obs.index[next_cell_global_idx]
-            next_pert_label_str = self.adata.obs.at[next_cell_id, 'genotype']
-        else:
-            next_cell_id, next_pert_label_str = self._sample_next_cell(current_cell_idx, current_cell_celltype,  current_cell_genotype)
-            next_cell_global_idx = self.adata.obs.index.get_loc(next_cell_id)
+        # 3. Resolve the target selected by the pairing policy
+        assert pair is not None
+        next_cell_global_idx = pair.target_idx
+        next_cell_id = self.adata.obs.index[next_cell_global_idx]
+        next_pert_label_str = pair.condition_label
         
         # 4. Get expression data for the next cell
         next_expr = self.adata.layers[binned_layer_key][next_cell_global_idx]
@@ -656,12 +504,11 @@ class PertTFUniDataManager:
                 
         return data_gen
 
-    def _create_dataset_from_indices(self, indices, fixed_pairs=None):
+    def _create_dataset_from_indices(self, indices, **pairing_config):
         """A helper function to create PertTFDataset from underlying adata."""
         perttf_dataset = PertTFDataset(
             self.adata, 
             indices=indices, 
-            fixed_pairs=fixed_pairs,
             # ot parameters
             use_ot=self.config.use_ot, 
             ot_params= self.config.get('ot_params', {}),
@@ -674,7 +521,8 @@ class PertTFUniDataManager:
             additional_ps_dict = self.additional_ps_dict,  
             expr_layer=self.expr_layer, 
             only_sample_wt_pert=self.only_sample_wt_pert,
-            size_factor_col = self.config.get('size_factor_col', None)
+            size_factor_col = self.config.get('size_factor_col', None),
+            **pairing_config,
         )
         return perttf_dataset
 
@@ -697,38 +545,29 @@ class PertTFUniDataManager:
         )
         return loader
 
-    def get_data_w_loader(self, indices = None, full_data = False, full_token = False):
-        indices = self.indices if indices is None and full_data else indices
-        data = self._create_dataset_from_indices(indices)
-        loader = self._create_loaders_from_dataset(data, full_token)
-        return data, loader
-
-    def get_fixed_perturbation_validation_loader(
+    def get_data_w_loader(
         self,
-        target_indices,
-        control_indices,
-        seed=None,
-        context_col="celltype",
-        perturbation_col="genotype",
-        control_value="WT",
+        indices=None,
+        full_data=False,
+        full_token=False,
+        pairing_config=None,
+        shuffle=True,
+        deterministic=False,
+        seed=0,
     ):
-        pairs = build_fixed_perturbation_pairs(
-            self.adata,
-            target_indices=target_indices,
-            control_indices=control_indices,
-            context_col=context_col,
-            perturbation_col=perturbation_col,
-            control_value=control_value,
-            seed=seed,
+        indices = self.indices if indices is None and full_data else indices
+        data = self._create_dataset_from_indices(
+            indices,
+            **(pairing_config or {}),
         )
-        data = self._create_dataset_from_indices(target_indices, fixed_pairs=pairs)
         loader = self._create_loaders_from_dataset(
             data,
-            shuffle=False,
-            deterministic=True,
-            seed=0 if seed is None else seed,
+            full_token_collator=full_token,
+            shuffle=shuffle,
+            deterministic=deterministic,
+            seed=seed,
         )
-        return data, loader, pairs
+        return data, loader
 
     def get_train_valid_loaders(self, test_size: float = 0.1, train_indices = None, valid_indices = None, full_token_validate  = False, random_state = None):
         """Provides a single, standard train/validation split."""
@@ -754,148 +593,3 @@ class PertTFUniDataManager:
         for fold, (train_indices, valid_indices) in enumerate(kf.split(self.indices)):
             print(f"--- Yielding data loaders for Fold {fold+1}/{kf.n_splits} ---")
             yield self.get_train_valid_loaders(train_indices = train_indices, valid_indices = valid_indices, full_token_validate  = False)
-
-
-
-"""
-The following classes attempt to implement a crude solution for dealing with large amount of single cell datasets
-The General Idea is as follows:
-1. Massive datasets should be processed into relatively unfied format (prefer Anndata) and placed on disk.
-1. Create Manifest that contains the meta data of all cells and raw files of each cell
-2. Train/valid split based on Manifest
-3. Memory constraints are shifted to I/O via on the fly read/loading of each cell with Anndata backed='r' or equivalent
-4. Collators and other preprocessing functions should remain unchanged
-5. This should also accomodate the case of a single massive dataset
-"""
-
-import pandas as pd
-import anndata
-
-class PertTFMultiDataManager:
-    """Unfinished Implementation"""
-    def __init__(self, data_directory: str, config: object):
-        self.config = config
-        self.data_directory = data_directory
-        
-        # 1. Create or load the global manifest
-        self.manifest_path = "global_manifest.parquet"
-        if not os.path.exists(self.manifest_path):
-            print("Creating global manifest...")
-            self.manifest = self._create_manifest()
-        else:
-            print("Loading existing manifest...")
-            self.manifest = pd.read_parquet(self.manifest_path)
-
-        # 2. Create global mappings from the manifest
-        print("Creating global vocab and mappings...")
-        self.cell_type_to_index = {t: i for i, t in enumerate(self.manifest['celltype'].unique())}
-        self.genotype_to_index = {t: i for i, t in enumerate(self.manifest['genotype'].unique())}
-        # Assume genes are consistent across files, or create a global gene list
-        # by inspecting the first file.
-        first_adata = anndata.read_h5ad(self.manifest['file_path'].iloc[0])
-        self.genes = first_adata.var.index.tolist()
-        self.vocab = self._create_vocab()
-        self.gene_ids = np.array(self.vocab(self.genes), dtype=int)
-
-        # Collators can remain largely the same!
-        self.collator = PertBatchCollator(...)
-        
-    def _create_manifest(self):
-        all_obs = []
-        h5ad_files = glob.glob(f"{self.data_directory}/*.h5ad")
-        for file_path in h5ad_files:
-            adata = anndata.read_h5ad(file_path, backed='r')
-            obs_df = adata.obs.copy()
-            obs_df['file_path'] = file_path
-            obs_df['index_in_file'] = np.arange(adata.n_obs)
-            all_obs.append(obs_df)
-        
-        manifest_df = pd.concat(all_obs)
-        manifest_df.to_parquet(self.manifest_path)
-        return manifest_df
-
-    # ... other methods ...
-
-
-class PertTFMultiDataset(Dataset):
-    """Unifinished Implementation"""
-    def __init__(self, manifest_df: pd.DataFrame, cell_type_to_index: dict, genotype_to_index: dict):
-        """
-        Initializes with a manifest DataFrame for a specific data split (e.g., train or valid).
-        """
-        self.manifest = manifest_df.reset_index(drop=True)
-        self.cell_type_to_index = cell_type_to_index
-        self.genotype_to_index = genotype_to_index
-        self.expr_layer = 'X_binned'
-        # ... other configs ...
-
-        # The sampling pool is now built from the manifest, not an AnnData object.
-        # This is fast and memory-efficient.
-        self.next_cell_dict = self._create_next_cell_pool()
-
-    def __len__(self):
-        return len(self.manifest)
-
-    def _create_next_cell_pool(self):
-        """Pre-computes a dictionary for sampling using the manifest."""
-        next_cell_dict = {}
-        # Group by celltype and genotype to find valid indices within the manifest
-        for (cell_type, genotype), group in self.manifest.groupby(['celltype', 'genotype']):
-            if cell_type not in next_cell_dict:
-                next_cell_dict[cell_type] = {}
-            # Store the manifest indices (0, 1, 2...) for this group
-            next_cell_dict[cell_type][genotype] = group.index.tolist()
-        return next_cell_dict
-
-    def _get_cell_data(self, manifest_idx: int):
-        """Helper to load data for a single cell from disk using its manifest index."""
-        cell_info = self.manifest.iloc[manifest_idx]
-        file_path = cell_info['file_path']
-        index_in_file = cell_info['index_in_file']
-        
-        # Use backed mode for memory-efficient reading of a single row
-        adata_slice = anndata.read_h5ad(file_path, backed='r')
-        expr = adata_slice.layers[self.expr_layer][index_in_file]
-        if issparse(expr):
-            expr = expr.toarray().flatten()
-            
-        return expr, cell_info
-
-    def __getitem__(self, idx: int):
-        """
-        Retrieves one sample by reading from disk on the fly.
-        """
-        # 1. Get current cell's metadata and expression data
-        current_expr, current_cell_info = self._get_cell_data(idx)
-
-        # 2. Sample the next cell using the manifest-based pool
-        # This logic remains very similar, but now returns a manifest index
-        next_cell_manifest_idx, next_pert_label_str = self._sample_next_cell(current_cell_info)
-        
-        # 3. Get next cell's expression data
-        next_expr, next_cell_info = self._get_cell_data(next_cell_manifest_idx)
-        
-        # 4. Assemble the sample dictionary (similar to your original code)
-        # ... use current_cell_info and next_cell_info to get labels ...
-        sample = {
-            "expr": current_expr,
-            "expr_next": next_expr,
-            # ... other key-value pairs
-        }
-        return sample
-
-    def _sample_next_cell(self, current_cell_info):
-        """Samples a 'next cell' using the manifest index."""
-        # This logic is adapted to use the manifest and its indices
-        current_cell_type = current_cell_info['celltype']
-        current_genotype = current_cell_info['genotype']
-        current_manifest_idx = current_cell_info.name # .name holds the manifest index
-
-        # ... (sampling logic similar to before, but now chooses a manifest index
-        # from self.next_cell_dict) ...
-
-        # For example:
-        #possible_next_indices = self.next_cell_dict[target_cell_type][target_genotype]
-        #next_manifest_idx = random.choice(possible_next_indices)
-        
-        #return next_manifest_idx, target_genotype
