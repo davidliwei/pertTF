@@ -35,9 +35,11 @@ def generate_config(parameter_dict,
     parameter_dict['sampling_mode']  = parameter_dict.get('sampling_mode', 'simple')
     parameter_dict['fix_nonzero_prop'] = parameter_dict.get('fix_nonzero_prop', False)
     parameter_dict['nonzero_prop'] = parameter_dict.get('nonzero_prop', 0.9)
-    parameter_dict['perturbation_metric_modes'] = parameter_dict.get(
-      'perturbation_metric_modes', ['mean', 'sample']
+    parameter_dict['perturbation_metric_mode'] = parameter_dict.get(
+      'perturbation_metric_mode', 'sample'
     )
+    if parameter_dict['perturbation_metric_mode'] not in {'mean', 'sample'}:
+      raise ValueError("perturbation_metric_mode must be 'mean' or 'sample'")
     parameter_dict['perturbation_metric_target_sum'] = parameter_dict.get(
       'perturbation_metric_target_sum', 10000.0
     )
@@ -48,10 +50,17 @@ def generate_config(parameter_dict,
       'perturbation_metric_fdr', 0.05
     )
     parameter_dict['perturbation_metric_min_cells'] = parameter_dict.get(
-      'perturbation_metric_min_cells', 3
+      'perturbation_metric_min_cells', 30
+    )
+    pairing_config = parameter_dict.get('pairing_config', {}) or {}
+    parameter_dict['perturbation_control_value'] = pairing_config.get(
+      'control_value', parameter_dict.get('perturbation_control_value', 'WT')
     )
     parameter_dict['perturbation_metric_sample_seed'] = parameter_dict.get(
       'perturbation_metric_sample_seed', parameter_dict.get('seed')
+    )
+    parameter_dict['perturbation_checkpoint_metric'] = parameter_dict.get(
+      'perturbation_checkpoint_metric', 'mvc_next'
     )
     if parameter_dict['next_cell_pred_type'] == 'identity':
       parameter_dict['next_weight'] = 0

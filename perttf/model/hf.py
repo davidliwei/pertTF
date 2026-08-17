@@ -629,6 +629,10 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         amp_dtype: Optional[str] = None,
         log_interval: Optional[int] = None,
         seed: Optional[int] = None,
+        train_indices=None,
+        valid_indices=None,
+        stratify_by=None,
+        split_check_columns=None,
     ):
         import random
         import numpy as np
@@ -713,6 +717,10 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             vocab=self.vocab,
             ps_columns=ps_columns,
             train_val_split=train_val_split,
+            train_indices=train_indices,
+            valid_indices=valid_indices,
+            stratify_by=stratify_by,
+            split_check_columns=split_check_columns,
         )
 
         if device is None:

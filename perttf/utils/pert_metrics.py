@@ -133,7 +133,7 @@ def compute_perturbation_metrics(
     predicted_groups: Dict[Tuple[str, str], GroupStats],
     control_value="WT",
     fdr_threshold=0.05,
-    min_cells=3,
+    min_cells=30,
 ):
     """Compute perturbation metrics per context and macro-average them."""
     per_group = {}
@@ -209,7 +209,7 @@ def compute_metrics_from_anndata(
     target_sum=10000.0,
     control_value="WT",
     fdr_threshold=0.05,
-    min_cells=3,
+    min_cells=30,
 ):
     """Apply the same metric core to real and predicted AnnData outputs."""
     real_groups = group_moments_from_anndata(
@@ -250,3 +250,31 @@ def labels_to_names(labels, index_to_name):
     if hasattr(labels, "detach"):
         labels = labels.detach().cpu().numpy()
     return np.asarray([index_to_name.get(int(value), str(int(value))) for value in labels])
+
+
+CHECKPOINT_METRIC_DIRECTIONS = {
+    "mvc_next": "min",
+    "pearson_delta_mean": "max",
+    "pearson_delta_sample": "max",
+    "mse_delta_mean": "min",
+    "mse_delta_sample": "min",
+    "ttest_de_overlap_at_n_mean": "max",
+    "ttest_de_overlap_at_n_sample": "max",
+    "ttest_de_direction_match_mean": "max",
+    "ttest_de_direction_match_sample": "max",
+}
+
+
+def resolve_checkpoint_score(validation_metrics, metric_name):
+    if metric_name not in CHECKPOINT_METRIC_DIRECTIONS:
+        raise ValueError(
+            f"Metric {metric_name!r} cannot select checkpoints; choose one of "
+            f"{sorted(CHECKPOINT_METRIC_DIRECTIONS)}"
+        )
+    metric_mode = CHECKPOINT_METRIC_DIRECTIONS[metric_name]
+    if metric_name not in validation_metrics:
+        raise ValueError(f"Configured checkpoint metric {metric_name!r} was not produced")
+    value = float(validation_metrics[metric_name])
+    if not np.isfinite(value):
+        raise ValueError(f"Checkpoint metric {metric_name!r} is not finite: {value}")
+    return value, metric_name, metric_mode
