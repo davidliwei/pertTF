@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from torch.distributions import Bernoulli
 from tqdm import trange
+from .modules import FLASH_ATTENTION_VERSION
 from .modules import (
     ClsDecoder,
     ContinuousValueEncoder, 
@@ -80,6 +81,9 @@ class BaseModel(nn.Module):
         self.n_input_bins = n_input_bins
         self.use_fast_transformer = False if not torch.cuda.is_available() or fast_transformer_backend == 'vanilla' else use_fast_transformer
         self.fast_transformer_backend = fast_transformer_backend if torch.cuda.is_available() else 'vanilla'
+        if self.use_fast_transformer and self.fast_transformer_backend == 'flash' and FLASH_ATTENTION_VERSION is None:
+            print("⚠️ fast_transformer_backend='flash' requested but flash-attn is not installed; falling back to 'sdpa'.")
+            self.fast_transformer_backend = 'sdpa'
         self.distribution = distribution
         self.sf_scaling = sf_scaling
         if self.input_emb_style not in ["category", "continuous", "scaling",'autobin']:

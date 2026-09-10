@@ -54,6 +54,11 @@ class FlashTransformerEncoderLayerVarlen(nn.Module):
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
+        if FLASH_ATTENTION_VERSION is None:
+            raise ImportError(
+                "FlashTransformerEncoderLayerVarlen requires flash-attn (v2: 'flash_attn', v3: 'flash_attn_interface'), "
+                "but neither could be imported. Install flash-attn or use fast_transformer_backend='sdpa'."
+            )
         self.flash_version = FLASH_ATTENTION_VERSION
         self.d_model = d_model
         self.nhead = nhead
@@ -484,22 +489,27 @@ class SDPATransformerEncoderLayer(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, batch_size, nhead, seq_len, head_dim)
         q, k, v = qkv[0], qkv[1], qkv[2]  # Each: (batch_size, nhead, seq_len, head_dim)
         
-        attn_mask = key_padding_mask
-        if attn_mask is not None:
-            # attn_mask must be broadcastable to (batch, nhead, seq_len, seq_len)
-            # We add the nhead and query_seq_len dimensions.
-            attn_mask = attn_mask.view(batch_size, 1, 1, seq_len)
+        attn_mask = None
+        if key_padding_mask is not None:
+            # key_padding_mask follows the torch TransformerEncoder convention:
+            # True = padded token, ignore it.
+            # SDPA's boolean attn_mask uses the opposite convention:
+            # True = this key may be attended to.
+            # Invert, then broadcast to (batch, nhead, q_len, k_len).
+            attn_mask = (~key_padding_mask.bool()).view(batch_size, 1, 1, seq_len)
 
 
-        # The entire logic for varlen and packed attention is replaced by this single call.
-        # SDPA handles the padding mask and causality internally.
-        with torch.nn.attention.sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
-            attn_output = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,  # Pass the reshaped mask here
-                dropout_p=self.dropout1.p if self.training else 0.0,
-                is_causal=self.causal
-            )
+        # Let PyTorch pick the best available kernel (flash, memory-efficient,
+        # cuDNN, or math). Restricting to a single backend raises at forward
+        # time when that kernel is unsupported for the current torch build,
+        # GPU, dtype, or mask, and that failure cannot be caught by the
+        # construction-time try/except in pertTF.py.
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout1.p if self.training else 0.0,
+            is_causal=self.causal,
+        )
             
         # Reshape output back to (batch_size, seq_len, d_model)
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)

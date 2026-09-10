@@ -198,10 +198,12 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         # 4. SANITIZE HF CONFIG
         # The Mixin automatically captured EVERYTHING in __init__ into self.config.
         # If you want config.json to NOT contain training params, you must remove them here.
-            # Remove vocab to prevent crash
+        # Remove vocab from the hub config: it is not JSON-serializable, and
+        # leaving the key (even as None) leaks into self.training_config, which
+        # is later unpacked into PertBatchCollator(vocab, ..., **config).
         if "vocab" in self._hub_mixin_config:
             self._hub_mixin_config['ntoken'] = len(vocab)
-            self._hub_mixin_config["vocab"] = None
+            del self._hub_mixin_config["vocab"]
         
         for n in list(self._hub_mixin_config.keys()):
             if type(self._hub_mixin_config[n]) in [dict, list]:

@@ -149,7 +149,7 @@ def produce_training_datasets(adata_input, config,
     data_info['valid_loader'] = v_loader
     data_info['train_data'] = t_data
     data_info['valid_data'] = v_data
-    data_info['cell_ids_train'] = t_data.get_adata_subset().obs.index
+    data_info['cell_ids_train'] = test_manager.adata.obs.index[t_data.indices]
     data_info['adata_sorted'] = v_data.get_adata_subset(next_cell_pred=effective_next_cell_pred)
     data_info['adata_manager'] = test_manager
     data_info['train_indices'] = np.asarray(train_indices, dtype=np.int64)

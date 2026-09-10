@@ -72,6 +72,7 @@ class PertTFDataset(Dataset):
                  additional_ps_dict: dict = None, 
                  only_sample_wt_pert: bool = False,
                  size_factor_col: str = None,
+                 size_factors: Optional[np.ndarray] = None,
                  prediction_only: bool = False,
                  config=None,
                  pairing_config=None,
@@ -96,6 +97,15 @@ class PertTFDataset(Dataset):
         """
         self.adata = adata
         self._check_anndata_content()
+        self.obs_names = self.adata.obs.index.to_numpy()
+        self.celltype_values = self.adata.obs["celltype"].to_numpy()
+        self.genotype_values = self.adata.obs["genotype"].to_numpy()
+        self.batch_values = self.adata.obs["batch_id"].to_numpy()
+        self.genotype_next_values = (
+            self.adata.obs["genotype_next"].to_numpy()
+            if "genotype_next" in self.adata.obs
+            else None
+        )
         indices = np.asarray(indices if indices is not None else np.arange(self.adata.n_obs), dtype=np.int64)
         self.next_cell_pred = next_cell_pred
         self.prediction_only = prediction_only
@@ -136,7 +146,11 @@ class PertTFDataset(Dataset):
         self.genotype_to_index = genotype_to_index if genotype_to_index is not None else {t: i for i, t in enumerate(self.adata.obs['genotype'].unique())}
         self.ps_columns = ps_columns or [] 
         self.ps_columns = list(self.ps_columns) # must be a list 
-        self.sf = _get_sf(self.adata.layers[self.expr_layer]) if size_factor_col is None else adata.obs[size_factor_col].values.reshape(-1,1)
+        self.sf = size_factors if size_factors is not None else (
+            _get_sf(self.adata.layers[self.expr_layer])
+            if size_factor_col is None
+            else adata.obs[size_factor_col].values.reshape(-1, 1)
+        )
         # Kept in the signature for existing callers; identity pairs now always use the source row itself.
         self.only_sample_wt_pert = only_sample_wt_pert
         if self.next_cell_pred == "lochness" and not self.prediction_only:
@@ -225,10 +239,10 @@ class PertTFDataset(Dataset):
 
         #current_cell_obs = self.adata.obs.iloc[current_cell_global_idx] # too slow
 
-        current_cell_idx = self.adata.obs.index[current_cell_global_idx]
-        current_cell_celltype = self.adata.obs.at[current_cell_idx, 'celltype']
-        current_cell_genotype = self.adata.obs.at[current_cell_idx, 'genotype']
-        current_cell_batch_label = self.adata.obs.at[current_cell_idx, 'batch_id']
+        current_cell_idx = self.obs_names[current_cell_global_idx]
+        current_cell_celltype = self.celltype_values[current_cell_global_idx]
+        current_cell_genotype = self.genotype_values[current_cell_global_idx]
+        current_cell_batch_label = self.batch_values[current_cell_global_idx]
 
         # 2. Get expression data for the current cell
         binned_layer_key = self.expr_layer
@@ -248,8 +262,8 @@ class PertTFDataset(Dataset):
                 "index": current_cell_global_idx,
                 "name": current_cell_idx,
             }
-            if 'genotype_next' in self.adata.obs.columns:
-                next_pert = self.adata.obs.at[current_cell_idx, 'genotype_next']
+            if self.genotype_next_values is not None:
+                next_pert = self.genotype_next_values[current_cell_global_idx]
                 sample["perturbation_labels_next"] = self.genotype_to_index.get(next_pert, 0)
             return sample
 
@@ -443,8 +457,8 @@ class PertTFUniDataManager:
                  next_cell_pred_type: str = "identity", 
                  additional_ps_dict: dict = None, 
                  only_sample_wt_pert: bool = False):
-        #assert not adata.is_view, "The provided anndata is likely a view of the original anndata, this is probably due to slicing the original annadata object, please use the .copy() method to provide a copy"
-        self.adata = adata.copy() # make a copy of the data so that no issues arise if adata is a anndata view
+        # Materialize views without duplicating expression matrices already owned by the caller.
+        self.adata = adata.copy() if adata.is_view else adata
         self.indices = np.arange(self.adata.n_obs)
         self.config = config
         self.ps_columns = ps_columns # perhaps this can incorporated into config
@@ -485,6 +499,13 @@ class PertTFUniDataManager:
         
         add_batch_info(self.adata)
         self.num_batch_types = len(self.adata.obs["batch_id"].unique())
+        # Size factors cover the full AnnData and can be shared by every loader.
+        size_factor_col = self.config.get('size_factor_col', None)
+        self.sf = (
+            _get_sf(self.adata.layers[self.expr_layer])
+            if size_factor_col is None
+            else self.adata.obs[size_factor_col].values.reshape(-1, 1)
+        )
         # The collators can be created once and reused
         ## first collator is the training collator, with a context window set in config
         self.collator = PertBatchCollator(self.vocab, self.gene_ids, hvg_inds = self.hvg_inds, **config)
@@ -537,6 +558,7 @@ class PertTFUniDataManager:
             expr_layer=self.expr_layer, 
             only_sample_wt_pert=self.only_sample_wt_pert,
             size_factor_col = self.config.get('size_factor_col', None),
+            size_factors=self.sf,
             config=self.config,
             pairing_config=pairing_config,
         )

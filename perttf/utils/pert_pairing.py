@@ -131,6 +131,8 @@ class ContextAwarePairing:
         self.seed = seed
         self.control_value = control_value
         self.perturbation_mode = perturbation_mode
+        self.context_values = self.adata.obs["celltype"].to_numpy()
+        self.perturbation_values = self.adata.obs["genotype"].to_numpy()
         self._configure_indices(indices, source_indices, target_indices)
 
         if ot_params is not None and pairing_anchor == "target" and source_selection != "strict":
@@ -163,8 +165,8 @@ class ContextAwarePairing:
             if values.size and (values.min() < 0 or values.max() >= self.adata.n_obs):
                 raise IndexError(f"{name} contain indices outside the AnnData bounds")
 
-        source_perts = self.adata.obs.iloc[source_indices]["genotype"].to_numpy()
-        target_perts = self.adata.obs.iloc[target_indices]["genotype"].to_numpy()
+        source_perts = self.perturbation_values[source_indices]
+        target_perts = self.perturbation_values[target_indices]
         self.source_indices = source_indices[source_perts == self.control_value] if self.source_selection == "strict" else source_indices
         self.target_indices = target_indices[target_perts != self.control_value] if self.target_selection == "strict" else target_indices
         self.anchor_indices = self.source_indices if self.pairing_anchor == "source" else self.target_indices
@@ -181,34 +183,39 @@ class ContextAwarePairing:
 
     def _build_target_cell_pool(self):
         pool = {}
-        for target_idx in self.target_indices:
-            target = self.adata.obs.iloc[target_idx]
-            pool.setdefault(target["celltype"], {}).setdefault(target["genotype"], []).append(int(target_idx))
+        for target_idx, context, perturbation in zip(
+            self.target_indices,
+            self.context_values[self.target_indices],
+            self.perturbation_values[self.target_indices],
+        ):
+            pool.setdefault(context, {}).setdefault(perturbation, []).append(int(target_idx))
         return pool
 
     def _build_source_cell_pool(self):
         pool = {}
-        for source_idx in self.source_indices:
-            source = self.adata.obs.iloc[source_idx]
-            pool.setdefault(source["celltype"], []).append(int(source_idx))
+        for source_idx, context in zip(
+            self.source_indices,
+            self.context_values[self.source_indices],
+        ):
+            pool.setdefault(context, []).append(int(source_idx))
         return pool
 
     def _identity_pair(self, source_idx):
-        source_label = self.adata.obs.iloc[source_idx]["genotype"]
+        source_label = self.perturbation_values[source_idx]
         condition_label = self.control_value if self.identity_condition is None else source_label
         return PerturbationPair(int(source_idx), int(source_idx), condition_label, "identity")
 
     def _resolve_source_pair(self, source_idx, rng=None):
-        source = self.adata.obs.iloc[source_idx]
-        if not self.perturbation_mode or source["genotype"] != self.control_value:
+        source_context = self.context_values[source_idx]
+        if not self.perturbation_mode or self.perturbation_values[source_idx] != self.control_value:
             return self._identity_pair(source_idx)
 
-        target_groups = (self.target_cell_pool or {}).get(source["celltype"], {})
+        target_groups = (self.target_cell_pool or {}).get(source_context, {})
         if not target_groups:
             return self._identity_pair(source_idx)
         if self.target_sampling == "cell":
             target_idx = int(self._choice([idx for group in target_groups.values() for idx in group], rng))
-            target_label = self.adata.obs.iloc[target_idx]["genotype"]
+            target_label = self.perturbation_values[target_idx]
         else:
             target_label = self._choice(list(target_groups), rng)
             target_idx = int(self._choice(target_groups[target_label], rng))
@@ -222,17 +229,18 @@ class ContextAwarePairing:
         return PerturbationPair(int(source_idx), target_idx, target_label, "perturbation")
 
     def _resolve_target_pair(self, target_idx, rng=None):
-        target = self.adata.obs.iloc[target_idx]
-        if target["genotype"] == self.control_value:
+        target_context = self.context_values[target_idx]
+        target_label = self.perturbation_values[target_idx]
+        if target_label == self.control_value:
             return self._identity_pair(target_idx)
         if self.ot is not None:
             source_idx = self.ot.sample_source(target_idx, rng)
         else:
-            source_pool = (self.source_cell_pool or {}).get(target["celltype"], [])
+            source_pool = (self.source_cell_pool or {}).get(target_context, [])
             if not source_pool:
-                raise ValueError(f"No eligible sources available for context {target['celltype']!r}")
+                raise ValueError(f"No eligible sources available for context {target_context!r}")
             source_idx = int(self._choice(source_pool, rng))
-        return PerturbationPair(source_idx, int(target_idx), target["genotype"], "perturbation")
+        return PerturbationPair(source_idx, int(target_idx), target_label, "perturbation")
 
     def _resolve_anchor(self, anchor_idx, rng=None):
         if self.pairing_anchor == "target":
