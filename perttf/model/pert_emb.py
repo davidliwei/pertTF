@@ -64,6 +64,23 @@ def load_perturbation_sources(
     return sources
 
 
+def build_perturbation_mapping(
+    perturbations: Sequence[str],
+    sources: dict,
+    control_label: str = "WT",
+) -> Dict[str, int]:
+    """Build one vocabulary for dataset labels, unified encoding and classification.
+
+    Dataset names keep first-occurrence order; control is included explicitly.
+    Source-only names are appended in sorted order. Call before preparing loaders
+    and pass the returned mapping unchanged to dataset preparation and the model.
+    """
+    names = list(dict.fromkeys(list(perturbations) + [control_label]))
+    external_names = {gene for genes, _ in sources.values() for gene in genes}
+    names.extend(sorted(external_names.difference(names)))
+    return {gene: index for index, gene in enumerate(names)}
+
+
 def load_pert_embedding_from_gears(gears_path, adata, 
                                   intersect_type : Literal["common","gears"] = "common"):
     """

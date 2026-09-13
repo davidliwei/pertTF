@@ -69,6 +69,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         pert_pad_id: Optional[int] = None,
         pert_dim: Optional[int] = None,
         distribution: Optional[str] = None,
+        pert_sources: Optional[Dict] = None,
+        control_label: str = "WT",
         **kwargs
     ):
         # 1. Handle Training Config & Extras
@@ -107,6 +109,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         # out of the HF config and forwarded directly to the parent, which builds a
         # FeaturePertEncoder when it is not None (enables zero-shot prediction).
         self.pert_features = kwargs.pop('pert_features', None)
+        if pert_sources is not None and self.pert_features is not None:
+            raise ValueError("Choose pert_sources or legacy pert_features, not both")
 
                 # fix up some old configurations and param names
         if kwargs.get('layer_size', False):
@@ -173,6 +177,16 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             # Note: We do NOT pass **kwargs here, so parent doesn't see extra params.
         )
 
+        if pert_sources is not None:
+            from .pert_encoder import UnifiedPertEncoder
+            if not hasattr(self, 'genotype_to_index'):
+                raise ValueError("Unified encoder requires the expanded genotype_to_index")
+            self.pert_encoder = UnifiedPertEncoder(
+                pert_sources, self.genotype_to_index,
+                self.d_model if pert_dim is None else pert_dim,
+                padding_idx=pert_pad_id, control_label=control_label,
+            )
+
         # 4. SANITIZE HF CONFIG
         # The Mixin automatically captured EVERYTHING in __init__ into self.config.
         # If you want config.json to NOT contain training params, you must remove them here.
@@ -186,6 +200,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         for n in list(self._hub_mixin_config.keys()):
             if type(self._hub_mixin_config[n]) in [dict, list]:
                 del self._hub_mixin_config[n]
+        self._hub_mixin_config.pop("pert_sources", None)
 
         # Remove training params from the model config (Cleaner config.json)
         for k in training_keys:
@@ -224,6 +239,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         }
         # Filter None values
         running_params_to_save = {k: v for k, v in running_params_to_save.items() if v is not None}
+        from .pert_encoder import UnifiedPertEncoder
+        if isinstance(self.pert_encoder, UnifiedPertEncoder):
+            running_params_to_save['pert_source_config'] = self.pert_encoder.source_config()
         
         if running_params_to_save:
             torch.save(running_params_to_save, os.path.join(save_directory, "running_parameters.pt"))
@@ -255,6 +273,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         max_seq_len: Optional[int] = None,
         use_size_factor: bool = True,
         device: Optional[Union[str, torch.device]] = None,
+        query_sources: Optional[Dict] = None,
     ):
         """Predict row-level perturbations already assigned in an AnnData object.
 
@@ -264,6 +283,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         HVG count sets the total gene budget, otherwise non_hvg_size is retained.
         Expressed and HVG budgets reserve an additional slot for the CLS token.
         Prediction metadata records the resolved token limit.
+        With a unified encoder, query_sources supplies temporary (genes, matrix)
+        tuples for new target IDs through existing source projections. Registered
+        IDs cannot be overridden, and no model vocabulary or weights are changed.
         """
         from .train_function import eval_testdata
 
@@ -308,9 +330,16 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         perturbations = adata.obs[perturbation_col]
         if perturbations.isna().any():
             raise ValueError(f"AnnData obs[{perturbation_col!r}] contains missing values")
-        missing_perturbations = sorted(
-            set(perturbations).difference(self.genotype_to_index)
-        )
+        from .pert_encoder import UnifiedPertEncoder
+        unified = isinstance(self.pert_encoder, UnifiedPertEncoder)
+        registered = self.genotype_to_index
+        query_ids = set()
+        if query_sources is not None:
+            if not unified:
+                raise ValueError("query_sources requires the unified perturbation encoder")
+            # Detailed table validation and collision checks run in encode_queries.
+            query_ids = {gene for genes, _ in query_sources.values() for gene in genes}
+        missing_perturbations = sorted(set(perturbations).difference(registered).difference(query_ids))
         if missing_perturbations:
             raise ValueError(
                 "Inference perturbations are absent from genotype_to_index: "
@@ -355,13 +384,36 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         device = torch.device(device)
         self.to(device)
         self.eval()
+        inference_mapping = self.genotype_to_index
+        perturbation_embeddings = None
+        if query_sources is not None:
+            # Registered targets use the dataset/model mapping directly. Only
+            # temporary query IDs need an evaluation-local extension and vectors.
+            inference_mapping = dict(self.genotype_to_index)
+            for gene in perturbations:
+                if gene not in inference_mapping:
+                    inference_mapping[gene] = len(inference_mapping)
+            with torch.no_grad():
+                names, vectors = self.pert_encoder.encode_queries(query_sources)
+                query_vectors = dict(zip(names, vectors))
+                perturbation_embeddings = next(self.parameters()).new_zeros(
+                    len(inference_mapping), self.pert_encoder.embedding_dim)
+                requested = list(dict.fromkeys(perturbations))
+                known = [gene for gene in requested if gene in registered]
+                if known:
+                    indices = torch.tensor([registered[g] for g in known], device=device)
+                    rows = torch.tensor([inference_mapping[g] for g in known], device=device)
+                    perturbation_embeddings[rows] = self.pert_encoder(indices)
+                for gene in requested:
+                    if gene in query_vectors:
+                        perturbation_embeddings[inference_mapping[gene]] = query_vectors[gene]
         result = eval_testdata(
             self,
             adata,
             list(adata.var_names),
             {
                 "cell_type_to_index": self.cell_type_to_index,
-                "genotype_to_index": self.genotype_to_index,
+                "genotype_to_index": inference_mapping,
                 "vocab": self.vocab,
             },
             config,
@@ -374,6 +426,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             sample_seed=prediction_seed,
             device=device,
             max_seq_len=int(config.max_seq_len),
+            perturbation_embeddings=perturbation_embeddings,
         )
         if not result.obs_names.equals(adata.obs_names):
             raise RuntimeError("pertTF inference did not preserve the requested rows and their order")
@@ -392,6 +445,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             "gene_sampling_mode": str(config.sampling_mode),
             "max_seq_len": int(config.max_seq_len),
         }
+        if unified:
+            result.uns["perttf_prediction"]["perturbation_sources"] = list(self.pert_encoder.sources)
+            result.uns["perttf_prediction"]["query_perturbations"] = sorted(query_ids)
         if config.sampling_mode == "hvg":
             result.uns["perttf_prediction"]["non_hvg_size"] = int(config.non_hvg_size)
         return result
@@ -533,12 +589,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
 
         if 'fast_transformer_backend' in kwargs:
             config['fast_transformer_backend'] = kwargs['fast_transformer_backend']
-        # 6. Instantiate Model
-        # If loading an OLD model, 'config' might contain training params (e.g., 'lr').
-        # These will be passed to __init__, captured in **kwargs, and moved to self.training_config.
-        model = cls(**config)
-
-        # 7. Load Weights
+        # Load tensors before reconstruction so unified feature buffers need not
+        # also be duplicated in running_parameters.pt or downloaded from HF.
         state_dict = None
         model_path = fetch_file("model.safetensors")
         if model_path:
@@ -553,6 +605,19 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             raise EnvironmentError(
                 f"model.safetensors or best_model.pt not found in {pretrained_model_name_or_path}"
             )
+
+        source_config = running_params.get('pert_source_config')
+        if kwargs.get('pert_sources') is not None:
+            raise ValueError("Changing perturbation sources during checkpoint loading is not supported")
+        if source_config is not None:
+            if not strict:
+                raise ValueError("Unified encoder checkpoints currently require strict=True")
+            config['control_label'] = source_config['control_label']
+            config['pert_sources'] = {
+                name: (table['genes'], state_dict[f'pert_encoder.sources.{name}.features'])
+                for name, table in source_config['sources'].items()
+            }
+        model = cls(**config)
 
         if strict:
             loaded_layers = cls._strict_load_weights(model, state_dict)
