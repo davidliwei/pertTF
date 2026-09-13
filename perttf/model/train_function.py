@@ -124,7 +124,7 @@ def train(model: nn.Module,
             ps_score_next = batch_data["ps_next"].to(device) #
 
         src_key_padding_mask = input_gene_ids.eq(vocab[config.pad_token])
-        with torch.cuda.amp.autocast(enabled=config.amp):
+        with torch.amp.autocast("cuda", enabled=config.amp):
             #import pdb; pdb.set_trace()
 
             output_dict = model(
@@ -493,7 +493,6 @@ def _run_evaluation_batches(
 
     model.eval()
     fork_devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
-    autocast_context = torch.cuda.amp.autocast if device.type == "cuda" else nullcontext
     with torch.no_grad(), torch.random.fork_rng(devices=fork_devices):
         if sample_seed is not None:
             torch.manual_seed(sample_seed)
@@ -516,7 +515,7 @@ def _run_evaluation_batches(
             mvc_src = batch_data["full_gene_ids"].to(device) if (perturbation_validation or use_full_mvc_src or not _cfg(config, "mvc_masked_train", True)) and "full_gene_ids" in batch_data else None
             use_mvc = predict_expr or _cfg(config, "GEPC", False)
 
-            with autocast_context(enabled=_cfg(config, "amp", False)) if device.type == "cuda" else autocast_context():
+            with torch.amp.autocast("cuda", enabled=_cfg(config, "amp", False)) if device.type == "cuda" else nullcontext():
                 output_dict = model(
                     input_gene_ids,
                     input_values,
