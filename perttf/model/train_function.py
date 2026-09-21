@@ -174,8 +174,11 @@ def train(model: nn.Module,
                 if cce_mode == 'cell_geno': ## supervised contrastive loss plus a custom contrastive loss
                     cce_weight = max(config.perturbation_classifier_weight*config.cell_type_classifier_weight, 1)
                     if pert_mask is None:
-                        input_labels = celltype_labels*1000+perturbation_labels # x1000 make labels unique combination of celltype and genotype
-                        pert_labels = celltype_labels_next*1000+perturbation_labels_next
+                        # unique celltype x genotype labels; corpora can have more than 1000 perturbations,
+                        # and after LoRA pert_mode='new' labels can exceed the base checkpoint's n_pert
+                        n_classes = max(int(model.n_pert), int(torch.maximum(perturbation_labels.max(), perturbation_labels_next.max()).item()) + 1)
+                        input_labels = celltype_labels * n_classes + perturbation_labels
+                        pert_labels = celltype_labels_next * n_classes + perturbation_labels_next
                         loss_cce = cce_loss(output_dict["contrastive_dict"], input_labels, pert_labels, logit_norm=logit_norm)
                     else:
                         celltype_cat = _cce_labels(output_dict["contrastive_dict"], celltype_labels, celltype_labels_next)
@@ -220,6 +223,10 @@ def train(model: nn.Module,
                 mvc_target_values = target_values if config.get('mvc_masked_train', True) else batch_data["full_expr"].to(device)
                 mvc_target_values_next = target_values_next if config.get('mvc_masked_train', True) else batch_data["full_expr_next"].to(device)
                 mvc_masked_positions = masked_positions if config.get('mvc_masked_train', True) else None
+                mvc_next_masked_positions = mvc_masked_positions
+                if not config.get('mvc_masked_train', True) and "full_expr_mask" in batch_data:
+                    mvc_masked_positions = batch_data["full_expr_mask"].to(device)
+                    mvc_next_masked_positions = batch_data["full_expr_next_mask"].to(device)
                 loss_gepc = criterion_mvc(
                         output_dict["mvc_output"], 
                         mvc_target_values, 
@@ -231,8 +238,8 @@ def train(model: nn.Module,
                 # added
                 loss_gepc_next = criterion_mvc(
                     output_dict["mvc_output_next"], 
-                    mvc_target_values_next, 
-                    mvc_masked_positions,
+                    mvc_target_values_next,
+                    mvc_next_masked_positions,
                     scale_factor = sf_next,
                 )
                 loss = loss + config.next_weight * loss_gepc_next
@@ -248,7 +255,7 @@ def train(model: nn.Module,
                     )
                     # added
                     loss_gepc_zero_log_prob_next = criterion_neg_log_bernoulli(
-                        output_dict["mvc_output_next"]["zero_probs"], mvc_target_values_next, mvc_masked_positions
+                        output_dict["mvc_output_next"]["zero_probs"], mvc_target_values_next, mvc_next_masked_positions
                     )
                     loss = loss + config.next_weight * loss_gepc_zero_log_prob_next
                     metrics_to_log.update(
@@ -582,8 +589,16 @@ def _run_evaluation_batches(
                     if _cfg(config, "GEPC", False):
                         mvc_target_values = target_values if mvc_src is None else batch_data["full_expr"].to(device)
                         mvc_target_values_next = target_values_next if mvc_src is None else batch_data["full_expr_next"].to(device)
-                        loss_gepc = criterion_mvc(output_dict["mvc_output"], mvc_target_values, scale_factor=sf)
-                        loss_gepc_next = criterion_mvc(output_dict["mvc_output_next"], mvc_target_values_next, scale_factor=sf_next)
+                        source_mask = batch_data.get("full_expr_mask") if mvc_src is not None else None
+                        target_mask = batch_data.get("full_expr_next_mask") if mvc_src is not None else None
+                        loss_gepc = criterion_mvc(
+                            output_dict["mvc_output"], mvc_target_values,
+                            mask=None if source_mask is None else source_mask.to(device), scale_factor=sf,
+                        )
+                        loss_gepc_next = criterion_mvc(
+                            output_dict["mvc_output_next"], mvc_target_values_next,
+                            mask=None if target_mask is None else target_mask.to(device), scale_factor=sf_next,
+                        )
                     else:
                         loss_gepc = output_values.new_tensor(0.0)
                         loss_gepc_next = output_values.new_tensor(0.0)
@@ -619,6 +634,8 @@ def _run_evaluation_batches(
                     sample=expr_prediction_mode == "sample",
                     device=device,
                 )["pred"][:, 1:]
+                if hasattr(loader, "metric_gene_mask"):
+                    predicted = predicted[:, torch.as_tensor(loader.metric_gene_mask, device=device)]
                 normalized = normalize_expression(
                     _to_numpy(predicted),
                     target_sum=target_sum,
@@ -939,6 +956,8 @@ def wrapper_train(model, config, data_gen,
     from .pert_encoder import UnifiedPertEncoder
     if isinstance(model.pert_encoder, UnifiedPertEncoder):
         running_parameters['pert_source_config'] = model.pert_encoder.source_config()
+    if 'corpus_config' in data_gen:
+        running_parameters['corpus_config'] = data_gen['corpus_config']
     torch.save(running_parameters, save_dir / "running_parameters.pt")
     import json
     json.dump(resolved_config, open(save_dir / "config.json", "w"))
@@ -946,7 +965,9 @@ def wrapper_train(model, config, data_gen,
     #config_data = json.load(open(save_dir / 'config.json', 'r'))
     perturbation_validation = data_gen.get('perturbation_validation', False)
     perturbation_reference_groups = None
-    if perturbation_validation:
+    if perturbation_validation and "perturbation_reference_groups" in data_gen:
+        perturbation_reference_groups = data_gen["perturbation_reference_groups"]
+    elif perturbation_validation:
         reference_indices = np.unique(
             np.concatenate([
                 data_gen['pert_valid_target_indices'],
@@ -971,6 +992,8 @@ def wrapper_train(model, config, data_gen,
     evaltest_processes = []
 
     for epoch in range(1, config.epochs + 1):
+        if hasattr(train_loader, "set_epoch"):
+            train_loader.set_epoch(epoch)
         epoch_start_time = time.time()
         # Clean up background UMAP and metric calculations on past test-data eval
         remaining_processes = []
@@ -1022,7 +1045,7 @@ def wrapper_train(model, config, data_gen,
             metric_details = compute_perturbation_metrics(
                 perturbation_reference_groups,
                 perturbation_evaluation['predicted_groups'],
-                control_value=resolve_control_value(config),
+                control_value=data_gen.get('control_label', resolve_control_value(config)),
                 fdr_threshold=config.get('perturbation_metric_fdr', 0.05),
                 min_cells=config.get('perturbation_metric_min_cells', 30),
             )

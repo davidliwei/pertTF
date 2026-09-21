@@ -44,14 +44,15 @@ docs = [
     "myst-nb>=1.0",
     "furo",
 ]
+corpus = ["perturb-data-lab>=0.2.0"]
 
 [project.urls]
 Homepage = "https://github.com/davidliwei/pertTF"
 Repository = "https://github.com/davidliwei/pertTF"
 
 
-[tool.setuptools]
-packages = ["perttf"] 
+[tool.setuptools.packages.find]
+include = ["perttf*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "perttf.__version__"}

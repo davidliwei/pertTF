@@ -3,6 +3,11 @@
 **pertTF is a transformer model designed for single-cell perturbation predictions.**
 
 > **Documentation:** the full documentation, including installation instructions, tutorials and guides, is available at **[perttf.readthedocs.io](https://perttf.readthedocs.io/en/latest/)**.
+
+For sparse on-disk perturb-data-lab corpora, see
+[Corpus training](demos/tutorials/CORPUS_TRAINING.md). The paired loader and
+unified-encoder data integration are owned by pertTF.
+
 -----
 # Installation
 ## Prerequisite environment
