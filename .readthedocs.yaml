@@ -4,13 +4,6 @@ build:
   os: "ubuntu-24.04"
   tools:
     python: "3.12"
-  jobs:
-    pre_install:
-      # perttf does not declare torch as an install dependency (same as
-      # .github/workflows/ci.yml, which installs a CPU-only build explicitly
-      # before `pip install .[test]`). autodoc needs a real, importable torch
-      # to introspect perttf's modules, so install the CPU wheel first.
-      - pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 sphinx:
   configuration: docs/conf.py

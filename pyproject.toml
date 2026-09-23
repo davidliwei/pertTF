@@ -36,31 +36,13 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest", "torch>=2.2", "tqdm"]
-# Full runtime import surface of perttf/ (torch excluded here: install a
-# CPU-only build separately first, as .github/workflows/ci.yml and
-# .readthedocs.yaml both do) plus the Sphinx toolchain used to build docs/.
+# Sphinx toolchain used to build docs/. Nothing here imports perttf itself
+# (no autodoc directives exist yet), so perttf's own runtime dependencies
+# (torch, scanpy, ...) aren't needed for this extra.
 docs = [
     "sphinx>=7.2",
     "myst-nb>=1.0",
     "furo",
-    "sphinx-autodoc-typehints",
-    "anndata",
-    "huggingface_hub",
-    "jax",
-    "matplotlib",
-    "numpy",
-    "omegaconf",
-    "ott-jax",
-    "pandas",
-    "peft",
-    "safetensors",
-    "scanpy >= 1.10.0",
-    "scikit-learn",
-    "scipy",
-    "seaborn",
-    "tqdm",
-    "typing_extensions",
-    "wandb",
 ]
 
 [project.urls]
