@@ -447,6 +447,7 @@ def _run_evaluation_batches(
     use_size_factor=True,
     target_sum=10000.0,
     sample_seed=None,
+    perturbation_embeddings=None,
 ):
     """Shared DataLoader-backed eval/inference loop used by evaluate() and eval_testdata()."""
     criterion = masked_mse_loss
@@ -514,6 +515,9 @@ def _run_evaluation_batches(
             src_key_padding_mask = input_gene_ids.eq(vocab[config.pad_token])
             mvc_src = batch_data["full_gene_ids"].to(device) if (perturbation_validation or use_full_mvc_src or not _cfg(config, "mvc_masked_train", True)) and "full_gene_ids" in batch_data else None
             use_mvc = predict_expr or _cfg(config, "GEPC", False)
+            perturbation_kwargs = {}
+            if perturbation_embeddings is not None and perturbation_labels_next is not None:
+                perturbation_kwargs["pert_embeddings_next"] = perturbation_embeddings[perturbation_labels_next]
 
             with torch.amp.autocast("cuda", enabled=_cfg(config, "amp", False)) if device.type == "cuda" else nullcontext():
                 output_dict = model(
@@ -531,6 +535,7 @@ def _run_evaluation_batches(
                     PERTPRED=_cfg(config, "genotype_classifier", True) or collect_outputs,
                     PSPRED=_cfg(config, "ps_weight", 0) > 0 or collect_outputs,
                     mvc_src=mvc_src,
+                    **perturbation_kwargs,
                 )
 
                 batch_size = input_gene_ids.shape[0]
@@ -691,6 +696,7 @@ def eval_testdata(
     device = None,
     sample_seed = None,
     max_seq_len = None,
+    perturbation_embeddings = None,
 ) -> AnnData:
     """
     Evaluate the model on test data and return an AnnData object with embeddings.
@@ -775,6 +781,7 @@ def eval_testdata(
         use_full_mvc_src=mvc_full_expr,
         use_size_factor=sizefactor,
         sample_seed=sample_seed,
+        perturbation_embeddings=perturbation_embeddings,
     )
     outputs = result["outputs"]
     if not outputs:
@@ -849,6 +856,9 @@ def wrapper_train(model, config, data_gen,
      'ps_names': data_gen["ps_names"],
      'config': config.as_dict(), # config as dictionary
     }
+    from .pert_encoder import UnifiedPertEncoder
+    if isinstance(model.pert_encoder, UnifiedPertEncoder):
+        running_parameters['pert_source_config'] = model.pert_encoder.source_config()
     torch.save(running_parameters, save_dir / "running_parameters.pt")
     import json
     json.dump(config.as_dict(), open(save_dir / "config.json", "w"))
