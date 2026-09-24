@@ -2,7 +2,7 @@ import torch
 from ..model.modules import AdversarialDiscriminator
 
 def create_optimizer_dict(model, device, config, num_batch_types = -1):
-    scaler = torch.cuda.amp.GradScaler(enabled=config.amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=config.amp)
     DAB_separate_optim = True if config.dab_weight >0 else False
 
     # This maybe should be part of training code 

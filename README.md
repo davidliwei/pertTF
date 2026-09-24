@@ -66,7 +66,8 @@ All these tutorials can run on Google Colab.
 
 ### Using the pertTF model
 
-- [Inference Tutorial](demos/tutorials/INFERENCE.md): use the HuggingFace pertTF model to make inferences
+- [Unified perturbation embeddings](demos/tutorials/PERTURBATION_SOURCES.md): select HF or custom sources, combine available features, and learn fallback embeddings for uncovered perturbations.
+- [Inference Tutorial](demos/tutorials/INFERENCE.md) and [Google Colab notebook](https://colab.research.google.com/drive/1KWWvRJJJOj9QXuF5zgddLHkdCx6KJnTa?usp=sharing): use the HuggingFace pertTF model to make inferences
 - [LoRA fine tuning tutorial](demos/tutorials/LORA_FINETUNING.md) and [python notebook](demos/tutorials/lora_finetuning_tutorial.ipynb): use LoRA to fine tune the pertTF model
 
 ### Virtual screen and modeling composition change
@@ -85,5 +86,4 @@ All these tutorials can run on Google Colab.
 - our [bioRxiv preprint](https://www.biorxiv.org/content/10.64898/2026.03.12.711379v1).
 - [HuggingFace website](https://huggingface.co/weililab) hosting models and datasets.
 - [Li lab website](https://weililab.org)
-
 

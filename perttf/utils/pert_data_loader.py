@@ -351,6 +351,12 @@ class PertBatchCollator:
         self.mask_value = config.get('mask_value', -1)
         self.nonzero_prop = config.get('nonzero_prop', 0.7)
         self.sampling_mode = config.get('sampling_mode', 'simple')
+        if self.sampling_mode in {'expressed', 'hvg'} and not self.include_zero_gene:
+            raise ValueError(
+                f"sampling_mode={self.sampling_mode!r} requires include_zero_gene=True: "
+                "expressed sampling needs the zero-expression gene pool, and HVG sampling "
+                "uses indices from the full gene pool."
+            )
         self.fix_nonzero_prop = config.get('fix_nonzero_prop', False)
         self.non_hvg_size = min(config.get('non_hvg_size', 1000), len(hvg_inds[1])) if hvg_inds is not None else 0
         self.hvg_inds = hvg_inds

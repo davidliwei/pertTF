@@ -124,7 +124,7 @@ def train(model: nn.Module,
             ps_score_next = batch_data["ps_next"].to(device) #
 
         src_key_padding_mask = input_gene_ids.eq(vocab[config.pad_token])
-        with torch.cuda.amp.autocast(enabled=config.amp):
+        with torch.amp.autocast("cuda", enabled=config.amp):
             #import pdb; pdb.set_trace()
 
             output_dict = model(
@@ -447,6 +447,7 @@ def _run_evaluation_batches(
     use_size_factor=True,
     target_sum=10000.0,
     sample_seed=None,
+    perturbation_embeddings=None,
 ):
     """Shared DataLoader-backed eval/inference loop used by evaluate() and eval_testdata()."""
     criterion = masked_mse_loss
@@ -493,7 +494,6 @@ def _run_evaluation_batches(
 
     model.eval()
     fork_devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
-    autocast_context = torch.cuda.amp.autocast if device.type == "cuda" else nullcontext
     with torch.no_grad(), torch.random.fork_rng(devices=fork_devices):
         if sample_seed is not None:
             torch.manual_seed(sample_seed)
@@ -515,8 +515,11 @@ def _run_evaluation_batches(
             src_key_padding_mask = input_gene_ids.eq(vocab[config.pad_token])
             mvc_src = batch_data["full_gene_ids"].to(device) if (perturbation_validation or use_full_mvc_src or not _cfg(config, "mvc_masked_train", True)) and "full_gene_ids" in batch_data else None
             use_mvc = predict_expr or _cfg(config, "GEPC", False)
+            perturbation_kwargs = {}
+            if perturbation_embeddings is not None and perturbation_labels_next is not None:
+                perturbation_kwargs["pert_embeddings_next"] = perturbation_embeddings[perturbation_labels_next]
 
-            with autocast_context(enabled=_cfg(config, "amp", False)) if device.type == "cuda" else autocast_context():
+            with torch.amp.autocast("cuda", enabled=_cfg(config, "amp", False)) if device.type == "cuda" else nullcontext():
                 output_dict = model(
                     input_gene_ids,
                     input_values,
@@ -532,6 +535,7 @@ def _run_evaluation_batches(
                     PERTPRED=_cfg(config, "genotype_classifier", True) or collect_outputs,
                     PSPRED=_cfg(config, "ps_weight", 0) > 0 or collect_outputs,
                     mvc_src=mvc_src,
+                    **perturbation_kwargs,
                 )
 
                 batch_size = input_gene_ids.shape[0]
@@ -690,10 +694,14 @@ def eval_testdata(
     sizefactor = False,
     sample = False,
     device = None,
+    sample_seed = None,
+    max_seq_len = None,
+    perturbation_embeddings = None,
 ) -> AnnData:
     """
     Evaluate the model on test data and return an AnnData object with embeddings.
     Plotting and UMAP are offloaded to a separate process.
+    An explicit max_seq_len overrides mode-specific defaults and includes CLS.
     """
     logger = create_logger() if logger is None else logger
     if device is None:
@@ -716,14 +724,17 @@ def eval_testdata(
 
     sampling_mode = _cfg(config, "sampling_mode", "simple")
     hvg_inds = None
-    max_seq_len = _cfg(config, "max_seq_len", 3000)
+    max_seq_len_override = max_seq_len
+    max_seq_len = _cfg(config, "max_seq_len", 3000) if max_seq_len is None else max_seq_len
     if sampling_mode == "expressed":
-        max_seq_len = 10000
+        if max_seq_len_override is None:
+            max_seq_len = 10000
     elif sampling_mode == "hvg":
         hvg_col = _cfg(config, "hvg_col", "highly_variable")
         assert hvg_col in adata_t.var.keys(), "adata must have calculated HVGs or adata.var must have hvg_col"
         hvg_inds = (np.where(adata_t.var[hvg_col])[0], np.where(~adata_t.var[hvg_col])[0])
-        max_seq_len = int(adata_t.var[hvg_col].sum()) + _cfg(config, "non_hvg_size", 1000)
+        if max_seq_len_override is None:
+            max_seq_len = int(adata_t.var[hvg_col].sum()) + _cfg(config, "non_hvg_size", 1000)
     collator_config = dict(config)
     # Drop the keys that the PertBatchCollator call below supplies explicitly,
     # so they are not also passed via **collator_config. Older checkpoints store
@@ -769,6 +780,8 @@ def eval_testdata(
         predict_expr=predict_expr,
         use_full_mvc_src=mvc_full_expr,
         use_size_factor=sizefactor,
+        sample_seed=sample_seed,
+        perturbation_embeddings=perturbation_embeddings,
     )
     outputs = result["outputs"]
     if not outputs:
@@ -843,6 +856,9 @@ def wrapper_train(model, config, data_gen,
      'ps_names': data_gen["ps_names"],
      'config': config.as_dict(), # config as dictionary
     }
+    from .pert_encoder import UnifiedPertEncoder
+    if isinstance(model.pert_encoder, UnifiedPertEncoder):
+        running_parameters['pert_source_config'] = model.pert_encoder.source_config()
     torch.save(running_parameters, save_dir / "running_parameters.pt")
     import json
     json.dump(config.as_dict(), open(save_dir / "config.json", "w"))
@@ -1023,7 +1039,8 @@ def wrapper_train(model, config, data_gen,
                     epoch=epoch,
                     eval_key=eval_dict_key,
                     predict_expr = predict_expr_tmp,
-                    mvc_full_expr= predict_expr_tmp
+                    mvc_full_expr= predict_expr_tmp,
+                    device=device,
                 )
                 adata_with_embeddings = results
                 

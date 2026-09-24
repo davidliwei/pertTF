@@ -194,7 +194,8 @@ class PerturbationTFModel(BaseModel):
         PERTPRED: bool = False,
         do_sample: bool = False,
         PSPRED: bool = False,
-        mvc_src: Tensor = None 
+        mvc_src: Tensor = None,
+        pert_embeddings_next: Optional[Tensor] = None,
     ) -> Mapping[str, Tensor]:
         """
         Args:
@@ -291,9 +292,12 @@ class PerturbationTFModel(BaseModel):
         cell_emb_orig = self._get_cell_emb_from_layer(transformer_output, values)        
         output["contrastive_dict"]['orig_emb0'] = cell_emb_orig
         #  concatenate cell embedding with perturbation embedding to generate next cell embedding
-        if pert_labels_next is not None: #and False:
+        if pert_labels_next is not None or pert_embeddings_next is not None:
             #import pdb; pdb.set_trace()
-            pert_emb_next = self.pert_encoder(pert_labels_next)
+            pert_emb_next = self.pert_encoder(pert_labels_next) if pert_embeddings_next is None else pert_embeddings_next
+            expected_pert_dim = self.d_model if self.pert_dim is None else self.pert_dim
+            if pert_emb_next.shape != (src.shape[0], expected_pert_dim):
+                raise ValueError("pert_embeddings_next must have shape (batch_size, pert_dim)")
             tf_concat=torch.cat(
                 [
                     cell_emb_orig,
