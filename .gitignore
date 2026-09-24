@@ -8,4 +8,5 @@ demos/run_on_hpc/.env
 data/*.h5ad
 runs/*
 demos/run_on_hpc/slurm.sh
+docs/_build
 
