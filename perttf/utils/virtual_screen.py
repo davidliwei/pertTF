@@ -94,7 +94,8 @@ def plot_predicted_eva(a_eva,subset_frac=1.0,
   a_eva_cp=a_eva [randsel_ss <= subset_frac]# .copy()
   results={}
   if redo_umap:
-    sc.pp.pca(a_eva_cp, layer=umap_use_rep)
+    targetobsm=a_eva_cp.obsm[umap_use_rep]
+    sc.pp.pca(a_eva_cp, obsm=umap_use_rep,n_comps=np.min([targetobsm.shape[0]-1,targetobsm.shape[1]-1,50]))
     sc.pp.neighbors(a_eva_cp, use_rep=umap_use_rep)
     sc.tl.umap(a_eva_cp, min_dist=0.5)
 
