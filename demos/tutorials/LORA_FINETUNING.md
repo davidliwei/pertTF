@@ -16,6 +16,16 @@ hf_hub_download(repo_id="weililab/pancreatic_18clone", filename="./18clones_seur
 adata = sc.read_h5ad("./18clones_seurat.h5ad")
 adata = ad.AnnData(X=adata.raw.X, obs=adata.obs, var=adata.raw.var)
 
+# Genotype labels use the pretrained model's names ('WT' for controls, e.g. '46_HHEX_het' -> 'HHEXhet')
+def clean_genotype(gene_label):
+    if gene_label == 'NA' or str(gene_label) == 'nan':
+        return 'WT'
+    parts = str(gene_label).split('_', 1)
+    name = parts[1] if len(parts) > 1 else parts[0]
+    return name.replace('_', '').split('/')[0]
+
+adata.obs['genotype'] = adata.obs['gene'].map(clean_genotype)
+
 # Preprocess: log-normalized expression must be in a layer called 'X_binned'
 adata.layers['X_binned'] = adata.X
 # Find highly variable genes (model expects a highly_variable column in adata.var)
@@ -46,26 +56,46 @@ lora_config = model.build_lora_config(
 ```
 
 ### Fine-tune
+What is fine-tuned for classification is chosen with two arguments:
+- `ft_cls='genotype'`, `'celltype'` or `['genotype', 'celltype']` — keep training the pretrained classifier head(s). The heads stay frozen and LoRA adapts the transformer that feeds them. Every label must be one the model already knows (an error lists unknown labels); a warning is shown when only part of the model's labels are present.
+- `new_cls='<obs column>'` with `new_cls_task='classification'` or `'regression'` — train a new head from scratch on the cell embedding, for any cell-level target, including labels the model has never seen.
+
+With neither (the default), LoRA adapts only the expression objective.
+
 ```python
+# a) Fine-tune the pretrained heads on cells whose genotype the model knows (CCDC6 is not one of them)
+adata_known = adata[adata.obs['genotype'].isin(model.genotype_to_index)].copy()
 peft_model = model.run_lora_train(
-    adata=adata,
+    adata=adata_known,
     epochs=5,
     batch_size=8,
     lr=1e-3,
     train_val_split=0.2,       # 80/20 train/validation split
     lora_config=lora_config,
+    ft_cls=['genotype', 'celltype'],
     save_dir='my_lora_adapter',  # adapter weights saved here
 )
 
-# Training prints validation MSE after each epoch and automatically
-# restores the best checkpoint (lowest validation MSE) at the end.
+# b) Train a new genotype head on all cells, starting from a freshly loaded base model
+#    (run_lora_train modifies the model it is called on)
+model_new = HFPerturbationTFModel.from_pretrained('weililab/pertTF-tiny', use_fast_transformer=True, fast_transformer_backend='flash')
+peft_new = model_new.run_lora_train(
+    adata=adata,
+    epochs=5,
+    batch_size=8,
+    lr=1e-3,
+    lora_config=lora_config,
+    new_cls='genotype',             # adata.obs column to predict
+    new_cls_task='classification',  # or 'regression' for a numeric column
+    save_dir='my_lora_new_head_adapter',
+)
 ```
 
 The `run_lora_train` method handles:
-- Wrapping the base model with PEFT/LoRA (only adapter weights are trained)
+- Wrapping the base model with PEFT/LoRA (only adapter weights, and any new head, are trained)
 - Creating train/validation data loaders from your AnnData
-- Training with best-model checkpointing based on validation MSE
-- Saving the adapter to `save_dir` (produces `adapter_config.json` and `adapter_model.safetensors`)
+- Training with best-model checkpointing on the validation loss of the chosen heads (expression MSE by default)
+- Saving the adapter to `save_dir` (produces `adapter_config.json`, `adapter_model.safetensors` and `lora_heads.json`, which records `ft_cls` and any new head with its labels)
 
 ### Additional training options
 ```python
@@ -86,7 +116,6 @@ peft_model = model.run_lora_train(
 
 ### Load a saved adapter for inference
 ```python
-from peft import PeftModel
 from perttf.model.hf import HFPerturbationTFModel
 from perttf.model.train_function import eval_testdata
 import numpy as np
@@ -120,14 +149,26 @@ base_model = HFPerturbationTFModel.from_pretrained(
 )
 base_model.to('cuda')
 
-# 2. Apply the saved LoRA adapter
-peft_model = PeftModel.from_pretrained(base_model, 'my_lora_adapter')
+# 2. Apply the saved LoRA adapter (rebuilds a new head first when the adapter has one)
+peft_model = base_model.load_lora_adapter('my_lora_adapter')
 peft_model.eval()
 
 # 3. Run inference — returns predicted genotype and cell type
-adata_eva = eval_wrapper(peft_model, adata)
+adata_eva = eval_wrapper(peft_model, adata_known)
 adata_eva.obs['predicted_genotype']
 adata_eva.obs['predicted_celltype']
+```
+
+#### Classification with a new head
+```python
+base_new = HFPerturbationTFModel.from_pretrained('weililab/pertTF-tiny', use_fast_transformer=True, fast_transformer_backend='flash')
+base_new.to('cuda')
+peft_new = base_new.load_lora_adapter('my_lora_new_head_adapter')
+peft_new.eval()
+
+# the new head predicts from the cell embedding that eval_testdata stores in obsm['X_scGPT']
+adata_eva = eval_wrapper(peft_new, adata)
+adata_eva.obs['predicted_genotype_new'] = base_new.predict_new_cls(adata_eva.obsm['X_scGPT'])
 ```
 
 #### Perturbation prediction (expression)

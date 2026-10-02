@@ -901,13 +901,37 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         valid_indices=None,
         stratify_by=None,
         split_check_columns=None,
+        ft_cls: Optional[Union[str, list]] = None,
+        new_cls: Optional[str] = None,
+        new_cls_task: Optional[str] = None,
     ):
+        """
+        LoRA fine-tuning of a pretrained model.
+
+        ft_cls: existing classifier head(s) to keep training with their pretrained labels,
+            'genotype', 'celltype' or ['genotype', 'celltype']. adata labels must be a subset of
+            the model's labels. The heads stay frozen; LoRA adapts the transformer that feeds them.
+            None (default) trains neither classifier loss.
+        new_cls: adata.obs column predicted by a new head trained from scratch on the cell
+            embedding, with new_cls_task 'classification' or 'regression'. Only the new head's
+            loss (plus ft_cls losses) is trained in this case.
+        """
+        import copy
         import random
+        import warnings
         import numpy as np
+        import torch.nn.functional as F
         from peft import get_peft_model
         from . import train_function
+        from .modules import ClsDecoder
         from .train_data_gen import produce_training_datasets
         from ..utils.set_optimizer import create_optimizer_dict
+
+        ft_cls = [] if ft_cls is None else ([ft_cls] if isinstance(ft_cls, str) else list(ft_cls))
+        if not set(ft_cls) <= {"genotype", "celltype"}:
+            raise ValueError(f"ft_cls must be 'genotype', 'celltype', a list of both, or None; got {ft_cls}")
+        if new_cls is not None and new_cls_task not in ("classification", "regression"):
+            raise ValueError("new_cls requires new_cls_task='classification' or 'regression'")
 
         if "genotype" not in adata.obs.columns and "condition" in adata.obs.columns:
             adata.obs["genotype"] = adata.obs["condition"].copy()
@@ -954,25 +978,57 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
                 )
             ps_columns = valid_ps_columns if valid_ps_columns else None
 
-        cell_type_to_index = getattr(self, "cell_type_to_index", None)
-        if cell_type_to_index is not None and "celltype" in adata.obs.columns:
-            missing_celltypes = [x for x in adata.obs["celltype"].unique() if x not in cell_type_to_index]
-            if missing_celltypes:
+        # A fine-tuned head keeps the pretrained label -> output-slot mapping, so every adata label
+        # must already be a model label. Heads that are not fine-tuned carry no loss and keep the
+        # previous behaviour of rebuilding the mapping when labels are missing.
+        config.cell_type_classifier = "celltype" in ft_cls
+        config.genotype_classifier = "genotype" in ft_cls
+        label_mappings = {}
+        for head, obs_col, attr in (("celltype", "celltype", "cell_type_to_index"), ("genotype", "genotype", "genotype_to_index")):
+            mapping = getattr(self, attr, None)
+            adata_labels = adata.obs[obs_col].unique()
+            missing = [x for x in adata_labels if mapping is None or x not in mapping]
+            if head in ft_cls:
+                if missing:
+                    raise ValueError(
+                        f"ft_cls='{head}': adata.obs['{obs_col}'] has labels the pretrained head does not know: "
+                        f"{sorted(map(str, missing))}. Filter or rename these cells to the model labels "
+                        f"(model.{attr}), or train a new head with new_cls='{obs_col}' instead."
+                    )
+                if len(adata_labels) < len(mapping):
+                    warnings.warn(
+                        f"ft_cls='{head}': adata contains {len(adata_labels)}/{len(mapping)} of the model's labels; "
+                        "the frozen head can still predict the absent labels."
+                    )
+            elif mapping is not None and missing:
                 print(
-                    "[run_lora_train] model cell_type_to_index missing labels from current adata; "
-                    "rebuilding celltype mapping from adata."
+                    f"[run_lora_train] model {attr} missing labels from current adata; "
+                    f"rebuilding {head} mapping from adata."
                 )
-                cell_type_to_index = None
+                mapping = None
+            label_mappings[head] = mapping
+        cell_type_to_index = label_mappings["celltype"]
+        genotype_to_index = label_mappings["genotype"]
 
-        genotype_to_index = getattr(self, "genotype_to_index", None)
-        if genotype_to_index is not None and "genotype" in adata.obs.columns:
-            missing_genotypes = [x for x in adata.obs["genotype"].unique() if x not in genotype_to_index]
-            if missing_genotypes:
-                print(
-                    "[run_lora_train] model genotype_to_index missing labels from current adata; "
-                    "rebuilding genotype mapping from adata."
-                )
-                genotype_to_index = None
+        # New head on the L2-normalised <cls> embedding, the same quantity eval_testdata stores in
+        # obsm['X_scGPT'], so predictions can be made from that embedding after evaluation.
+        new_cls_info = None
+        if new_cls is not None:
+            if new_cls_task == "classification":
+                new_cls_to_index = {str(x): i for i, x in enumerate(sorted(adata.obs[new_cls].astype(str).unique()))}
+                new_cls_targets = torch.tensor(adata.obs[new_cls].astype(str).map(new_cls_to_index).to_numpy(), dtype=torch.long)
+                n_out = len(new_cls_to_index)
+            else:
+                new_cls_to_index = None
+                new_cls_targets = torch.tensor(adata.obs[new_cls].to_numpy(dtype=np.float32))
+                n_out = 1
+            new_cls_info = {"new_cls": new_cls, "new_cls_task": new_cls_task, "new_cls_to_index": new_cls_to_index, "n_out": n_out}
+            self.new_cls_head = ClsDecoder(self.d_model, n_out)
+            self.new_cls_info = new_cls_info
+            lora_config = copy.deepcopy(lora_config) if lora_config is not None else self.build_lora_config()
+            lora_config.modules_to_save = list(lora_config.modules_to_save or []) + ["new_cls_head"]
+            # cell-level prediction uses unmasked input
+            config.mask_ratio = 0.0
 
         data_gen = produce_training_datasets(
             adata_input=adata,
@@ -1003,36 +1059,88 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
 
         optimizer_dict = create_optimizer_dict(peft_model, device, config, data_gen["num_batch_types"])
 
+        def new_cls_epoch(loader, is_train):
+            # Loss of the new head plus any ft_cls heads; the expression objectives are not trained here.
+            peft_model.train(is_train)
+            pad_id = data_gen["vocab"][config.pad_token]
+            total_loss, n_cells = 0.0, 0
+            for batch_data in loader:
+                input_gene_ids = batch_data["gene_ids"].to(device)
+                with torch.set_grad_enabled(is_train), torch.amp.autocast("cuda", enabled=config.amp):
+                    output_dict = peft_model(
+                        input_gene_ids,
+                        batch_data["values"].to(device),
+                        src_key_padding_mask=input_gene_ids.eq(pad_id),
+                        batch_labels=batch_data["batch_labels"].to(device) if config.use_batch_label else None,
+                        sf=batch_data["sf"].to(device),
+                        CLS=config.cell_type_classifier,
+                        PERTPRED=config.genotype_classifier,
+                    )
+                    cell_emb = F.normalize(output_dict["transformer_output"][:, 0, :], p=2, dim=1)
+                    new_cls_pred = self.new_cls_head(cell_emb)
+                    target = new_cls_targets[batch_data["index"].long()].to(device)
+                    if new_cls_task == "classification":
+                        loss = F.cross_entropy(new_cls_pred, target)
+                    else:
+                        loss = F.mse_loss(new_cls_pred.squeeze(1), target)
+                    if config.cell_type_classifier:
+                        loss = loss + config.cell_type_classifier_weight * F.cross_entropy(
+                            output_dict["cls_output"], batch_data["celltype_labels"].to(device))
+                    if config.genotype_classifier:
+                        loss = loss + config.perturbation_classifier_weight * F.cross_entropy(
+                            output_dict["pert_output"], batch_data["perturbation_labels"].to(device))
+                if is_train:
+                    optimizer = optimizer_dict["optimizer"]
+                    scaler = optimizer_dict["scaler"]
+                    optimizer.zero_grad()
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(peft_model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                total_loss += loss.item() * len(target)
+                n_cells += len(target)
+            return total_loss / n_cells
+
         best_val_loss = float("inf")
         best_epoch = 0
         best_state_dict = None
 
         for epoch in range(1, epochs + 1):
-            train_function.train(
-                model=peft_model,
-                loader=data_gen["train_loader"],
-                config=config,
-                vocab=data_gen["vocab"],
-                optim_dict=optimizer_dict,
-                epoch=epoch,
-                logger=None,
-                device=device,
-            )
+            if new_cls is not None:
+                train_loss = new_cls_epoch(data_gen["train_loader"], is_train=True)
+                val_loss = new_cls_epoch(data_gen["valid_loader"], is_train=False)
+                print(f"Epoch {epoch}/{epochs} | train_loss: {train_loss:.4f} | val_loss: {val_loss:.4f}")
+            else:
+                train_function.train(
+                    model=peft_model,
+                    loader=data_gen["train_loader"],
+                    config=config,
+                    vocab=data_gen["vocab"],
+                    optim_dict=optimizer_dict,
+                    epoch=epoch,
+                    logger=None,
+                    device=device,
+                )
 
-            # Validation
-            val_results = train_function.evaluate(
-                model=peft_model,
-                loader=data_gen["valid_loader"],
-                config=config,
-                vocab=data_gen["vocab"],
-                epoch=epoch,
-                device=device,
-            )
-            val_mse = val_results[0]
-            print(f"Epoch {epoch}/{epochs} | val_mse: {val_mse:.4f}")
+                # Validation
+                val_results = train_function.evaluate(
+                    model=peft_model,
+                    loader=data_gen["valid_loader"],
+                    config=config,
+                    vocab=data_gen["vocab"],
+                    epoch=epoch,
+                    device=device,
+                )
+                val_mse, val_cls, val_pert = val_results[0], val_results[7], val_results[8]
+                # Select on the fine-tuned classifier losses when ft_cls is set, else on expression MSE.
+                val_loss = val_mse
+                if ft_cls:
+                    val_loss = ("celltype" in ft_cls) * val_cls + ("genotype" in ft_cls) * val_pert
+                print(f"Epoch {epoch}/{epochs} | val_mse: {val_mse:.4f} | val_cls: {val_cls:.4f} | val_pert: {val_pert:.4f}")
 
-            if val_mse < best_val_loss:
-                best_val_loss = val_mse
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
                 best_epoch = epoch
                 best_state_dict = {k: v.cpu().clone() for k, v in peft_model.state_dict().items()}
 
@@ -1040,15 +1148,41 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         if best_state_dict is not None:
             peft_model.load_state_dict(best_state_dict)
             peft_model.to(device)
-            print(f"Restored best model from epoch {best_epoch} (val_mse={best_val_loss:.4f})")
+            print(f"Restored best model from epoch {best_epoch} (val_loss={best_val_loss:.4f})")
 
         if save_dir:
             adapter_dir = Path(save_dir)
             adapter_dir.mkdir(parents=True, exist_ok=True)
             peft_model.save_pretrained(str(adapter_dir))
+            with open(adapter_dir / "lora_heads.json", "w") as f:
+                json.dump({"ft_cls": ft_cls, "new_cls_info": new_cls_info}, f, indent=2)
             print(f"Saved PEFT adapter to: {adapter_dir.resolve()}")
 
         return peft_model
+
+    def load_lora_adapter(self, adapter_dir: str):
+        """Attach a run_lora_train adapter, rebuilding the new_cls head first when one was trained."""
+        from peft import PeftModel
+        from .modules import ClsDecoder
+
+        with open(Path(adapter_dir) / "lora_heads.json") as f:
+            heads = json.load(f)
+        if heads["new_cls_info"] is not None:
+            self.new_cls_info = heads["new_cls_info"]
+            self.new_cls_head = ClsDecoder(self.d_model, self.new_cls_info["n_out"]).to(next(self.parameters()).device)
+        return PeftModel.from_pretrained(self, adapter_dir)
+
+    def predict_new_cls(self, cell_embeddings):
+        """Predict the new_cls target from eval_testdata's obsm['X_scGPT'] (L2-normalised <cls> embedding)."""
+        import numpy as np
+
+        device = next(self.new_cls_head.parameters()).device
+        with torch.no_grad():
+            pred = self.new_cls_head(torch.as_tensor(np.asarray(cell_embeddings), dtype=torch.float32, device=device)).cpu().numpy()
+        if self.new_cls_info["new_cls_task"] == "regression":
+            return pred[:, 0]
+        index_to_label = {i: label for label, i in self.new_cls_info["new_cls_to_index"].items()}
+        return np.array([index_to_label[i] for i in pred.argmax(axis=1)])
 
     def run_train(self, adata, **kwargs):
         return self.run_lora_train(adata=adata, **kwargs)
