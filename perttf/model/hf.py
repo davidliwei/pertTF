@@ -881,7 +881,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             target_modules=target_modules,
         )
         
-    def run_lora_train(
+    def run_lora_cls_train(
         self,
         adata,
         epochs: int = 1,
@@ -889,7 +889,6 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         lr: Optional[float] = None,
         train_val_split: float = 0.2,
         input_layer_key: str = "X_binned",
-        next_layer_key: str = "X_binned_next",
         lora_config=None,
         device: Optional[torch.device] = None,
         save_dir: Optional[str] = None,
@@ -933,12 +932,22 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         if new_cls is not None and new_cls_task not in ("classification", "regression"):
             raise ValueError("new_cls requires new_cls_task='classification' or 'regression'")
 
-        if "genotype" not in adata.obs.columns and "condition" in adata.obs.columns:
-            adata.obs["genotype"] = adata.obs["condition"].copy()
+        # Training and inference (eval_testdata) both read these fixed names.
+        for obs_col, example in (("genotype", "adata.obs['genotype'] = adata.obs['<perturbation column>']"),
+                                 ("celltype", "adata.obs['celltype'] = adata.obs['<cell type column>'], or 'all' for a single context")):
+            if obs_col not in adata.obs.columns:
+                raise ValueError(f"adata.obs has no '{obs_col}' column; create it first, e.g. {example}")
         if input_layer_key not in adata.layers:
-            adata.layers[input_layer_key] = adata.X.copy()
-        if next_layer_key not in adata.layers:
-            adata.layers[next_layer_key] = adata.layers[input_layer_key].copy()
+            raise ValueError(f"adata.layers has no '{input_layer_key}' layer; set it to the log-normalized expression, e.g. adata.layers['{input_layer_key}'] = adata.X")
+
+        # Checkpoint classifier flags: a head trained with its flag off was never fitted, so fine-tuning towards it is meaningless.
+        checkpoint_config = self.training_config if self.training_config is not None else {}
+        for head, flag in (("celltype", "cell_type_classifier"), ("genotype", "genotype_classifier")):
+            if head in ft_cls and not checkpoint_config.get(flag, True):
+                raise ValueError(
+                    f"ft_cls='{head}': this checkpoint was trained with {flag}=False, so its {head} head was never fitted. "
+                    f"Train a new head with new_cls='{head}', new_cls_task='classification' instead."
+                )
 
         config = self._init_default_train_config_()
         # Avoid duplicate kwarg collision in PertBatchCollator(vocab=..., **config).
@@ -948,6 +957,13 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         config.GEPC = hasattr(self, "mvc_decoder")
         config.explicit_zero_prob = bool(getattr(self, "explicit_zero_prob", False))
         config.distribution = getattr(self, "distribution", None)
+        # Classification fine-tuning always uses the identity objective, whatever the checkpoint was
+        # trained for (e.g. a pert checkpoint has this_weight=0, next_weight=1, mask_ratio=0).
+        config.next_cell_pred_type = "identity"
+        config.this_weight = 1.0
+        config.next_weight = 0.0
+        if config.mask_ratio == 0:
+            config.mask_ratio = 0.15
         if batch_size is not None:
             config.batch_size = batch_size
         if lr is not None:
@@ -973,7 +989,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             valid_ps_columns = [col for col in ps_columns if col in adata.obs.columns]
             if len(valid_ps_columns) != len(ps_columns):
                 print(
-                    f"[run_lora_train] filtered ps columns to existing obs columns: "
+                    f"[run_lora_cls_train] filtered ps columns to existing obs columns: "
                     f"{valid_ps_columns if valid_ps_columns else 'None'}"
                 )
             ps_columns = valid_ps_columns if valid_ps_columns else None
@@ -1002,7 +1018,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
                     )
             elif mapping is not None and missing:
                 print(
-                    f"[run_lora_train] model {attr} missing labels from current adata; "
+                    f"[run_lora_cls_train] model {attr} missing labels from current adata; "
                     f"rebuilding {head} mapping from adata."
                 )
                 mapping = None
@@ -1034,7 +1050,6 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             adata_input=adata,
             config=config,
             input_layer_key=input_layer_key,
-            next_layer_key=next_layer_key,
             next_cell_pred=config.next_cell_pred_type,
             cell_type_to_index=cell_type_to_index,
             genotype_to_index=genotype_to_index,
@@ -1161,7 +1176,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         return peft_model
 
     def load_lora_adapter(self, adapter_dir: str):
-        """Attach a run_lora_train adapter, rebuilding the new_cls head first when one was trained."""
+        """Attach a run_lora_cls_train adapter, rebuilding the new_cls head first when one was trained."""
         from peft import PeftModel
         from .modules import ClsDecoder
 
@@ -1184,9 +1199,6 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         index_to_label = {i: label for label, i in self.new_cls_info["new_cls_to_index"].items()}
         return np.array([index_to_label[i] for i in pred.argmax(axis=1)])
 
-    def run_train(self, adata, **kwargs):
-        return self.run_lora_train(adata=adata, **kwargs)
-        
     def eval_identity(self, adata):
         pass  
 

@@ -65,7 +65,7 @@ With neither (the default), LoRA adapts only the expression objective.
 ```python
 # a) Fine-tune the pretrained heads on cells whose genotype the model knows (CCDC6 is not one of them)
 adata_known = adata[adata.obs['genotype'].isin(model.genotype_to_index)].copy()
-peft_model = model.run_lora_train(
+peft_model = model.run_lora_cls_train(
     adata=adata_known,
     epochs=5,
     batch_size=8,
@@ -77,9 +77,9 @@ peft_model = model.run_lora_train(
 )
 
 # b) Train a new genotype head on all cells, starting from a freshly loaded base model
-#    (run_lora_train modifies the model it is called on)
+#    (run_lora_cls_train modifies the model it is called on)
 model_new = HFPerturbationTFModel.from_pretrained('weililab/pertTF-tiny', use_fast_transformer=True, fast_transformer_backend='flash')
-peft_new = model_new.run_lora_train(
+peft_new = model_new.run_lora_cls_train(
     adata=adata,
     epochs=5,
     batch_size=8,
@@ -91,7 +91,7 @@ peft_new = model_new.run_lora_train(
 )
 ```
 
-The `run_lora_train` method handles:
+The `run_lora_cls_train` method handles:
 - Wrapping the base model with PEFT/LoRA (only adapter weights, and any new head, are trained)
 - Creating train/validation data loaders from your AnnData
 - Training with best-model checkpointing on the validation loss of the chosen heads (expression MSE by default)
@@ -100,7 +100,7 @@ The `run_lora_train` method handles:
 ### Additional training options
 ```python
 # For larger datasets or GPU memory constraints:
-peft_model = model.run_lora_train(
+peft_model = model.run_lora_cls_train(
     adata=adata,
     epochs=10,
     batch_size=16,
