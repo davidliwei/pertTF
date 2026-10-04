@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 import torch
 from pathlib import Path
 from typing import Optional, Any, Union, Dict
@@ -605,6 +606,13 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             raise EnvironmentError(
                 f"model.safetensors or best_model.pt not found in {pretrained_model_name_or_path}"
             )
+        # Fingerprint of the checkpoint weights, taken before loading (which renames attention keys per
+        # backend); LoRA adapters record it so load_lora_adapter can check they get the same base.
+        weights_hash = hashlib.sha256()
+        for key in sorted(state_dict):
+            weights_hash.update(key.encode())
+            weights_hash.update(state_dict[key].contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
+        base_hash = weights_hash.hexdigest()
 
         source_config = running_params.get('pert_source_config')
         if kwargs.get('pert_sources') is not None:
@@ -631,7 +639,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             
             # Store the list of loaded layers in the model for freezing later
         model._loaded_layer_names = loaded_layers
-            
+        model.base_hash = base_hash
+
         print(f"Model loaded. {len(loaded_layers)} layers transferred.")
 
         return model
@@ -884,6 +893,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
     def run_lora_cls_train(
         self,
         adata,
+        cls_col: str,
+        cls_task: str,
         epochs: int = 1,
         batch_size: Optional[int] = None,
         lr: Optional[float] = None,
@@ -893,158 +904,76 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         device: Optional[torch.device] = None,
         save_dir: Optional[str] = None,
         amp: Optional[bool] = None,
-        amp_dtype: Optional[str] = None,
-        log_interval: Optional[int] = None,
         seed: Optional[int] = None,
         train_indices=None,
         valid_indices=None,
         stratify_by=None,
         split_check_columns=None,
-        ft_cls: Optional[Union[str, list]] = None,
-        new_cls: Optional[str] = None,
-        new_cls_task: Optional[str] = None,
+        this_weight: float = 1.0,
     ):
         """
-        LoRA fine-tuning of a pretrained model.
+        LoRA fine-tuning with a new head that predicts a cell-level target from the cell embedding.
 
-        ft_cls: existing classifier head(s) to keep training with their pretrained labels,
-            'genotype', 'celltype' or ['genotype', 'celltype']. adata labels must be a subset of
-            the model's labels. The heads stay frozen; LoRA adapts the transformer that feeds them.
-            None (default) trains neither classifier loss.
-        new_cls: adata.obs column predicted by a new head trained from scratch on the cell
-            embedding, with new_cls_task 'classification' or 'regression'. Only the new head's
-            loss (plus ft_cls losses) is trained in this case.
+        cls_col: adata.obs column to predict, with cls_task 'classification' or 'regression'. The head
+            is trained from scratch on the L2-normalised <cls> embedding (obsm['X_scGPT'] after
+            eval_testdata) and saved in the adapter together with its labels.
+        this_weight: weight of the expression reconstruction losses of the cell itself (masked-gene MSE
+            and GEPC/MVC), trained in the same forward pass on masked input; 0 trains the head loss only
+            on unmasked input.
+        The split is random (train_val_split, optionally stratify_by) unless train_indices/valid_indices
+        are given. For classification, cls_col is checked so every validation class is also in training;
+        split_check_columns adds further columns to check. Checkpoints are selected on the validation loss of the head.
         """
         import copy
-        import random
-        import warnings
         import numpy as np
-        import torch.nn.functional as F
-        from peft import get_peft_model
-        from . import train_function
+        from . import lora
         from .modules import ClsDecoder
         from .train_data_gen import produce_training_datasets
-        from ..utils.set_optimizer import create_optimizer_dict
 
-        ft_cls = [] if ft_cls is None else ([ft_cls] if isinstance(ft_cls, str) else list(ft_cls))
-        if not set(ft_cls) <= {"genotype", "celltype"}:
-            raise ValueError(f"ft_cls must be 'genotype', 'celltype', a list of both, or None; got {ft_cls}")
-        if new_cls is not None and new_cls_task not in ("classification", "regression"):
-            raise ValueError("new_cls requires new_cls_task='classification' or 'regression'")
+        if cls_task not in ("classification", "regression"):
+            raise ValueError(f"cls_task must be 'classification' or 'regression'; got {cls_task!r}")
+        lora.check_no_adapter(self)
 
-        # Training and inference (eval_testdata) both read these fixed names.
-        for obs_col, example in (("genotype", "adata.obs['genotype'] = adata.obs['<perturbation column>']"),
-                                 ("celltype", "adata.obs['celltype'] = adata.obs['<cell type column>'], or 'all' for a single context")):
-            if obs_col not in adata.obs.columns:
-                raise ValueError(f"adata.obs has no '{obs_col}' column; create it first, e.g. {example}")
-        if input_layer_key not in adata.layers:
-            raise ValueError(f"adata.layers has no '{input_layer_key}' layer; set it to the log-normalized expression, e.g. adata.layers['{input_layer_key}'] = adata.X")
-
-        # Checkpoint classifier flags: a head trained with its flag off was never fitted, so fine-tuning towards it is meaningless.
-        checkpoint_config = self.training_config if self.training_config is not None else {}
-        for head, flag in (("celltype", "cell_type_classifier"), ("genotype", "genotype_classifier")):
-            if head in ft_cls and not checkpoint_config.get(flag, True):
-                raise ValueError(
-                    f"ft_cls='{head}': this checkpoint was trained with {flag}=False, so its {head} head was never fitted. "
-                    f"Train a new head with new_cls='{head}', new_cls_task='classification' instead."
-                )
-
-        config = self._init_default_train_config_()
-        # Avoid duplicate kwarg collision in PertBatchCollator(vocab=..., **config).
-        if "vocab" in config:
-            del config["vocab"]
-        # Keep training flags aligned with the loaded model, not stale checkpoint training_config.
-        config.GEPC = hasattr(self, "mvc_decoder")
-        config.explicit_zero_prob = bool(getattr(self, "explicit_zero_prob", False))
-        config.distribution = getattr(self, "distribution", None)
-        # Classification fine-tuning always uses the identity objective, whatever the checkpoint was
-        # trained for (e.g. a pert checkpoint has this_weight=0, next_weight=1, mask_ratio=0).
+        config, ps_columns = lora.prepare_config(self, adata, input_layer_key, batch_size, lr, amp, None, seed)
+        # Always the identity objective, whatever the checkpoint was trained for (e.g. a pert checkpoint
+        # has this_weight=0, next_weight=1, mask_ratio=0); the pretrained classifier heads are not trained.
         config.next_cell_pred_type = "identity"
-        config.this_weight = 1.0
         config.next_weight = 0.0
-        if config.mask_ratio == 0:
-            config.mask_ratio = 0.15
-        if batch_size is not None:
-            config.batch_size = batch_size
-        if lr is not None:
-            config.lr = lr
-        if amp is not None:
-            config.amp = amp
-        if amp_dtype is not None:
-            config.amp_dtype = amp_dtype
-        if log_interval is not None:
-            config.log_interval = log_interval
-        config.dataset_name = Path(getattr(adata, "filename", "") or "adata").stem
-
-        # Reproducibility: seed all RNGs before data loading and training.
-        effective_seed = seed if seed is not None else config.get("seed", 42)
-        random.seed(effective_seed)
-        np.random.seed(effective_seed)
-        torch.manual_seed(effective_seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(effective_seed)
-
-        ps_columns = getattr(self, "ps_names", None)
-        if ps_columns:
-            valid_ps_columns = [col for col in ps_columns if col in adata.obs.columns]
-            if len(valid_ps_columns) != len(ps_columns):
-                print(
-                    f"[run_lora_cls_train] filtered ps columns to existing obs columns: "
-                    f"{valid_ps_columns if valid_ps_columns else 'None'}"
-                )
-            ps_columns = valid_ps_columns if valid_ps_columns else None
-
-        # A fine-tuned head keeps the pretrained label -> output-slot mapping, so every adata label
-        # must already be a model label. Heads that are not fine-tuned carry no loss and keep the
-        # previous behaviour of rebuilding the mapping when labels are missing.
-        config.cell_type_classifier = "celltype" in ft_cls
-        config.genotype_classifier = "genotype" in ft_cls
-        label_mappings = {}
-        for head, obs_col, attr in (("celltype", "celltype", "cell_type_to_index"), ("genotype", "genotype", "genotype_to_index")):
-            mapping = getattr(self, attr, None)
-            adata_labels = adata.obs[obs_col].unique()
-            missing = [x for x in adata_labels if mapping is None or x not in mapping]
-            if head in ft_cls:
-                if missing:
-                    raise ValueError(
-                        f"ft_cls='{head}': adata.obs['{obs_col}'] has labels the pretrained head does not know: "
-                        f"{sorted(map(str, missing))}. Filter or rename these cells to the model labels "
-                        f"(model.{attr}), or train a new head with new_cls='{obs_col}' instead."
-                    )
-                if len(adata_labels) < len(mapping):
-                    warnings.warn(
-                        f"ft_cls='{head}': adata contains {len(adata_labels)}/{len(mapping)} of the model's labels; "
-                        "the frozen head can still predict the absent labels."
-                    )
-            elif mapping is not None and missing:
-                print(
-                    f"[run_lora_cls_train] model {attr} missing labels from current adata; "
-                    f"rebuilding {head} mapping from adata."
-                )
-                mapping = None
-            label_mappings[head] = mapping
-        cell_type_to_index = label_mappings["celltype"]
-        genotype_to_index = label_mappings["genotype"]
-
-        # New head on the L2-normalised <cls> embedding, the same quantity eval_testdata stores in
-        # obsm['X_scGPT'], so predictions can be made from that embedding after evaluation.
-        new_cls_info = None
-        if new_cls is not None:
-            if new_cls_task == "classification":
-                new_cls_to_index = {str(x): i for i, x in enumerate(sorted(adata.obs[new_cls].astype(str).unique()))}
-                new_cls_targets = torch.tensor(adata.obs[new_cls].astype(str).map(new_cls_to_index).to_numpy(), dtype=torch.long)
-                n_out = len(new_cls_to_index)
-            else:
-                new_cls_to_index = None
-                new_cls_targets = torch.tensor(adata.obs[new_cls].to_numpy(dtype=np.float32))
-                n_out = 1
-            new_cls_info = {"new_cls": new_cls, "new_cls_task": new_cls_task, "new_cls_to_index": new_cls_to_index, "n_out": n_out}
-            self.new_cls_head = ClsDecoder(self.d_model, n_out)
-            self.new_cls_info = new_cls_info
-            lora_config = copy.deepcopy(lora_config) if lora_config is not None else self.build_lora_config()
-            lora_config.modules_to_save = list(lora_config.modules_to_save or []) + ["new_cls_head"]
-            # cell-level prediction uses unmasked input
+        config.this_weight = this_weight
+        config.cell_type_classifier = False
+        config.genotype_classifier = False
+        # Reconstruction needs masked genes; the head alone uses unmasked input.
+        if this_weight > 0:
+            config.mask_ratio = config.mask_ratio if config.mask_ratio > 0 else 0.15
+        else:
             config.mask_ratio = 0.0
+
+        # The genotype and celltype mappings only feed the data loader here (their heads are not trained).
+        cell_type_to_index, genotype_to_index = lora.label_mappings(self, adata, require_known=[])
+
+        if cls_task == "classification":
+            cls_to_index = {str(x): i for i, x in enumerate(sorted(adata.obs[cls_col].astype(str).unique()))}
+            cls_targets = torch.tensor(adata.obs[cls_col].astype(str).map(cls_to_index).to_numpy(), dtype=torch.long)
+            n_out = len(cls_to_index)
+        else:
+            cls_to_index = None
+            cls_targets = torch.tensor(adata.obs[cls_col].to_numpy(dtype=np.float32))
+            n_out = 1
+        cls_info = {"cls_col": cls_col, "cls_task": cls_task, "cls_to_index": cls_to_index, "n_out": n_out}
+        self.cls_head = ClsDecoder(self.d_model, n_out)
+        self.cls_info = cls_info
+        lora_config = copy.deepcopy(lora_config) if lora_config is not None else self.build_lora_config()
+        # The new head is trained fully and saved inside the adapter.
+        lora_config.modules_to_save = list(lora_config.modules_to_save or []) + ["cls_head"]
+
+        # Only the cls_col labels are learned, so by default only they are checked (validation classes
+        # must be in training); continuous regression targets are not checked.
+        if split_check_columns is None:
+            split_check_columns = []
+        elif isinstance(split_check_columns, str):
+            split_check_columns = [split_check_columns]
+        if cls_task == "classification" and cls_col not in split_check_columns:
+            split_check_columns = list(split_check_columns) + [cls_col]
 
         data_gen = produce_training_datasets(
             adata_input=adata,
@@ -1064,140 +993,191 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
 
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        peft_model, optimizer_dict = lora.wrap(self, lora_config, config, device, data_gen["num_batch_types"])
 
-        self.to(device)
-        peft_model = get_peft_model(self, lora_config or self.build_lora_config()).to(device)
+        epoch_kwargs = dict(config=config, device=device, pad_id=data_gen["vocab"][config.pad_token],
+                            cls_targets=cls_targets, cls_task=cls_task, optimizer_dict=optimizer_dict)
 
-        # train_function logs through wandb by default; keep this entry-point side-effect free.
-        if hasattr(train_function, "wandb") and hasattr(train_function.wandb, "log"):
-            train_function.wandb.log = lambda *args, **kwargs: None
+        def run_epoch(epoch):
+            train_head, train_recon = lora.cls_epoch(peft_model, self.cls_head, data_gen["train_loader"], is_train=True, **epoch_kwargs)
+            val_head, val_recon = lora.cls_epoch(peft_model, self.cls_head, data_gen["valid_loader"], is_train=False, **epoch_kwargs)
+            print(f"Epoch {epoch}/{epochs} | train head: {train_head:.4f} recon: {train_recon:.4f} | val head: {val_head:.4f} recon: {val_recon:.4f}")
+            return val_head
 
-        optimizer_dict = create_optimizer_dict(peft_model, device, config, data_gen["num_batch_types"])
-
-        def new_cls_epoch(loader, is_train):
-            # Loss of the new head plus any ft_cls heads; the expression objectives are not trained here.
-            peft_model.train(is_train)
-            pad_id = data_gen["vocab"][config.pad_token]
-            total_loss, n_cells = 0.0, 0
-            for batch_data in loader:
-                input_gene_ids = batch_data["gene_ids"].to(device)
-                with torch.set_grad_enabled(is_train), torch.amp.autocast("cuda", enabled=config.amp):
-                    output_dict = peft_model(
-                        input_gene_ids,
-                        batch_data["values"].to(device),
-                        src_key_padding_mask=input_gene_ids.eq(pad_id),
-                        batch_labels=batch_data["batch_labels"].to(device) if config.use_batch_label else None,
-                        sf=batch_data["sf"].to(device),
-                        CLS=config.cell_type_classifier,
-                        PERTPRED=config.genotype_classifier,
-                    )
-                    cell_emb = F.normalize(output_dict["transformer_output"][:, 0, :], p=2, dim=1)
-                    new_cls_pred = self.new_cls_head(cell_emb)
-                    target = new_cls_targets[batch_data["index"].long()].to(device)
-                    if new_cls_task == "classification":
-                        loss = F.cross_entropy(new_cls_pred, target)
-                    else:
-                        loss = F.mse_loss(new_cls_pred.squeeze(1), target)
-                    if config.cell_type_classifier:
-                        loss = loss + config.cell_type_classifier_weight * F.cross_entropy(
-                            output_dict["cls_output"], batch_data["celltype_labels"].to(device))
-                    if config.genotype_classifier:
-                        loss = loss + config.perturbation_classifier_weight * F.cross_entropy(
-                            output_dict["pert_output"], batch_data["perturbation_labels"].to(device))
-                if is_train:
-                    optimizer = optimizer_dict["optimizer"]
-                    scaler = optimizer_dict["scaler"]
-                    optimizer.zero_grad()
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(peft_model.parameters(), 1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                total_loss += loss.item() * len(target)
-                n_cells += len(target)
-            return total_loss / n_cells
-
-        best_val_loss = float("inf")
-        best_epoch = 0
-        best_state_dict = None
-
-        for epoch in range(1, epochs + 1):
-            if new_cls is not None:
-                train_loss = new_cls_epoch(data_gen["train_loader"], is_train=True)
-                val_loss = new_cls_epoch(data_gen["valid_loader"], is_train=False)
-                print(f"Epoch {epoch}/{epochs} | train_loss: {train_loss:.4f} | val_loss: {val_loss:.4f}")
-            else:
-                train_function.train(
-                    model=peft_model,
-                    loader=data_gen["train_loader"],
-                    config=config,
-                    vocab=data_gen["vocab"],
-                    optim_dict=optimizer_dict,
-                    epoch=epoch,
-                    logger=None,
-                    device=device,
-                )
-
-                # Validation
-                val_results = train_function.evaluate(
-                    model=peft_model,
-                    loader=data_gen["valid_loader"],
-                    config=config,
-                    vocab=data_gen["vocab"],
-                    epoch=epoch,
-                    device=device,
-                )
-                val_mse, val_cls, val_pert = val_results[0], val_results[7], val_results[8]
-                # Select on the fine-tuned classifier losses when ft_cls is set, else on expression MSE.
-                val_loss = val_mse
-                if ft_cls:
-                    val_loss = ("celltype" in ft_cls) * val_cls + ("genotype" in ft_cls) * val_pert
-                print(f"Epoch {epoch}/{epochs} | val_mse: {val_mse:.4f} | val_cls: {val_cls:.4f} | val_pert: {val_pert:.4f}")
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_epoch = epoch
-                best_state_dict = {k: v.cpu().clone() for k, v in peft_model.state_dict().items()}
-
-        # Restore best checkpoint
-        if best_state_dict is not None:
-            peft_model.load_state_dict(best_state_dict)
-            peft_model.to(device)
-            print(f"Restored best model from epoch {best_epoch} (val_loss={best_val_loss:.4f})")
-
-        if save_dir:
-            adapter_dir = Path(save_dir)
-            adapter_dir.mkdir(parents=True, exist_ok=True)
-            peft_model.save_pretrained(str(adapter_dir))
-            with open(adapter_dir / "lora_heads.json", "w") as f:
-                json.dump({"ft_cls": ft_cls, "new_cls_info": new_cls_info}, f, indent=2)
-            print(f"Saved PEFT adapter to: {adapter_dir.resolve()}")
-
+        lora.fit(peft_model, epochs, run_epoch, device)
+        lora.save(peft_model, save_dir, {"mode": "cls", "cls_info": cls_info})
         return peft_model
 
-    def load_lora_adapter(self, adapter_dir: str):
-        """Attach a run_lora_cls_train adapter, rebuilding the new_cls head first when one was trained."""
+    def run_lora_pert_train(
+        self,
+        adata,
+        train_indices,
+        valid_indices,
+        epochs: int = 1,
+        batch_size: Optional[int] = None,
+        lr: Optional[float] = None,
+        input_layer_key: str = "X_binned",
+        lora_config=None,
+        device: Optional[torch.device] = None,
+        save_dir: Optional[str] = None,
+        amp: Optional[bool] = None,
+        log_interval: Optional[int] = None,
+        seed: Optional[int] = None,
+        checkpoint_metric: str = "pearson_delta",
+    ):
+        """
+        LoRA fine-tuning of perturbation prediction (control cell + target perturbation -> perturbed expression).
+
+        train_indices / valid_indices are required because the split defines what is evaluated: validation
+        perturbations or cell types absent from training measure transfer to unseen perturbations or contexts.
+        Each split needs control ('WT') and perturbed cells, and every validation cell type needs both.
+        Requires a checkpoint trained with next_cell_pred_type='pert' and keeps its objective.
+
+        checkpoint_metric selects the best epoch: 'pearson_delta' (default), 'mse_delta',
+        'ttest_de_overlap_at_n', 'ttest_de_direction_match' or 'mvc_next' (validation loss of the predicted
+        perturbed expression). The delta metrics compare, per (cell type, perturbation) group with at least
+        30 cells, the mean change from control of sampled predictions and of the observed input_layer_key
+        expression, over all genes (no precomputed DE genes).
+        """
+        import numpy as np
+        from . import lora
+        from . import train_function
+        from .train_data_gen import produce_training_datasets
+        from ..utils.pert_metrics import compute_perturbation_metrics, group_moments_from_anndata, resolve_checkpoint_score
+
+        lora.check_no_adapter(self)
+        checkpoint_mode = (self.training_config or {}).get("next_cell_pred_type")
+        if checkpoint_mode != "pert":
+            raise ValueError(
+                f"run_lora_pert_train needs a checkpoint trained for perturbation prediction "
+                f"(training_config.next_cell_pred_type='pert'); this one has {checkpoint_mode!r}."
+            )
+
+        config, ps_columns = lora.prepare_config(self, adata, input_layer_key, batch_size, lr, amp, log_interval, seed)
+        # Keep the checkpoint's perturbation objective (next_weight, this_weight, mask_ratio, classifier flags).
+        config.next_cell_pred_type = "pert"
+
+        # Genotype labels select rows of the pretrained perturbation embedding, so they must all be model labels.
+        cell_type_to_index, genotype_to_index = lora.label_mappings(self, adata, require_known=["genotype"])
+
+        data_gen = produce_training_datasets(
+            adata_input=adata,
+            config=config,
+            input_layer_key=input_layer_key,
+            next_cell_pred="pert",
+            cell_type_to_index=cell_type_to_index,
+            genotype_to_index=genotype_to_index,
+            vocab=self.vocab,
+            ps_columns=ps_columns,
+            train_indices=train_indices,
+            valid_indices=valid_indices,
+        )
+
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        lora_config = lora_config if lora_config is not None else self.build_lora_config()
+        peft_model, optimizer_dict = lora.wrap(self, lora_config, config, device, data_gen["num_batch_types"])
+
+        # Observed group means of the validation cells, from the data manager's AnnData so the genes are in
+        # the same order as the predicted groups.
+        target_sum = config.get("perturbation_metric_target_sum", 10000.0)
+        reference_indices = np.concatenate([data_gen["pert_valid_target_indices"], data_gen["pert_valid_control_indices"]])
+        real_groups = group_moments_from_anndata(
+            data_gen["adata_manager"].adata, reference_indices, layer=input_layer_key, input_scale="log1p", target_sum=target_sum,
+        ).finalize()
+        metric_name = checkpoint_metric if checkpoint_metric == "mvc_next" else f"{checkpoint_metric}_sample"
+
+        def run_epoch(epoch):
+            train_function.train(
+                model=peft_model,
+                loader=data_gen["train_loader"],
+                config=config,
+                vocab=data_gen["vocab"],
+                optim_dict=optimizer_dict,
+                epoch=epoch,
+                logger=None,
+                device=device,
+            )
+            evaluation = train_function.evaluate(
+                model=peft_model,
+                loader=data_gen["valid_loader"],
+                config=config,
+                vocab=data_gen["vocab"],
+                cell_type_to_index=data_gen["cell_type_to_index"],
+                genotype_to_index=data_gen["genotype_to_index"],
+                expr_prediction_mode="sample",
+                target_sum=target_sum,
+                sample_seed=config.get("seed", None),
+                epoch=epoch,
+                device=device,
+            )
+            aggregate = compute_perturbation_metrics(
+                real_groups, evaluation["predicted_groups"], control_value="WT"
+            )["aggregate"]
+            validation_metrics = {"mvc_next": evaluation["losses"]["mvc_next"]}
+            validation_metrics.update({f"{name}_sample": value for name, value in aggregate.items()})
+            print(
+                f"Epoch {epoch}/{epochs} | val pearson_delta: {aggregate['pearson_delta']:.4f} | "
+                f"mse_delta: {aggregate['mse_delta']:.4f} | mvc_next: {validation_metrics['mvc_next']:.4f} | "
+                f"groups: {aggregate['n_evaluated_groups']}"
+            )
+            score, _, mode = resolve_checkpoint_score(validation_metrics, metric_name)
+            # lora.fit keeps the lowest score
+            return score if mode == "min" else -score
+
+        lora.fit(peft_model, epochs, run_epoch, device)
+        lora.save(peft_model, save_dir, {"mode": "pert", "cls_info": None})
+        return peft_model
+
+    @classmethod
+    def load_lora_adapter(cls, base_model_name_or_path: str, adapter_dir: str, **kwargs):
+        """
+        Load the base checkpoint (HF repo id or local dir; kwargs go to from_pretrained) and attach an
+        adapter saved by run_lora_cls_train or run_lora_pert_train, rebuilding the cls head first when one
+        was trained. Each call returns an independent model, so several adapters can be loaded side by side.
+        """
         from peft import PeftModel
         from .modules import ClsDecoder
 
         with open(Path(adapter_dir) / "lora_heads.json") as f:
             heads = json.load(f)
-        if heads["new_cls_info"] is not None:
-            self.new_cls_info = heads["new_cls_info"]
-            self.new_cls_head = ClsDecoder(self.d_model, self.new_cls_info["n_out"]).to(next(self.parameters()).device)
-        return PeftModel.from_pretrained(self, adapter_dir)
+        model = cls.from_pretrained(base_model_name_or_path, **kwargs)
+        # A different checkpoint with the same architecture would accept the adapter silently.
+        if model.base_hash != heads["base_hash"]:
+            raise ValueError(
+                f"{base_model_name_or_path} is not the base model the adapter in {adapter_dir} was trained on "
+                "(checkpoint weights differ)."
+            )
+        if heads["cls_info"] is not None:
+            model.cls_info = heads["cls_info"]
+            model.cls_head = ClsDecoder(model.d_model, model.cls_info["n_out"])
+        return PeftModel.from_pretrained(model, adapter_dir)
 
-    def predict_new_cls(self, cell_embeddings):
-        """Predict the new_cls target from eval_testdata's obsm['X_scGPT'] (L2-normalised <cls> embedding)."""
+    def predict_cls(self, adata, input_layer_key: str = "X_binned"):
+        """
+        Predict the trained cls_col for each cell: embeds the cells with this LoRA-adapted model (the
+        L2-normalised <cls> embedding the head was trained on), then applies the cls head. Call it on the
+        model returned by run_lora_cls_train or load_lora_adapter. Returns a pandas Series indexed by cell name.
+        """
         import numpy as np
+        import pandas as pd
+        from .train_function import eval_testdata
 
-        device = next(self.new_cls_head.parameters()).device
+        device = next(self.parameters()).device
+        # The head was trained in identity mode, whatever the checkpoint's own objective.
+        config = OmegaConf.merge(self.training_config, {"next_cell_pred_type": "identity"})
+        train_data_dict = {"genotype_to_index": self.genotype_to_index, "vocab": self.vocab,
+                           "cell_type_to_index": self.cell_type_to_index}
+        adata_eval = eval_testdata(self, adata, None, train_data_dict=train_data_dict, config=config,
+                                   input_layer_key=input_layer_key, device=device)
         with torch.no_grad():
-            pred = self.new_cls_head(torch.as_tensor(np.asarray(cell_embeddings), dtype=torch.float32, device=device)).cpu().numpy()
-        if self.new_cls_info["new_cls_task"] == "regression":
-            return pred[:, 0]
-        index_to_label = {i: label for label, i in self.new_cls_info["new_cls_to_index"].items()}
-        return np.array([index_to_label[i] for i in pred.argmax(axis=1)])
+            pred = self.cls_head(torch.as_tensor(adata_eval.obsm["X_scGPT"], dtype=torch.float32, device=device)).cpu().numpy()
+        if self.cls_info["cls_task"] == "regression":
+            values = pred[:, 0]
+        else:
+            index_to_label = {i: label for label, i in self.cls_info["cls_to_index"].items()}
+            values = np.array([index_to_label[i] for i in pred.argmax(axis=1)])
+        return pd.Series(values, index=adata_eval.obs_names, name=f"predicted_{self.cls_info['cls_col']}")
 
     def eval_identity(self, adata):
         pass  
