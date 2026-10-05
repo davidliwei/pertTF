@@ -99,23 +99,29 @@ def label_mappings(model, adata: AnnData, require_known) -> Tuple[Optional[Dict]
 
 
 def wrap(model, lora_config, config, device: torch.device, num_batch_types: int):
-    """Wrap the model with LoRA and build its optimizer."""
+    """Wrap the model with LoRA and build its optimizer: always AdamW with the per-epoch StepLR."""
     model.to(device)
     peft_model = get_peft_model(model, lora_config).to(device)
     # train_function logs through wandb by default; keep the LoRA entry points side-effect free.
     if hasattr(train_function, "wandb") and hasattr(train_function.wandb, "log"):
         train_function.wandb.log = lambda *args, **kwargs: None
+    # Not inherited from the checkpoint's pretraining optimizer (e.g. Muon with a cosine schedule).
+    config.optimizer = "adamw"
+    config.scheduler = "step"
+    config.warmup_epochs = 0
     optimizer_dict = create_optimizer_dict(peft_model, device, config, num_batch_types)
     return peft_model, optimizer_dict
 
 
-def fit(peft_model, epochs: int, run_epoch: Callable[[int], float], device: torch.device) -> None:
-    """Run run_epoch(epoch) -> validation score (lower is better) for each epoch and restore the lowest-score state."""
+def fit(peft_model, epochs: int, run_epoch: Callable[[int], float], device: torch.device, scheduler) -> None:
+    """Run run_epoch(epoch) -> validation score (lower is better) for each epoch, stepping the LR scheduler
+    after each, and restore the lowest-score state."""
     best_score = float("inf")
     best_epoch = 0
     best_state_dict = None
     for epoch in range(1, epochs + 1):
         score = run_epoch(epoch)
+        scheduler.step()
         if score < best_score:
             best_score = score
             best_epoch = epoch

@@ -99,11 +99,12 @@ configuration artifacts. W&B logs `train/lr` and, for Muon, `train/lr_muon` and
 `train/lr_aux_adam` for the update just attempted.
 
 For direct calls to `create_optimizer_dict`, pass
-`steps_per_epoch=len(train_loader)` when selecting cosine. The main wrapper and
-HF/LoRA entry point supply this automatically. HF/LoRA reads these options from
-the model's `training_config` and uses its requested `epochs` for the schedule.
-Existing HF/LoRA epoch-end behavior and separate DAB/adversarial schedules are
-unchanged. This extension does not add optimizer-state checkpoint resumption.
+`steps_per_epoch=len(train_loader)` when selecting cosine. The main wrapper
+supplies this automatically. LoRA fine-tuning (`run_lora_cls_train`,
+`run_lora_pert_train`) does not read these options from the checkpoint: it always
+uses AdamW with the once-per-epoch StepLR (`schedule_ratio`). Separate
+DAB/adversarial schedules are unchanged. This extension does not add
+optimizer-state checkpoint resumption.
 
 ## Tutorials
 

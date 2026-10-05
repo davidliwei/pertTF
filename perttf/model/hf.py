@@ -1004,7 +1004,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             print(f"Epoch {epoch}/{epochs} | train head: {train_head:.4f} recon: {train_recon:.4f} | val head: {val_head:.4f} recon: {val_recon:.4f}")
             return val_head
 
-        lora.fit(peft_model, epochs, run_epoch, device)
+        lora.fit(peft_model, epochs, run_epoch, device, optimizer_dict["scheduler"])
         lora.save(peft_model, save_dir, {"mode": "cls", "cls_info": cls_info})
         return peft_model
 
@@ -1125,7 +1125,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             # lora.fit keeps the lowest score
             return score if mode == "min" else -score
 
-        lora.fit(peft_model, epochs, run_epoch, device)
+        lora.fit(peft_model, epochs, run_epoch, device, optimizer_dict["scheduler"])
         lora.save(peft_model, save_dir, {"mode": "pert", "cls_info": None})
         return peft_model
 
