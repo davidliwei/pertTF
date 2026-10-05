@@ -810,12 +810,15 @@ def eval_testdata(
             adata_t.obsm[key] = value
 
     pert_preds = outputs["pert_logits"]
-    pert_shift = pert_preds - pert_preds.max(axis=1, keepdims=True)
-    X_genotype_cls_probs = np.exp(pert_shift) / np.sum(np.exp(pert_shift), axis=1, keepdims=True)
-    adata_t.obsm["X_pert_pred_probs"] = X_genotype_cls_probs
-    adata_t.obsm["genotype_pred_probs"] = X_genotype_cls_probs
-    index_to_genotype = {v: k for k, v in genotype_to_index.items()}
-    adata_t.obs["predicted_genotype"] = [index_to_genotype[i] for i in np.argmax(X_genotype_cls_probs, axis=1)]
+    # After LoRA pert_mode='new' the model has a new perturbation dictionary but keeps the pretrained genotype
+    # classifier, whose outputs then index a different label set; no genotype prediction is written.
+    if pert_preds.shape[1] == len(genotype_to_index):
+        pert_shift = pert_preds - pert_preds.max(axis=1, keepdims=True)
+        X_genotype_cls_probs = np.exp(pert_shift) / np.sum(np.exp(pert_shift), axis=1, keepdims=True)
+        adata_t.obsm["X_pert_pred_probs"] = X_genotype_cls_probs
+        adata_t.obsm["genotype_pred_probs"] = X_genotype_cls_probs
+        index_to_genotype = {v: k for k, v in genotype_to_index.items()}
+        adata_t.obs["predicted_genotype"] = [index_to_genotype[i] for i in np.argmax(X_genotype_cls_probs, axis=1)]
     if "genotype" in adata_t.obs.columns:
         adata_t.obs["genotype_id"] = adata_t.obs["genotype"].map(genotype_to_index).astype(pd.CategoricalDtype(categories=list(genotype_to_index.values())))
 

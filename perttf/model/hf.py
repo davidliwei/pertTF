@@ -1026,6 +1026,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         log_interval: Optional[int] = None,
         seed: Optional[int] = None,
         checkpoint_metric: str = "pearson_delta",
+        pert_mode: str = "ft",
+        pert_source: str = "denovo",
+        distribution: Optional[str] = "nb",
     ):
         """
         LoRA fine-tuning of perturbation prediction (control cell + target perturbation -> perturbed expression).
@@ -1033,7 +1036,23 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         train_indices / valid_indices are required because the split defines what is evaluated: validation
         perturbations or cell types absent from training measure transfer to unseen perturbations or contexts.
         Each split needs control ('WT') and perturbed cells, and every validation cell type needs both.
-        Requires a checkpoint trained with next_cell_pred_type='pert' and keeps its objective.
+
+        pert_mode:
+            'ft': a checkpoint trained with next_cell_pred_type='pert'; keeps its objective, perturbation labels
+                (adata genotypes must all be model labels) and expression decoder. LoRA also adapts the
+                perturbation encoder and the perturbed-cell encoder (pert_exp_encoder).
+            'new': any checkpoint, including one pretrained only on unperturbed cells (identity). A new
+                perturbation encoder, perturbed-cell encoder and expression decoder are trained from scratch
+                and saved with the adapter, together with the new perturbation dictionary (adata genotypes,
+                plus every gene of the feature sources). The objective is the perturbed expression plus the
+                reconstruction of the cell itself (next_weight = this_weight = 1); the pretrained classifier
+                and PS heads are not trained.
+        pert_source ('new' only): perturbation embedding, 'denovo' (one learned vector per perturbation) or
+            feature presets 'esm2', 'genept', 'gears' (joinable with '+', e.g. 'esm2+genept'). Only feature
+            sources can embed perturbations absent from training, so held-out validation perturbations must
+            be covered by the source.
+        distribution ('new' only): expression distribution of the new decoder, 'nb' (default), 'zinb', 'hnb',
+            'zig', 'pois', 'zipois', or None (MSE).
 
         checkpoint_metric selects the best epoch: 'pearson_delta' (default), 'mse_delta',
         'ttest_de_overlap_at_n', 'ttest_de_direction_match' or 'mvc_next' (validation loss of the predicted
@@ -1044,25 +1063,78 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         lr: AdamW learning rate (default: the checkpoint's training_config lr), multiplied by schedule_ratio
         after each epoch; the checkpoint's optimizer/scheduler settings are not used.
         """
+        import copy
         import numpy as np
+        from torch import nn
         from . import lora
         from . import train_function
         from .train_data_gen import produce_training_datasets
         from ..utils.pert_metrics import compute_perturbation_metrics, group_moments_from_anndata, resolve_checkpoint_score
 
+        if pert_mode not in ("ft", "new"):
+            raise ValueError(f"pert_mode must be 'ft' or 'new'; got {pert_mode!r}")
         lora.check_no_adapter(self)
         checkpoint_mode = (self.training_config or {}).get("next_cell_pred_type")
-        if checkpoint_mode != "pert":
+        if pert_mode == "ft" and checkpoint_mode != "pert":
             raise ValueError(
-                f"run_lora_pert_train needs a checkpoint trained for perturbation prediction "
-                f"(training_config.next_cell_pred_type='pert'); this one has {checkpoint_mode!r}."
+                f"pert_mode='ft' needs a checkpoint trained for perturbation prediction "
+                f"(training_config.next_cell_pred_type='pert'); this one has {checkpoint_mode!r}. "
+                "Use pert_mode='new' to train new perturbation modules on it."
             )
 
         config, ps_columns = lora.prepare_config(self, adata, input_layer_key, batch_size, lr, amp, log_interval, seed)
-        # Keep the checkpoint's perturbation objective (next_weight, this_weight, mask_ratio, classifier flags).
         config.next_cell_pred_type = "pert"
+        lora_config = copy.deepcopy(lora_config) if lora_config is not None else self.build_lora_config()
 
-        # Genotype labels select rows of the pretrained perturbation embedding, so they must all be model labels.
+        if pert_mode == "ft":
+            # Keep the checkpoint's perturbation objective (next_weight, this_weight, mask_ratio, classifier flags).
+            # LoRA also adapts the pretrained perturbation encoder and perturbed-cell encoder.
+            pert_layers = [
+                f"{prefix}.{name}"
+                for prefix in ("pert_encoder", "pert_exp_encoder")
+                for name, module in getattr(self, prefix).named_modules()
+                if isinstance(module, (nn.Linear, nn.Embedding))
+            ]
+            lora_config.target_modules = list(lora_config.target_modules) + pert_layers
+            pert_info = None
+        else:
+            from .pert_emb import build_perturbation_mapping, load_perturbation_sources
+
+            pert_sources = load_perturbation_sources(None if pert_source == "denovo" else pert_source)
+            new_genotype_to_index = build_perturbation_mapping(sorted(adata.obs["genotype"].astype(str).unique()), pert_sources)
+            lora.attach_new_pert_modules(self, new_genotype_to_index, pert_sources, distribution)
+            # Validation perturbations absent from training are only meaningful with features from a source;
+            # otherwise their vector in the new encoder is never trained.
+            genotype = adata.obs["genotype"].astype(str)
+            unseen = set(genotype.iloc[valid_indices]) - set(genotype.iloc[train_indices])
+            untrained = sorted(g for g in unseen if self.pert_encoder.fallback_indices[new_genotype_to_index[g]] >= 0)
+            if untrained:
+                raise ValueError(
+                    f"Validation perturbations {untrained} are not in training and have no features in "
+                    f"pert_source={pert_source!r}, so their embedding would stay untrained. Use a feature source "
+                    "that covers them, or validate on perturbations that are also in training."
+                )
+            # New modules are trained fully and saved inside the adapter.
+            lora_config.modules_to_save = list(lora_config.modules_to_save or []) + ["pert_encoder", "pert_exp_encoder", "mvc_decoder"]
+            pert_info = {
+                "genotype_to_index": new_genotype_to_index,
+                "sources": {
+                    name: {"genes": source["genes"], "dim": int(self.pert_encoder.sources[name].features.shape[1])}
+                    for name, source in self.pert_encoder.source_config()["sources"].items()
+                },
+                "distribution": distribution,
+            }
+            config.GEPC = True
+            config.distribution = distribution
+            config.next_weight = 1.0
+            config.this_weight = 1.0
+            config.mask_ratio = config.mask_ratio if config.mask_ratio > 0 else 0.15
+            config.cell_type_classifier = False
+            config.genotype_classifier = False
+            config.ps_weight = 0.0
+
+        # In 'ft' mode genotype labels select rows of the pretrained perturbation embedding, so they must all be
+        # model labels; in 'new' mode the model already holds the new dictionary.
         cell_type_to_index, genotype_to_index = lora.label_mappings(self, adata, require_known=["genotype"])
 
         data_gen = produce_training_datasets(
@@ -1080,7 +1152,6 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
 
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        lora_config = lora_config if lora_config is not None else self.build_lora_config()
         peft_model, optimizer_dict = lora.wrap(self, lora_config, config, device, data_gen["num_batch_types"])
 
         # Observed group means of the validation cells, from the data manager's AnnData so the genes are in
@@ -1131,17 +1202,19 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             return score if mode == "min" else -score
 
         lora.fit(peft_model, epochs, run_epoch, device, optimizer_dict["scheduler"])
-        lora.save(peft_model, save_dir, {"mode": "pert", "cls_info": None})
+        lora.save(peft_model, save_dir, {"mode": "pert", "cls_info": None, "pert_info": pert_info})
         return peft_model
 
     @classmethod
     def load_lora_adapter(cls, base_model_name_or_path: str, adapter_dir: str, **kwargs):
         """
         Load the base checkpoint (HF repo id or local dir; kwargs go to from_pretrained) and attach an
-        adapter saved by run_lora_cls_train or run_lora_pert_train, rebuilding the cls head first when one
-        was trained. Each call returns an independent model, so several adapters can be loaded side by side.
+        adapter saved by run_lora_cls_train or run_lora_pert_train, rebuilding the cls head or the
+        pert_mode='new' perturbation modules (with their perturbation dictionary and distribution) first when
+        they were trained. Each call returns an independent model, so several adapters can be loaded side by side.
         """
         from peft import PeftModel
+        from . import lora
         from .modules import ClsDecoder
 
         with open(Path(adapter_dir) / "lora_heads.json") as f:
@@ -1156,6 +1229,12 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         if heads["cls_info"] is not None:
             model.cls_info = heads["cls_info"]
             model.cls_head = ClsDecoder(model.d_model, model.cls_info["n_out"])
+        pert_info = heads.get("pert_info")
+        if pert_info is not None:
+            # Feature tables of the saved shape; their values are restored from the adapter with the trained weights.
+            pert_sources = {name: (source["genes"], torch.zeros(len(source["genes"]), source["dim"]))
+                            for name, source in pert_info["sources"].items()}
+            lora.attach_new_pert_modules(model, pert_info["genotype_to_index"], pert_sources, pert_info["distribution"])
         return PeftModel.from_pretrained(model, adapter_dir)
 
     def predict_cls(self, adata, input_layer_key: str = "X_binned"):
