@@ -2,7 +2,7 @@
 # LoRA Fine-Tuning Tutorial
 
 You can run this tutorial on Google Colab!  
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1cDBYSzVtdGUxT4rTyeq1jPQPun9QQhI5)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/davidliwei/pertTF/blob/main/demos/tutorials/lora_finetuning_tutorial.ipynb)
 
 ### Preparation
 ```python
