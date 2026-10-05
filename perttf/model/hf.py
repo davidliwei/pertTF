@@ -920,6 +920,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         this_weight: weight of the expression reconstruction losses of the cell itself (masked-gene MSE
             and GEPC/MVC), trained in the same forward pass on masked input; 0 trains the head loss only
             on unmasked input.
+        lr: AdamW learning rate (default: the checkpoint's training_config lr), multiplied by schedule_ratio
+            after each epoch; the checkpoint's optimizer/scheduler settings are not used.
         The split is random (train_val_split, optionally stratify_by) unless train_indices/valid_indices
         are given. For classification, cls_col is checked so every validation class is also in training;
         split_check_columns adds further columns to check. Checkpoints are selected on the validation loss of the head.
@@ -1004,7 +1006,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             print(f"Epoch {epoch}/{epochs} | train head: {train_head:.4f} recon: {train_recon:.4f} | val head: {val_head:.4f} recon: {val_recon:.4f}")
             return val_head
 
-        lora.fit(peft_model, epochs, run_epoch, device)
+        lora.fit(peft_model, epochs, run_epoch, device, optimizer_dict["scheduler"])
         lora.save(peft_model, save_dir, {"mode": "cls", "cls_info": cls_info})
         return peft_model
 
@@ -1038,6 +1040,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         perturbed expression). The delta metrics compare, per (cell type, perturbation) group with at least
         30 cells, the mean change from control of sampled predictions and of the observed input_layer_key
         expression, over all genes (no precomputed DE genes).
+
+        lr: AdamW learning rate (default: the checkpoint's training_config lr), multiplied by schedule_ratio
+        after each epoch; the checkpoint's optimizer/scheduler settings are not used.
         """
         import numpy as np
         from . import lora
@@ -1125,7 +1130,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             # lora.fit keeps the lowest score
             return score if mode == "min" else -score
 
-        lora.fit(peft_model, epochs, run_epoch, device)
+        lora.fit(peft_model, epochs, run_epoch, device, optimizer_dict["scheduler"])
         lora.save(peft_model, save_dir, {"mode": "pert", "cls_info": None})
         return peft_model
 

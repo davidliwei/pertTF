@@ -44,6 +44,7 @@ tutorials/feature_pert_encoder_demo
 :caption: Guides
 
 guides/run_on_hpc
+guides/training_options
 ```
 
 ## References

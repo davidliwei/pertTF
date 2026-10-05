@@ -296,8 +296,16 @@ def train(model: nn.Module,
                     f"scaler. The current scale is {scaler.get_scale()}. This warning "
                     "can be ignored if no longer occurs after autoscaling of the scaler."
                 )
+        metrics_to_log['train/lr'] = optimizer.param_groups[0]['lr']
+        if optim_dict.get('optimizer_config', {}).get('optimizer') == 'muon':
+            metrics_to_log['train/lr_muon'] = optimizer.param_groups[0]['lr']
+            metrics_to_log['train/lr_aux_adam'] = optimizer.param_groups[1]['lr']
+        scale_before = scaler.get_scale()
         scaler.step(optimizer)
         scaler.update()
+        # An AMP overflow skips the optimizer update and reduces the scale.
+        if optim_dict.get('scheduler_interval', 'epoch') == 'update' and scaler.get_scale() >= scale_before:
+            scheduler.step()
 
         if config.ADV:
             # rerun the model for adversarial training
@@ -836,7 +844,9 @@ def wrapper_train(model, config, data_gen,
     num_batch_types = data_gen['num_batch_types']
     vocab = data_gen['vocab']
 
-    optimizer_dict = create_optimizer_dict(model, device, config, num_batch_types)
+    train_loader, valid_loader = data_gen['train_loader'], data_gen['valid_loader']
+    optimizer_dict = create_optimizer_dict(model, device, config, num_batch_types,
+                                           steps_per_epoch=len(train_loader))
     best_val_score = None
     best_avg_bio = 0.0
     best_model = None
@@ -848,23 +858,24 @@ def wrapper_train(model, config, data_gen,
 
     # save the current configurations before epoch starts
     torch.save(vocab, save_dir / "vocab.pt")
+    resolved_config = config.as_dict()
+    resolved_config.update(optimizer_dict['optimizer_config'])
     running_parameters={
      'cell_type_to_index': data_gen["cell_type_to_index"],
      'genotype_to_index': data_gen["genotype_to_index"],
      'genes': data_gen["genes"], # genes,
      'gene_ids': data_gen["gene_ids"], # gene_ids,
      'ps_names': data_gen["ps_names"],
-     'config': config.as_dict(), # config as dictionary
+     'config': resolved_config, # config as dictionary
     }
     from .pert_encoder import UnifiedPertEncoder
     if isinstance(model.pert_encoder, UnifiedPertEncoder):
         running_parameters['pert_source_config'] = model.pert_encoder.source_config()
     torch.save(running_parameters, save_dir / "running_parameters.pt")
     import json
-    json.dump(config.as_dict(), open(save_dir / "config.json", "w"))
+    json.dump(resolved_config, open(save_dir / "config.json", "w"))
     # later, use the following to load json file
     #config_data = json.load(open(save_dir / 'config.json', 'r'))
-    train_loader, valid_loader = data_gen['train_loader'], data_gen['valid_loader']
     perturbation_validation = data_gen.get('perturbation_validation', False)
     perturbation_reference_groups = None
     if perturbation_validation:
@@ -1068,7 +1079,8 @@ def wrapper_train(model, config, data_gen,
             wandb.log({"test/best_model_epoch":best_model_epoch})
             # wandb.log({"avg_bio": results.get("avg_bio", 0.0)})
 
-        optimizer_dict['scheduler'].step()
+        if optimizer_dict['scheduler_interval'] == 'epoch':
+            optimizer_dict['scheduler'].step()
 
         if optimizer_dict['DAB_separate_optim']:
             optimizer_dict['scheduler_dab'].step()
