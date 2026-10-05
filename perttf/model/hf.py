@@ -920,6 +920,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         this_weight: weight of the expression reconstruction losses of the cell itself (masked-gene MSE
             and GEPC/MVC), trained in the same forward pass on masked input; 0 trains the head loss only
             on unmasked input.
+        lr: AdamW learning rate (default: the checkpoint's training_config lr), multiplied by schedule_ratio
+            after each epoch; the checkpoint's optimizer/scheduler settings are not used.
         The split is random (train_val_split, optionally stratify_by) unless train_indices/valid_indices
         are given. For classification, cls_col is checked so every validation class is also in training;
         split_check_columns adds further columns to check. Checkpoints are selected on the validation loss of the head.
@@ -1038,6 +1040,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         perturbed expression). The delta metrics compare, per (cell type, perturbation) group with at least
         30 cells, the mean change from control of sampled predictions and of the observed input_layer_key
         expression, over all genes (no precomputed DE genes).
+
+        lr: AdamW learning rate (default: the checkpoint's training_config lr), multiplied by schedule_ratio
+        after each epoch; the checkpoint's optimizer/scheduler settings are not used.
         """
         import numpy as np
         from . import lora

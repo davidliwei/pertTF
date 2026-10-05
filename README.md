@@ -62,9 +62,21 @@ sys.path.insert(0, '/content/pertTF/')
 
 ## Training optimizers and learning-rate schedules
 
+<!-- training-options-start -->
 Existing training configurations retain Adam and the once-per-epoch StepLR
-schedule (`schedule_ratio` is the decay factor). For warmup followed by cosine
-decay, add these settings to your training configuration:
+schedule (`schedule_ratio` is the decay factor). The new training configuration
+settings and their defaults:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `optimizer` | `"adam"` | `"adam"`, `"adamw"` or `"muon"` |
+| `weight_decay` | `0.01` | AdamW and Muon only |
+| `muon_aux_lr_ratio` | `0.01` | Muon only: auxiliary Adam peak LR / Muon peak LR |
+| `scheduler` | `"step"` | `"step"` (StepLR once per epoch) or `"cosine"` (per update) |
+| `warmup_epochs` | `0.0` | Cosine only; fractional epochs allowed |
+
+For warmup followed by cosine decay, add these settings to your training
+configuration:
 
 ```python
 optimizer = "muon"          # "adam", "adamw", or "muon"
@@ -105,6 +117,7 @@ supplies this automatically. LoRA fine-tuning (`run_lora_cls_train`,
 uses AdamW with the once-per-epoch StepLR (`schedule_ratio`). Separate
 DAB/adversarial schedules are unchanged. This extension does not add
 optimizer-state checkpoint resumption.
+<!-- training-options-end -->
 
 ## Tutorials
 
