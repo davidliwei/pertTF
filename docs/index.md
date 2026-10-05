@@ -19,7 +19,6 @@ installation
 
 tutorials/PERTURBATION_SOURCES
 tutorials/INFERENCE
-tutorials/LORA_FINETUNING
 tutorials/lora_finetuning_tutorial
 ```
 
