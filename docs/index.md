@@ -20,6 +20,7 @@ installation
 tutorials/PERTURBATION_SOURCES
 tutorials/INFERENCE
 tutorials/lora_finetuning_tutorial
+tutorials/pretrain_finetune_tutorial
 ```
 
 ```{toctree}
