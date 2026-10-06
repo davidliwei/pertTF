@@ -497,7 +497,8 @@ class PertTFUniDataManager:
         if config.get('sampling_mode', 'simple') == 'hvg':
             self.hvg_col = config.get('hvg_col', 'highly_variable')
             assert self.hvg_col in adata.var.keys(), 'adata must have calculated HVGs or adata.var must have hvg_col'
-            n_hvg = min(self.adata.var[self.hvg_col].sum(), n_hvg)
+            # int(): a numpy count would reach config.max_seq_len, which an OmegaConf config rejects.
+            n_hvg = int(min(self.adata.var[self.hvg_col].sum(), n_hvg))
             non_hvg = min(len(self.gene_ids) - n_hvg, config.get('non_hvg_size', 1000))
             self.config.update({'max_seq_len': n_hvg + non_hvg + config.get('append_cls', True)}, allow_val_change=True)
             print(f'sampling_mode is hvg, sampling {n_hvg} HVGs + {non_hvg} non-HVGs for training')

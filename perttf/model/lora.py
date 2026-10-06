@@ -98,6 +98,33 @@ def label_mappings(model, adata: AnnData, require_known) -> Tuple[Optional[Dict]
     return mappings["celltype"], mappings["genotype"]
 
 
+def attach_new_pert_modules(model, genotype_to_index: Dict[str, int], pert_sources: dict, distribution: Optional[str]) -> None:
+    """
+    run_lora_pert_train(pert_mode='new'): replace the perturbation encoder, the perturbed-cell encoder and the
+    expression decoder with untrained modules for a new perturbation dictionary and expression distribution.
+    Used for training and again by load_lora_adapter, before the trained weights are loaded.
+    """
+    from omegaconf import OmegaConf
+    from .modules import MVCDecoder, PertExpEncoder
+    from .pert_encoder import UnifiedPertEncoder
+
+    pert_dim = model.d_model if model.pert_dim is None else model.pert_dim
+    model.genotype_to_index = genotype_to_index
+    model.pert_encoder = UnifiedPertEncoder(pert_sources, genotype_to_index, pert_dim, control_label="WT")
+    model.pert_exp_encoder = PertExpEncoder(model.d_model, model.pert_dim)
+    model.mvc_decoder = MVCDecoder(
+        model.d_model,
+        arch_style=model.mvc_decoder_style,
+        explicit_zero_prob=model.explicit_zero_prob,
+        use_batch_labels=model.use_batch_labels,
+        distribution=distribution,
+        sf_scaling=model.sf_scaling,
+    )
+    model.distribution = distribution
+    # eval_testdata reads the objective from training_config, so predictions include the perturbed cell.
+    model.training_config = OmegaConf.merge(model.training_config, {"next_cell_pred_type": "pert", "distribution": distribution})
+
+
 def wrap(model, lora_config, config, device: torch.device, num_batch_types: int):
     """Wrap the model with LoRA and build its optimizer: always AdamW with the per-epoch StepLR."""
     model.to(device)
@@ -133,7 +160,8 @@ def fit(peft_model, epochs: int, run_epoch: Callable[[int], float], device: torc
 
 
 def save(peft_model, save_dir: Optional[str], heads_info: Dict) -> None:
-    """Save the adapter plus lora_heads.json (mode, any new cls head and the base checkpoint hash), read by load_lora_adapter."""
+    """Save the adapter plus lora_heads.json (mode, any new cls head or perturbation modules and the base
+    checkpoint hash), read by load_lora_adapter."""
     if not save_dir:
         return
     adapter_dir = Path(save_dir)
