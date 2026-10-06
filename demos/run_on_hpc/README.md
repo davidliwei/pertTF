@@ -1,8 +1,8 @@
-### scGPT Slurm Job Submission on HPC
+# scGPT Slurm Job Submission on HPC
 
 This repository contains the necessary scripts to run scGPT on a High Performance Computing (HPC) cluster using Slurm. The scripts are designed to be used with the [scGPT](https://github.com/bowang-lab/scGPT) repository.
 
-### Usage
+## Usage
 
 1. Clone this repository to your HPC cluster.
 2. Update the `.env_example` file with your wandb API key and save it as `.env` in the same directory.
