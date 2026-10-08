@@ -2,7 +2,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from perturb_data_lab.loaders import MetadataIndex
+from scorpus.loaders import MetadataIndex
 from perttf.model.corpus_adapter import (
     PertTFAdapterConfig,
     PerturbationPairSampler,

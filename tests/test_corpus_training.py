@@ -8,7 +8,7 @@ import torch
 import wandb
 from scipy import sparse
 
-from perturb_data_lab import concat, from_h5ad
+from scorpus import concat, from_h5ad
 from perttf.custom_loss import GenerativeExpressionLoss
 from perttf.model.corpus_data import produce_corpus_datasets
 from perttf.model.hf import HFPerturbationTFModel

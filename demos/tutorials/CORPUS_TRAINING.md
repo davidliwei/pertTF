@@ -1,13 +1,16 @@
-# Train from perturb-data-lab corpora
+# Train from scorpus corpora
 
-pertTF owns the corpus adapter. perturb-data-lab owns conversion, sparse reads,
+pertTF owns the corpus adapter. scorpus owns conversion, sparse reads,
 original metadata, and temporary dataset composition. Installing/importing the
 ordinary pertTF model does not require the optional corpus package.
 
-For these worktrees, make both packages available explicitly:
+The corpus route needs scorpus >= 0.3.0, which is not on PyPI. Install it from
+GitHub, or put a checkout on PYTHONPATH:
 
 ```bash
-export PYTHONPATH=/path/to/perttf_corpus_data_adapter:/path/to/pdl_composable_corpora/src
+pip install git+https://github.com/weili-lab/scorpus.git
+# or
+export PYTHONPATH=/path/to/perttf_corpus_data_adapter:/path/to/scorpus/src
 ```
 
 Use the project's Python environment. Do large data preparation and training on
@@ -17,7 +20,7 @@ synthetic cells.
 ## Prepare data
 
 Convert each source independently and combine its metadata as described in
-perturb-data-lab's `docs/composable_corpora.md`. This example assumes `corpus`
+scorpus's `docs/composable_corpora.md`. This example assumes `corpus`
 has collective `perturbation`, `cell_type`, and `batch` columns and explicitly
 aligned feature IDs.
 
@@ -115,7 +118,7 @@ documented in [CORPUS_PAIRED_LOADER.md](CORPUS_PAIRED_LOADER.md).
 
 ## Verification
 
-With both worktrees on PYTHONPATH:
+With pertTF and scorpus importable:
 
 ```bash
 python -m pytest tests/test_corpus_training.py -q

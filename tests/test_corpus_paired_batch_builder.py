@@ -10,7 +10,7 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 
-from perturb_data_lab.loaders import load_corpus
+from scorpus.loaders import load_corpus
 from perttf.model.corpus_adapter import (
     PertTFAdapterConfig,
     PertTFPairedBatchLoader,

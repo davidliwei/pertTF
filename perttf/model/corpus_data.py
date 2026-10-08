@@ -7,7 +7,7 @@ from dataclasses import asdict
 import anndata as ad
 import numpy as np
 
-from perturb_data_lab.loaders import GeneTokenMapper
+from scorpus.loaders import GeneTokenMapper
 
 from .corpus_adapter import PertTFAdapterConfig, PertTFCorpusAdapter, PertTFPairedBatchLoader
 from .pert_emb import build_perturbation_mapping

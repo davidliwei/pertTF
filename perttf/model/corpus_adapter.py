@@ -12,13 +12,13 @@ import polars as pl
 import torch
 from torch.utils.data import DataLoader
 
-from perturb_data_lab.loaders.expression import ExpressionBatch
-from perturb_data_lab.loaders.gene_token_mapper import GeneTokenMapper
-from perturb_data_lab.loaders.index import MetadataIndex, _normalize_candidate_row_indices
-from perturb_data_lab.loaders.sparse_batch import SparseBatchProcessor
+from scorpus.loaders.expression import ExpressionBatch
+from scorpus.loaders.gene_token_mapper import GeneTokenMapper
+from scorpus.loaders.index import MetadataIndex, _normalize_candidate_row_indices
+from scorpus.loaders.sparse_batch import SparseBatchProcessor
 
 if TYPE_CHECKING:
-    from perturb_data_lab.loaders.corpus_loader import Corpus
+    from scorpus.loaders.corpus_loader import Corpus
 
 __all__ = [
     "PertTFAdapterConfig",

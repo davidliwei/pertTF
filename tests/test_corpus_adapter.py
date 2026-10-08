@@ -9,7 +9,7 @@ import yaml
 
 import perttf.model.corpus_adapter as loader_exports
 import perttf.model.corpus_adapter as adapter_exports
-from perturb_data_lab.loaders import FeatureRegistry, MetadataIndex, load_corpus
+from scorpus.loaders import FeatureRegistry, MetadataIndex, load_corpus
 from perttf.model.corpus_adapter import (
     PertTFAdapterConfig,
     PertTFPairedBatchBuilder,

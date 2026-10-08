@@ -1,9 +1,9 @@
 # pertTF Paired Corpus Loader
 
 `PertTFPairedBatchLoader` builds pertTF-style source/target paired batches from a
-canonicalized `perturb-data-lab` corpus. It is the recommended public path when a
+canonicalized `scorpus` corpus. It is the recommended public path when a
 training loop needs pertTF-compatible tensors. The adapter is owned by pertTF;
-perturb-data-lab supplies the model-independent corpus interface.
+scorpus supplies the model-independent corpus interface.
 
 ## Requirements
 
@@ -15,7 +15,7 @@ perturb-data-lab supplies the model-independent corpus interface.
 ## Basic Usage
 
 ```python
-from perturb_data_lab import load_corpus
+from scorpus import load_corpus
 from perttf.model.corpus_adapter import (
     PertTFAdapterConfig,
     PertTFPairedBatchLoader,

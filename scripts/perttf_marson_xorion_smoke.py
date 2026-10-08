@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run a bounded pertTF public-loader smoke on the Marson/Xorion aggregate corpus.
 
-This script loads an existing ``perturb-data-lab`` corpus, verifies per-dataset
+This script loads an existing ``scorpus`` corpus, verifies per-dataset
 ``hvg.parquet`` discovery, exercises the
 public ``PertTFPairedBatchLoader`` path until it finds a bounded mixed-dataset
 batch, and writes lightweight smoke summaries.
@@ -22,13 +22,13 @@ import numpy as np
 import torch
 import yaml
 
-from perturb_data_lab.loaders import load_corpus
+from scorpus.loaders import load_corpus
 from perttf.model.corpus_adapter import (
     PertTFAdapterConfig,
     PertTFPairedBatchLoader,
     PertTFCorpusAdapter,
 )
-from perturb_data_lab.materializers.paths import resolve_corpus_paths
+from scorpus.materializers.paths import resolve_corpus_paths
 
 
 def _utc_now() -> str:
