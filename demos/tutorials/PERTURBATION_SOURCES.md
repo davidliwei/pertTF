@@ -10,18 +10,21 @@ models using `PertLabelEncoder` or `pert_features` retain their original behavio
 from perttf.model.pert_emb import load_perturbation_sources
 
 sources = load_perturbation_sources("genept+esm2")
-# Also supported: "gears", "esm2", "genept", or any distinct combination.
+# Also supported: "gears", "esm2", "genept", "string_net", "string_prot",
+# "crispr_score_strict", "crispr_score_mean20", or any distinct combination.
 ```
 
 Names always select files from the public
 [`weililab/perturbation-embeddings`](https://huggingface.co/datasets/weililab/perturbation-embeddings)
 dataset. The default revision is pinned to
-`5b01881945b81d9250cf600fb07968539ed8292b`; `revision=` selects another release.
+`379bd319f295aafdfb98bbeda534fba92baa9085`; `revision=` selects another release.
 ESM2 and GenePT are filtered using their respective human gene lists, with
 19,516 and 19,134 entries. Public files are downloaded directly into memory,
 without a persistent HF file cache or authentication. Each preset load downloads
-again: approximately 400 MB for ESM2, 235 MB for GenePT, and 1.3 MB for GEARS
-(matrix sizes in decimal units). Keep and reuse the returned tuples to avoid
+again: approximately 400 MB for ESM2, 235 MB for GenePT, 1.3 MB for GEARS,
+40 MB for `string_net`, 81 MB for `string_prot`, and 83-86 MB for each CRISPR
+score table (matrix sizes in decimal units). See `EMBEDDING_PRESETS.md` for
+what each table contains. Keep and reuse the returned tuples to avoid
 repeated downloads. No cache directory is required or created by this loader.
 If selecting a branch/tag revision, it is resolved once before reading any files.
 Record your chosen commit SHA separately with experiment provenance; the default
@@ -82,7 +85,7 @@ The historical `genotype_index_gears` return key is retained for all source type
 - `intersect_type="common"`: use source-covered perturbations observed in AnnData.
 - `intersect_type="source"`: retain all supported source perturbations, including
   ones absent from this dataset.
-- `embed_type` accepts only `"esm2"`, `"genept"`, or `"gears"`. For a custom
+- `embed_type` accepts one preset name (see `EMBEDDING_PRESETS`). For a custom
   representation, including concatenation, load and align the vectors yourself
   and supply `custom_genes` plus `custom_embeddings` instead of a preset.
 - The optional `filter_by_human` gene-list file retains its existing behavior.

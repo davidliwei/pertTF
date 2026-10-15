@@ -19,8 +19,9 @@ from anndata import AnnData
 from .train_function import eval_testdata
 
 EMBEDDING_REPO_ID = "weililab/perturbation-embeddings"
-DEFAULT_EMBEDDING_REVISION = "5b01881945b81d9250cf600fb07968539ed8292b"
-EMBEDDING_PRESETS = {"esm2", "genept", "gears"}
+DEFAULT_EMBEDDING_REVISION = "379bd319f295aafdfb98bbeda534fba92baa9085"
+# esm2/genept/gears files are byte-identical to the previous pin 5b01881945b81d9250cf600fb07968539ed8292b.
+EMBEDDING_PRESETS = {"esm2", "genept", "gears", "string_net", "string_prot", "crispr_score_strict", "crispr_score_mean20"}
 
 
 def load_perturbation_sources(
@@ -37,7 +38,7 @@ def load_perturbation_sources(
     """
     names = [] if presets is None else presets.split("+")
     if len(names) != len(set(names)) or any(name not in EMBEDDING_PRESETS for name in names):
-        raise ValueError("Presets must be distinct names from esm2, genept, gears joined by '+'")
+        raise ValueError(f"Presets must be distinct names from {', '.join(sorted(EMBEDDING_PRESETS))} joined by '+'")
     custom_sources = {} if custom_sources is None else custom_sources
     if set(names).intersection(custom_sources):
         raise ValueError("A source cannot be specified as both an HF preset and a custom table")
@@ -175,7 +176,7 @@ def load_pert_embeddings(
     """
     Prepare a complete matrix, genotype mapping, and subset for legacy encoders.
 
-    Select one HF preset (esm2, genept, gears), or supply custom_genes and a
+    Select one HF preset from EMBEDDING_PRESETS, or supply custom_genes and a
     custom_embeddings NumPy matrix. Deprecated path1/path2 are ignored with a
     warning. Common/source cohort policies are unchanged; no missing rows are
     filled. Custom concatenation and file loading are the caller's responsibility.
@@ -192,8 +193,8 @@ def load_pert_embeddings(
             raise ValueError("custom_embeddings must have one row per custom gene")
         genes, matrix = custom_genes, custom_embeddings
     else:
-        if embed_type not in {"esm2", "genept", "gears"}:
-            raise ValueError("embed_type must be esm2, genept, or gears; prepare concatenated embeddings via the custom inputs")
+        if embed_type not in EMBEDDING_PRESETS:
+            raise ValueError(f"embed_type must be one of {', '.join(sorted(EMBEDDING_PRESETS))}; prepare concatenated embeddings via the custom inputs")
         genes, matrix = load_perturbation_sources(embed_type, revision=revision)[embed_type]
     # WT is supplied once, as a zero row, by the preparation step below.
     emb_dict = {gene: vector for gene, vector in zip(genes, matrix) if gene != 'WT'}

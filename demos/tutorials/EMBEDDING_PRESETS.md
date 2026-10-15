@@ -1,6 +1,6 @@
 # Loading perturbation embedding presets
 
-Use published ESM2, GenePT, or GEARS embeddings with the existing perturbation
+Use published ESM2, GenePT, GEARS, STRING, or DepMap CRISPR score embeddings with the existing perturbation
 lookup and feature encoders. This changes data loading, not model architecture.
 
 ## Prepare embeddings and the dataset together
@@ -80,16 +80,28 @@ are in memory and cause no downloads.
 
 Presets come from
 [`weililab/perturbation-embeddings`](https://huggingface.co/datasets/weililab/perturbation-embeddings)
-at pinned revision `5b01881945b81d9250cf600fb07968539ed8292b`:
+at pinned revision `379bd319f295aafdfb98bbeda534fba92baa9085` (the `esm2`,
+`genept` and `gears` files are identical to the previous pin
+`5b01881945b81d9250cf600fb07968539ed8292b`):
 
 | Preset | Genes | Dimensions | Matrix size |
 |---|---:|---:|---:|
 | `esm2` | 19,516 | 5,120 | ~400 MB |
 | `genept` | 19,134 | 3,072 | ~235 MB |
 | `gears` | 9,853 | 32 | ~1.3 MB |
+| `string_net` | 19,699 | 512 | ~40 MB |
+| `string_prot` | 19,699 | 1,024 | ~81 MB |
+| `crispr_score_strict` | 17,087 | 1,208 | ~83 MB |
+| `crispr_score_mean20` | 17,787 | 1,208 | ~86 MB |
 
 ESM2 and GenePT are restricted to their respective human gene lists. GEARS comes
 from a legacy checkpoint with unknown training provenance; see the dataset card.
+`string_net` (STRING SPACE network) and `string_prot` (STRING ProtT5 sequence)
+come from STRING v12.5. The CRISPR tables are DepMap 26Q1 GeneEffect profiles
+across 1,208 cell lines: `strict` keeps only complete genes, `mean20` keeps genes
+with <=20% missing values and fills them with the gene mean. These four tables use
+current HGNC symbols where the mapping is one-to-one, whereas the older three keep
+their source identifiers, so a few genes may be named differently across tables.
 
 HF files are fetched directly into memory, without a persistent file cache or
 authentication. Calling the reader again downloads again; reuse the returned

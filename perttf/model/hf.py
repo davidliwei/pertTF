@@ -1149,7 +1149,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
                 reconstruction of the cell itself (next_weight = this_weight = 1); the pretrained classifier
                 and PS heads are not trained.
         pert_source ('new' only): perturbation embedding, 'denovo' (one learned vector per perturbation) or
-            feature presets 'esm2', 'genept', 'gears' (joinable with '+', e.g. 'esm2+genept'). Only feature
+            feature presets 'esm2', 'genept', 'gears', 'string_net', 'string_prot', 'crispr_score_strict',
+            'crispr_score_mean20' (joinable with '+', e.g. 'esm2+genept'). Only feature
             sources can embed perturbations absent from training, so held-out validation perturbations must
             be covered by the source.
         distribution ('new' only): expression distribution of the new decoder, 'nb' (default), 'zinb', 'hnb',
