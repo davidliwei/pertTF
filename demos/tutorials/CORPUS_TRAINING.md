@@ -4,11 +4,12 @@ pertTF owns the corpus adapter. scorpus owns conversion, sparse reads,
 original metadata, and temporary dataset composition. Installing/importing the
 ordinary pertTF model does not require the optional corpus package.
 
-The corpus route needs scorpus >= 0.3.0, which is not on PyPI. Install it from
-GitHub, or put a checkout on PYTHONPATH:
+The corpus route needs scorpus with `scorpus.pairing` (its `main` branch; the
+version number is still 0.3.0) and its torch extra. It is not on PyPI. Install it
+from GitHub, or put a checkout on PYTHONPATH:
 
 ```bash
-pip install git+https://github.com/weili-lab/scorpus.git
+pip install "scorpus[torch] @ git+https://github.com/weili-lab/scorpus.git"
 # or
 export PYTHONPATH=/path/to/perttf_corpus_data_adapter:/path/to/scorpus/src
 ```

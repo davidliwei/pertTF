@@ -44,7 +44,7 @@ docs = [
     "myst-nb>=1.0",
     "furo",
 ]
-corpus = ["scorpus>=0.3.0"]
+corpus = ["scorpus[torch]>=0.3.0"]
 
 [project.urls]
 Homepage = "https://github.com/davidliwei/pertTF"
