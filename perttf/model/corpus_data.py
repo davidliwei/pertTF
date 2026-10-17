@@ -53,6 +53,7 @@ def produce_corpus_datasets(
     pairing_columns: tuple[str, ...] = (),
     normalization_scale: float = 1.0,
     num_workers: int = 0,
+    device="cpu",
 ):
     """Return the data_gen dictionary consumed by wrapper_train.
 
@@ -68,6 +69,9 @@ def produce_corpus_datasets(
 
     Perturbation metrics use the tokenizable intersection of the validation
     datasets' feature panels. Full-expression losses use availability masks.
+
+    Workers read expression; batches are built on ``device``. Pass the training GPU:
+    gene sampling and full expression are much slower on the CPU.
     """
     if config.get("next_cell_pred_type", "pert") != "pert" or not config.get("GEPC", False):
         raise ValueError("Corpus perturbation training requires next_cell_pred_type='pert' and GEPC=True")
@@ -125,6 +129,7 @@ def produce_corpus_datasets(
         config=adapter_config, tokens=tokens, labels=labels, batch_size=config.get("batch_size", 32),
         seq_len=config.get("max_seq_len", 1024) - 1, seed=config.get("seed", 0),
         num_workers=num_workers, multiprocessing_context="spawn" if num_workers else None,
+        persistent_workers=num_workers > 0, device=device,
     )
     metadata = corpus.metadata_index.df
     pairing = dict(context_columns=context_columns, perturbation_column=perturbation_column, control_labels=(control_label,))

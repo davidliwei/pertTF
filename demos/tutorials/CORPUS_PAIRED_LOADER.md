@@ -50,6 +50,7 @@ loader = PertTFPairedBatchLoader(
     seq_len=1024,
     batch_size=8,
     cover="source",
+    device="cuda",                                 # where batches are built
 )
 
 batch = next(iter(loader))
@@ -147,8 +148,10 @@ Batch keys:
 ## Workers and Epochs
 
 With `num_workers > 0`, worker processes only read source and target
-expression; pairing and the tensors stay in the main process. For Lance-backed
-corpora, `multiprocessing_context="spawn"` is usually safest.
+expression; pairing and the tensors stay in the main process and are built on
+`device`. Build on the GPU: gene sampling and full expression are much slower
+on the CPU. `persistent_workers=True` keeps the workers between epochs. For
+Lance-backed corpora, `multiprocessing_context="spawn"` is usually safest.
 
 Use `set_epoch(epoch)` for deterministic reshuffling between epochs:
 

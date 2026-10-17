@@ -44,6 +44,8 @@ data_gen = produce_corpus_datasets(
     pert_sources=sources,           # {source_name: (perturbation_ids, features)}
     # pairing_columns=("donor",),  # if a collective donor column is available
     normalization_scale=1.0,
+    num_workers=4,                  # expression is read in worker processes
+    device=device,                  # batches are built on the training GPU
 )
 ```
 

@@ -15,7 +15,7 @@ import polars as pl
 import torch
 from torch.utils.data import DataLoader
 
-from scorpus.loaders import ExpressionBatch, dense_counts
+from scorpus.loaders import ExpressionBatch
 from scorpus.pairing import Sampler, combine, cross, make_groups
 
 if TYPE_CHECKING:
@@ -149,12 +149,28 @@ class _PairReads:
         return batch_index, read(source_rows.tolist()), read(target_rows.tolist())
 
 
+class _EpochReads:
+    """DataLoader sampler: (batch index, source rows, target rows) of the loader's current epoch."""
+
+    def __init__(self, loader: "PertTFPairedBatchLoader") -> None:
+        self._loader = loader
+
+    def __iter__(self):
+        rows = self._loader.rows
+        for i, (source, target) in enumerate(self._loader._epoch_batches()):
+            yield i, rows[source], rows[target]
+
+    def __len__(self) -> int:
+        return len(self._loader._epoch_batches())
+
+
 def _unchanged(item):
     return item
 
 
 def _with_cls(values: torch.Tensor, cls_value) -> torch.Tensor:
-    return torch.cat([torch.full((len(values), 1), cls_value, dtype=values.dtype), values], dim=1)
+    cls_column = torch.full((len(values), 1), cls_value, dtype=values.dtype, device=values.device)
+    return torch.cat([cls_column, values], dim=1)
 
 
 class PertTFPairedBatchLoader:
@@ -165,7 +181,7 @@ class PertTFPairedBatchLoader:
     ``default_pair_sampler``). Each epoch uses every cell of the covered side once
     (``cover="source"`` for training, ``"target"`` for validation) and cuts the pairs into
     batches of ``batch_size``. Worker processes read expression; the tensors are built in the
-    main process.
+    main process, on ``device`` (a GPU is much faster for gene sampling and full expression).
 
     ``labels`` gives {label: ID} for some or all label names of ``config.label_fields``; the
     others are numbered in order of first appearance in ``rows``. The target's labels are the
@@ -188,6 +204,8 @@ class PertTFPairedBatchLoader:
         drop_last: bool = False,
         num_workers: int = 0,
         multiprocessing_context: str | None = None,
+        persistent_workers: bool = False,
+        device: torch.device | str = "cpu",
     ) -> None:
         if config.sampling_mode not in SAMPLING_MODES:
             raise ValueError(f"sampling_mode must be one of {SAMPLING_MODES}, got {config.sampling_mode!r}")
@@ -195,10 +213,16 @@ class PertTFPairedBatchLoader:
         self.rows = np.asarray(rows, dtype=np.int64)
         self.seq_len, self.batch_size, self.cover = seq_len, batch_size, cover
         self.seed, self.drop_last = seed, drop_last
+        self.device = torch.device(device)
         self.epoch = 0
         self._batches = None
         self.dataset = _PairReads(corpus.expression_reader, len(self.rows))
-        self._loader_options = dict(num_workers=num_workers, multiprocessing_context=multiprocessing_context)
+        # One DataLoader for all epochs, so persistent workers are reused; its sampler follows set_epoch.
+        self._data_loader = DataLoader(
+            self.dataset, sampler=_EpochReads(self), batch_size=None, collate_fn=_unchanged,
+            num_workers=num_workers, multiprocessing_context=multiprocessing_context,
+            persistent_workers=persistent_workers,
+        )
 
         # Per-cell metadata, indexed by position in rows.
         metadata = corpus.metadata_index.df[self.rows]
@@ -218,15 +242,19 @@ class PertTFPairedBatchLoader:
         self._size_factor = metadata["size_factor"].to_numpy().astype(np.float32)
 
         registry = corpus.feature_registry
+        on_device = self._on_device
+        self._local_to_global = on_device(registry.local_to_global_map.astype(np.int64))
+        self._n_genes = registry.global_vocab_size
+        self._has_gene = on_device(registry.dataset_has_gene)
+        self._tokenizable = on_device(tokens.tokenizable)
         # Genes without a token are never sampled.
-        self._sampling_pool = torch.as_tensor(registry.dataset_has_gene) & torch.as_tensor(tokens.tokenizable)
+        self._sampling_pool = self._has_gene & self._tokenizable
         if config.hvg_top_k is None:
-            self._hvg = torch.as_tensor(registry.hvg_mask)
+            self._hvg = on_device(registry.hvg_mask)
         else:
             ranks = registry.hvg_rank_matrix
-            self._hvg = torch.as_tensor((ranks > 0) & (ranks <= config.hvg_top_k))
-        self._token_of_gene = torch.as_tensor(tokens.token_of_gene)
-        self._tokenizable = torch.as_tensor(tokens.tokenizable)
+            self._hvg = on_device((ranks > 0) & (ranks <= config.hvg_top_k))
+        self._token_of_gene = on_device(tokens.token_of_gene)
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -245,9 +273,7 @@ class PertTFPairedBatchLoader:
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         batches = self._epoch_batches()
-        reads = [(i, self.rows[source], self.rows[target]) for i, (source, target) in enumerate(batches)]
-        loader = DataLoader(self.dataset, sampler=reads, batch_size=None, collate_fn=_unchanged, **self._loader_options)
-        for i, source_expr, target_expr in loader:
+        for i, source_expr, target_expr in self._data_loader:
             yield self._build(*batches[i], source_expr, target_expr, self._batch_seed(i))
 
     def build_batch(self, source: np.ndarray, target: np.ndarray, seed: int) -> dict[str, torch.Tensor]:
@@ -259,15 +285,15 @@ class PertTFPairedBatchLoader:
         return int(np.random.SeedSequence([self.seed, self.epoch, batch_index, 1]).generate_state(1, dtype=np.uint64)[0])
 
     def _build(self, source, target, source_expr, target_expr, seed: int) -> dict[str, torch.Tensor]:
-        config = self.config
-        counts, measured = (torch.as_tensor(a) for a in dense_counts(self.corpus, source_expr))
-        counts_next, measured_next = (torch.as_tensor(a) for a in dense_counts(self.corpus, target_expr))
-        size_factor = torch.as_tensor(self._size_factor[source])
-        size_factor_next = torch.as_tensor(self._size_factor[target])
+        config, on_device = self.config, self._on_device
+        dataset, dataset_next = on_device(self._dataset_index[source]), on_device(self._dataset_index[target])
+        counts, counts_next = self._dense_counts(source_expr, dataset), self._dense_counts(target_expr, dataset_next)
+        measured, measured_next = self._has_gene[dataset], self._has_gene[dataset_next]
+        size_factor, size_factor_next = on_device(self._size_factor[source]), on_device(self._size_factor[target])
 
         # Genes are sampled for the source cell (only measured genes with a token; -1 where it has
         # too few) and the target is read at the same genes, where its dataset measured them.
-        genes = self._sample_genes(counts, torch.as_tensor(self._dataset_index[source]), seed)
+        genes = self._sample_genes(counts, dataset, seed)
         safe_genes = genes.clamp(min=0)
         valid = genes >= 0
         valid_next = valid & measured_next.gather(1, safe_genes)
@@ -289,10 +315,10 @@ class PertTFPairedBatchLoader:
             # pertTF's sf is the normalization multiplier; the corpus stores the size factor.
             "sf": size_factor.reshape(-1, 1).reciprocal() * config.normalization_scale,
             "sf_next": size_factor_next.reshape(-1, 1).reciprocal() * config.normalization_scale,
-            "index": torch.as_tensor(self.rows[source]),
-            "next_index": torch.as_tensor(self.rows[target]),
-            "ps": torch.zeros((n_cells, 1)),
-            "ps_next": torch.zeros((n_cells, 1)),
+            "index": on_device(self.rows[source]),
+            "next_index": on_device(self.rows[target]),
+            "ps": torch.zeros((n_cells, 1), device=self.device),
+            "ps_next": torch.zeros((n_cells, 1), device=self.device),
             "full_gene_ids": _with_cls(self._token_of_gene.unsqueeze(0), self.tokens.cls_id).expand(n_cells, -1).clone(),
             "full_expr": _with_cls(self._log1p(counts, size_factor), config.cls_value),
             "full_expr_next": _with_cls(self._log1p(counts_next, size_factor_next), config.cls_value),
@@ -301,9 +327,20 @@ class PertTFPairedBatchLoader:
             "full_expr_next_mask": _with_cls(measured_next & self._tokenizable, True),
         }
         for name, ids in self._label_ids.items():
-            batch[f"{name}_labels"] = torch.as_tensor(ids[source], dtype=torch.long)
-            batch[f"{name}_labels_next"] = torch.as_tensor(ids[target], dtype=torch.long)
+            batch[f"{name}_labels"] = torch.as_tensor(ids[source], dtype=torch.long, device=self.device)
+            batch[f"{name}_labels_next"] = torch.as_tensor(ids[target], dtype=torch.long, device=self.device)
         return batch
+
+    def _dense_counts(self, expr: ExpressionBatch, dataset: torch.Tensor) -> torch.Tensor:
+        """Counts on the corpus gene axis (cells x genes), filled on the device from the sparse batch."""
+        cell = self._on_device(np.repeat(np.arange(len(dataset)), np.diff(expr.row_offsets)))
+        gene = self._local_to_global[dataset[cell], self._on_device(expr.expressed_gene_indices.astype(np.int64))]
+        counts = torch.zeros((len(dataset), self._n_genes), device=self.device)
+        counts[cell, gene] = self._on_device(expr.expression_counts.astype(np.float32))
+        return counts
+
+    def _on_device(self, array) -> torch.Tensor:
+        return torch.as_tensor(array, device=self.device)
 
     def _log1p(self, counts: torch.Tensor, size_factor: torch.Tensor) -> torch.Tensor:
         return torch.log1p(counts / size_factor.unsqueeze(1) * self.config.normalization_scale)
@@ -321,7 +358,7 @@ class PertTFPairedBatchLoader:
         probs = weight / total.clamp_min(1.0)
         drawable = probs.clone()
         drawable[total[:, 0] == 0, 0] = 1.0  # a cell with no gene to draw gets only -1
-        generator = torch.Generator().manual_seed(seed)
+        generator = torch.Generator(device=self.device).manual_seed(seed)
         genes = torch.multinomial(drawable, self.seq_len, replacement=False, generator=generator)
         return torch.where(probs.gather(1, genes) > 0, genes, -1)
 
@@ -329,7 +366,8 @@ class PertTFPairedBatchLoader:
         """Replace a ``mask_ratio`` share of the expression values (not pad or CLS) by ``mask_value``."""
         config = self.config
         maskable = (values != config.pad_value) & (values != config.cls_value)
-        scores = torch.rand(values.shape, generator=torch.Generator().manual_seed(seed))
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+        scores = torch.rand(values.shape, device=self.device, generator=generator)
         masked = values.clone()
         masked[(scores < config.mask_ratio) & maskable] = config.mask_value
         return masked

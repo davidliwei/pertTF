@@ -74,7 +74,7 @@ def _mixed(tmp_path):
 
 def _loader(corpus, rows=None, *, sampler=None, cover="source", perturbed_to_self=True, context_columns=(),
             tokens=None, labels=None, seq_len=4, batch_size=8, seed=0, num_workers=0, multiprocessing_context=None,
-            label_fields=LABELS, **config):
+            label_fields=LABELS, device="cpu", **config):
     rows = np.arange(len(corpus.metadata_index)) if rows is None else np.asarray(rows)
     sampler = sampler or default_pair_sampler(
         corpus.metadata_index.df[rows], context_columns=context_columns, perturbation_column="perturb_label",
@@ -84,6 +84,7 @@ def _loader(corpus, rows=None, *, sampler=None, cover="source", perturbed_to_sel
         corpus, sampler=sampler, rows=rows, config=PertTFAdapterConfig(label_fields=label_fields, **{"mask_ratio": 0.0, **config}),
         tokens=tokens or GeneTokens.from_corpus(corpus), seq_len=seq_len, batch_size=batch_size, cover=cover,
         labels=labels, seed=seed, num_workers=num_workers, multiprocessing_context=multiprocessing_context,
+        device=device,
     )
 
 
@@ -262,3 +263,19 @@ def test_spawn_workers_give_the_same_batches(tmp_path):
     assert len(single) == len(spawned) == 2
     for a, b in zip(single, spawned):
         assert a.keys() == b.keys() and all(torch.equal(a[key], b[key]) for key in a)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_gpu_batches(tmp_path):
+    corpus = _mixed(tmp_path)
+    cells, partners = np.array([0, 2]), np.array([1, 3])
+    cpu = _loader(corpus, seq_len=1).build_batch(cells, partners, seed=4)
+    gpu = _loader(corpus, seq_len=1, device="cuda").build_batch(cells, partners, seed=4)
+    assert gpu.keys() == cpu.keys() and all(value.device.type == "cuda" for value in gpu.values())
+    for key in ("index", "next_index", "sf", "sf_next", "full_gene_ids", "full_expr", "full_expr_next",
+                "full_expr_mask", "full_expr_next_mask", "perturbation_labels", "perturbation_labels_next"):
+        torch.testing.assert_close(gpu[key].cpu(), cpu[key])
+    # GPU random numbers may pick other genes; the values must be those of the picked genes.
+    column = gpu["gene_ids"][:, 1:] - 3                                     # token 4 + gene -> full_expr column 1 + gene
+    torch.testing.assert_close(gpu["target_values"][:, 1:], gpu["full_expr"].gather(1, column))
+    torch.testing.assert_close(gpu["target_values_next"][:, 1:], gpu["full_expr_next"].gather(1, column))
