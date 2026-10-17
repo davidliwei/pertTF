@@ -70,12 +70,12 @@ def test_two_corpora_unified_training_and_validation(tmp_path, monkeypatch):
         )
         mapping = data_gen["genotype_to_index"]
         assert "external_only" in mapping
-        assert data_gen["train_loader"].adapter.label_to_index_by_name["perturbation"] == mapping
-        assert data_gen["valid_loader"].adapter.label_to_index_by_name["perturbation"] == mapping
+        assert data_gen["train_loader"].label_to_index_by_name["perturbation"] == mapping
+        assert data_gen["valid_loader"].label_to_index_by_name["perturbation"] == mapping
         assert data_gen["metric_gene_ids"].tolist() == ["g1", "g3"]
         assert data_gen["vocab"].stoi == tokenizer
         assert data_gen["cell_type_to_index"] == {"unused_context": 0, "T": 1}
-        assert data_gen["train_loader"].adapter.label_to_index_by_name["batch"] == {"b": 0, "a": 1}
+        assert data_gen["train_loader"].label_to_index_by_name["batch"] == {"b": 0, "a": 1}
         np.testing.assert_array_equal(data_gen["gene_ids"], [4, 5, 3, 6])
         control_counts = np.array([[1., 1.], [3., 1.]])
         treated_counts = np.array([[2., 2.], [3., 1.], [5., 2.], [2., 3.]])

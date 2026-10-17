@@ -7,9 +7,9 @@ from dataclasses import asdict
 import anndata as ad
 import numpy as np
 
-from scorpus.loaders import GeneTokenMapper
+from scorpus.loaders import dense_counts
 
-from .corpus_adapter import PertTFAdapterConfig, PertTFCorpusAdapter, PertTFPairedBatchLoader, default_pair_sampler
+from .corpus_adapter import GeneTokens, PertTFAdapterConfig, PertTFPairedBatchLoader, default_pair_sampler
 from .pert_emb import build_perturbation_mapping
 from ..utils.custom_tokenizer import SimpleVocab
 from ..utils.split_check import check_train_valid_split
@@ -19,20 +19,14 @@ from ..utils.pert_metrics import GroupMoments, normalize_expression
 def corpus_reference_groups(corpus, rows, *, context_column, perturbation_column, gene_mask, target_sum=10000.0, chunk_rows=1024):
     """Stream reference moments over the same common gene axis used in evaluation."""
     selected_genes = np.flatnonzero(gene_mask)
-    global_to_output = np.full(corpus.feature_registry.global_vocab_size, -1, dtype=np.int64)
-    global_to_output[selected_genes] = np.arange(len(selected_genes))
     moments = GroupMoments()
     rows = np.asarray(rows, dtype=np.int64)
     for start in range(0, len(rows), chunk_rows):
         selected = rows[start:start + chunk_rows]
         batch = corpus.expression_reader.read_expression_flat(selected.tolist())
-        metadata = corpus.take_metadata(selected, columns=["dataset_index", context_column, perturbation_column])
-        expression = np.zeros((len(selected), len(selected_genes)), dtype=np.float64)
-        for i, dataset_index in enumerate(metadata["dataset_index"]):
-            global_ids = corpus.feature_registry.local_to_global_map[dataset_index, batch.row_gene_indices(i)]
-            positions = global_to_output[global_ids]
-            keep = positions >= 0
-            expression[i, positions[keep]] = batch.row_counts(i)[keep]
+        metadata = corpus.take_metadata(selected, columns=[context_column, perturbation_column])
+        counts, _ = dense_counts(corpus, batch, genes=selected_genes)
+        expression = counts.astype(np.float64)
         moments.update(
             normalize_expression(expression, target_sum=target_sum, input_scale="counts"),
             metadata[context_column], metadata[perturbation_column],
@@ -85,11 +79,11 @@ def produce_corpus_datasets(
         raise ValueError("Align corpus features explicitly with concat(feature_key=...) before training")
     if any(kind == "non_count" for kind in corpus.expression_kinds.values()):
         raise ValueError("This training route requires counts; a no_count corpus needs explicit preprocessing first")
-    frame = corpus.metadata_index.df.to_pandas()
     label_fields = {perturbation_column: "perturbation", celltype_column: "celltype", batch_column: "batch"}
     if len(label_fields) != 3:
         raise ValueError("Perturbation, celltype, and batch columns must be distinct")
     context_columns = list(dict.fromkeys(("dataset_id", celltype_column, *pairing_columns)))
+    frame = corpus.metadata_index.df.select(list(dict.fromkeys(["dataset_index", *label_fields, *context_columns]))).to_pandas()
     selected_rows = np.union1d(train_indices, valid_indices)
     if frame.iloc[selected_rows][list(dict.fromkeys([*label_fields, *context_columns]))].isna().any().any():
         raise ValueError("Selected training/validation metadata contains missing labels")
@@ -106,47 +100,32 @@ def produce_corpus_datasets(
     if source_ids.difference(mapping):
         raise ValueError("genotype_to_index must include external source IDs")
     adapter_config = PertTFAdapterConfig(
-        label_fields=label_fields, control_labels=(control_label,), include_full_expr=True,
-        normalize_expression="log1p", normalization_scale=normalization_scale,
+        label_fields=label_fields, normalization_scale=normalization_scale,
         mask_ratio=config.get("mask_ratio", 0.15),
-        pad_token=config.get("pad_token", "<pad>"),
         pad_value=config.get("pad_value", -2), mask_value=config.get("mask_value", -1),
         cls_value=config.get("cls_value", -3),
+        sampling_mode=config.get("sampling_mode", "uniform"),
     )
-    label_mappings = {"perturbation": mapping}
-    if cell_type_to_index is not None:
-        label_mappings["celltype"] = cell_type_to_index
-    if batch_to_index is not None:
-        label_mappings["batch"] = batch_to_index
-    gene_mapper = None
-    if tokenizer_stoi is not None:
-        # pertTF/scGPT vocabularies need not have UNK: this route excludes
-        # untokenizable genes instead of representing them with an UNK token.
-        gene_mapper = GeneTokenMapper.from_tokenizer_stoi(
-            corpus.feature_registry, tokenizer_stoi,
-            pad_token=adapter_config.pad_token, cls_token=adapter_config.cls_token,
-            feature_id_to_token=feature_id_to_token,
-        )
-    elif feature_id_to_token is not None:
-        raise ValueError("feature_id_to_token requires tokenizer_stoi")
-    adapter = PertTFCorpusAdapter.from_corpus(
-        corpus, adapter_config, row_indices=selected_rows,
-        gene_token_mapper=gene_mapper,
-        label_mappings=label_mappings,
+    # Both loaders share one ID per label; labels not supplied are numbered over the selected rows.
+    selected_frame = frame.iloc[selected_rows]
+    labels = {
+        "perturbation": mapping,
+        "celltype": cell_type_to_index or {label: i for i, label in enumerate(dict.fromkeys(selected_frame[celltype_column]))},
+        "batch": batch_to_index or {label: i for i, label in enumerate(dict.fromkeys(selected_frame[batch_column]))},
+    }
+    # A pretrained vocabulary need not have every corpus gene; genes without a token are left out.
+    tokens = GeneTokens.from_corpus(
+        corpus, tokenizer_stoi, feature_id_to_token, pad_token=config.get("pad_token", "<pad>"),
     )
-    used_datasets = frame.iloc[selected_rows]["dataset_index"].unique()
-    coverage = corpus.feature_registry.dataset_has_gene[used_datasets] & adapter.gene_token_mapper.tokenizable_by_global_id
+    used_datasets = selected_frame["dataset_index"].unique()
+    coverage = corpus.feature_registry.dataset_has_gene[used_datasets] & tokens.tokenizable
     if not coverage.any(axis=1).all():
         raise ValueError("Every selected dataset must have at least one tokenizable gene")
     options = dict(
-        adapter=adapter, batch_size=config.get("batch_size", 32),
-        seq_len=config.get("max_seq_len", 1024) - 1,
-        seed=config.get("seed", 0), drop_last=False,
-        sampling_mode=config.get("sampling_mode", "uniform"),
+        config=adapter_config, tokens=tokens, labels=labels, batch_size=config.get("batch_size", 32),
+        seq_len=config.get("max_seq_len", 1024) - 1, seed=config.get("seed", 0),
         num_workers=num_workers, multiprocessing_context="spawn" if num_workers else None,
     )
-    if options["seq_len"] < 1:
-        raise ValueError("max_seq_len must allow at least one gene and CLS")
     metadata = corpus.metadata_index.df
     pairing = dict(context_columns=context_columns, perturbation_column=perturbation_column, control_labels=(control_label,))
     train_rows = np.asarray(train_indices, dtype=np.int64)
@@ -161,7 +140,7 @@ def produce_corpus_datasets(
     )
     datasets = frame.iloc[valid_rows]["dataset_index"].unique()
     metric_gene_mask = corpus.feature_registry.dataset_has_gene[datasets].all(axis=0)
-    metric_gene_mask &= adapter.gene_token_mapper.tokenizable_by_global_id
+    metric_gene_mask &= tokens.tokenizable
     if not metric_gene_mask.any():
         raise ValueError("Validation datasets have no shared tokenizable genes")
     valid_loader.metric_gene_mask = metric_gene_mask
@@ -170,20 +149,21 @@ def produce_corpus_datasets(
         perturbation_column=perturbation_column, gene_mask=metric_gene_mask,
         target_sum=config.get("perturbation_metric_target_sum", 10000.0),
     )
+    genes = np.asarray(corpus.feature_registry.global_feature_ids)
     return {
         "train_loader": train_loader, "valid_loader": valid_loader,
-        "vocab": SimpleVocab.from_dict(adapter.to_simple_vocab_stoi()),
-        "genes": np.asarray(adapter.feature_ids_by_global_id), "gene_ids": adapter.gene_token_ids,
-        "genotype_to_index": dict(mapping), "cell_type_to_index": adapter.label_to_index_by_name["celltype"],
-        "num_batch_types": len(adapter.labels_by_name["batch"]), "ps_names": [],
+        "vocab": SimpleVocab.from_dict(tokens.stoi),
+        "genes": genes, "gene_ids": tokens.token_of_gene,
+        "genotype_to_index": dict(mapping), "cell_type_to_index": labels["celltype"],
+        "num_batch_types": len(labels["batch"]), "ps_names": [],
         "perturbation_validation": True, "control_label": control_label,
         "perturbation_reference_groups": reference_groups,
-        "metric_gene_ids": np.asarray(adapter.feature_ids_by_global_id)[metric_gene_mask],
+        "metric_gene_ids": genes[metric_gene_mask],
         "split_report": split_report,
         "corpus_config": {
             "adapter": asdict(adapter_config),
-            "batch_to_index": adapter.label_to_index_by_name["batch"],
+            "batch_to_index": labels["batch"],
             "expression_kinds": dict(corpus.expression_kinds),
-            "metric_gene_ids": np.asarray(adapter.feature_ids_by_global_id)[metric_gene_mask].tolist(),
+            "metric_gene_ids": genes[metric_gene_mask].tolist(),
         },
     }

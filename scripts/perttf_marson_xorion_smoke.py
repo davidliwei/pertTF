@@ -24,9 +24,9 @@ import yaml
 
 from scorpus.loaders import load_corpus
 from perttf.model.corpus_adapter import (
+    GeneTokens,
     PertTFAdapterConfig,
     PertTFPairedBatchLoader,
-    PertTFCorpusAdapter,
     default_pair_sampler,
 )
 from scorpus.materializers.paths import resolve_corpus_paths
@@ -107,9 +107,9 @@ def _observe_loader_batch(
 ) -> ObservedLoaderBatch:
     source_indices = np.asarray(batch["index"].detach().cpu().tolist(), dtype=np.int64)
     target_indices = np.asarray(batch["next_index"].detach().cpu().tolist(), dtype=np.int64)
-    label_columns = config.label_columns_by_name
+    label_columns = {name: column for column, name in config.label_fields.items()}
     celltype_column = label_columns["celltype"]
-    perturbation_column = label_columns[config.perturbation_label]
+    perturbation_column = label_columns["perturbation"]
     metadata_columns = ["dataset_index", celltype_column, perturbation_column]
     source_meta = corpus.take_metadata(source_indices.tolist(), columns=metadata_columns)
     target_meta = corpus.take_metadata(target_indices.tolist(), columns=metadata_columns)
@@ -199,15 +199,20 @@ def _read_expression_raw_batch(corpus, indices: list[int]) -> dict[str, Any]:
 
 def _verify_sampled_alignment(
     corpus,
-    adapter: PertTFCorpusAdapter,
+    loader: PertTFPairedBatchLoader,
     observed: ObservedLoaderBatch,
     batch: dict[str, torch.Tensor],
 ) -> dict[str, Any]:
     source_raw = _read_expression_raw_batch(corpus, observed.source_indices.tolist())
     target_raw = _read_expression_raw_batch(corpus, observed.target_indices.tolist())
-    pad_token_id = adapter.to_simple_vocab_stoi()[adapter.config.pad_token]
-    cls_offset = 1 if adapter.config.append_cls else 0
-    token_offset = adapter.special_token_offset
+    pad_token_id = loader.tokens.pad_id
+    cls_offset = 1
+    gene_of_token = {
+        int(token): gene for gene, token in enumerate(loader.tokens.token_of_gene) if loader.tokens.tokenizable[gene]
+    }
+    scale = loader.config.normalization_scale
+    source_sf = corpus.take_metadata(observed.source_indices.tolist(), columns=["size_factor"])["size_factor"]
+    target_sf = corpus.take_metadata(observed.target_indices.tolist(), columns=["size_factor"])["size_factor"]
     local_to_global = corpus.feature_registry.local_to_global_map
     checked_positions = 0
     mismatches: list[str] = []
@@ -227,9 +232,10 @@ def _verify_sampled_alignment(
             token_id = int(batch["gene_ids"][row_pos, col])
             if token_id == pad_token_id:
                 continue
-            global_id = token_id - token_offset
-            expected_source = source_counts.get(global_id, 0.0)
-            expected_target = target_counts.get(global_id, 0.0)
+            global_id = gene_of_token[token_id]
+            # Values are log1p(count / size_factor * normalization_scale).
+            expected_source = float(np.log1p(np.float32(source_counts.get(global_id, 0.0)) / np.float32(source_sf[row_pos]) * scale))
+            expected_target = float(np.log1p(np.float32(target_counts.get(global_id, 0.0)) / np.float32(target_sf[row_pos]) * scale))
             actual_source = float(batch["target_values"][row_pos, col].item())
             actual_target = float(batch["target_values_next"][row_pos, col].item())
             checked_positions += 1
@@ -253,11 +259,10 @@ def _verify_sampled_alignment(
 
 def _verify_full_expression_masks(
     corpus,
-    adapter: PertTFCorpusAdapter,
     observed: ObservedLoaderBatch,
     batch: dict[str, torch.Tensor],
 ) -> dict[str, Any]:
-    cls_offset = 1 if adapter.config.append_cls else 0
+    cls_offset = 1
     source_expected = torch.as_tensor(
         corpus.feature_registry.dataset_has_gene[observed.source_dataset_indices],
         dtype=torch.bool,
@@ -482,9 +487,8 @@ def main() -> None:
     _log("Verified hvg.parquet discovery for all datasets")
 
     loader_start = time.monotonic()
+    control_labels = tuple(dict.fromkeys(str(value) for value in args.control_label))
     config = PertTFAdapterConfig(
-        control_labels=tuple(dict.fromkeys(str(value) for value in args.control_label)),
-        include_full_expr=True,
         label_fields={
             "perturb_label": "perturbation",
             "cell_context": "celltype",
@@ -492,6 +496,9 @@ def main() -> None:
             "dataset_id": "dataset",
         },
         mask_ratio=0.0,
+        sampling_mode="hvg",
+        hvg_weight=float(args.hvg_weight),
+        hvg_top_k=int(args.hvg_top_k),
     )
     # pertTF's default training pairs within the same dataset and cell context.
     pairing_context_columns = ("dataset_index", "cell_context")
@@ -499,7 +506,7 @@ def main() -> None:
         corpus.metadata_index.df,
         context_columns=pairing_context_columns,
         perturbation_column="perturb_label",
-        control_labels=config.control_labels,
+        control_labels=control_labels,
         perturbed_to_self=True,
     )
     multiprocessing_context = command_snapshot["multiprocessing_context"]
@@ -510,30 +517,23 @@ def main() -> None:
         batch_size=int(args.batch_size),
         seq_len=int(args.seq_len),
         config=config,
+        tokens=GeneTokens.from_corpus(corpus),
         seed=int(args.seed),
-        sampling_mode="hvg",
-        hvg_weight=float(args.hvg_weight),
-        hvg_top_k=int(args.hvg_top_k),
         num_workers=int(args.num_workers),
         multiprocessing_context=multiprocessing_context,
     )
-    if not loader.effective_label_row_indices.size:
-        raise RuntimeError("public pertTF loader resolved no usable rows")
     loader_seconds = time.monotonic() - loader_start
     _log(
         "Built public pertTF loader in "
         f"{loader_seconds:.2f}s with "
-        f"{len(loader.effective_label_row_indices)} effective label rows, "
+        f"{len(loader.rows)} rows, "
         f"{len(sampler.groups.rows)} pair groups, "
         f"{sampler.n_bundles} allowed group pairs"
     )
 
-    dataset_state = dict(loader._data_loader.dataset.__dict__)
-    expression_only_state_passed = (
-        set(dataset_state) == {"_reader", "_total_rows"}
-        and all(value is not corpus.metadata_index for value in dataset_state.values())
-        and not any(isinstance(value, PertTFCorpusAdapter) for value in dataset_state.values())
-    )
+    # Worker processes receive only the expression reader.
+    dataset_state = dict(vars(loader.dataset))
+    expression_only_state_passed = set(dataset_state) == {"_reader", "_n_cells"}
     requested_dataset_ids = tuple(dict.fromkeys(str(value) for value in args.dataset_id))
     batch_start = time.monotonic()
     observed = _select_public_loader_batch(
@@ -562,8 +562,8 @@ def main() -> None:
     mixed_dataset = bool(len(set(observed.source_dataset_ids)) > 1)
     require_same_dataset = "dataset_index" in pairing_context_columns
     require_same_celltype = "cell_context" in pairing_context_columns
-    alignment = _verify_sampled_alignment(corpus, loader.adapter, observed, batch)
-    full_expr_masks = _verify_full_expression_masks(corpus, loader.adapter, observed, batch)
+    alignment = _verify_sampled_alignment(corpus, loader, observed, batch)
+    full_expr_masks = _verify_full_expression_masks(corpus, observed, batch)
 
     summary = {
         "timestamp": _utc_now(),
@@ -580,7 +580,7 @@ def main() -> None:
             "dataset_state_keys": sorted(dataset_state.keys()),
             "pairing_context_columns": list(pairing_context_columns),
             "total_row_count": int(len(corpus.metadata_index)),
-            "effective_label_row_count": int(len(loader.effective_label_row_indices)),
+            "effective_label_row_count": int(len(loader.rows)),
             "pair_group_count": int(len(sampler.groups.rows)),
             "allowed_pair_count": int(sampler.n_bundles),
         },
@@ -629,8 +629,8 @@ def main() -> None:
         "full_expression_masks": full_expr_masks,
         "runtime_notes": {
             "max_rss_mib": _max_rss_mib(),
-            "device": str(loader._builder.device),
-            "control_labels": list(config.control_labels),
+            "device": "cpu",
+            "control_labels": list(control_labels),
         },
         "timing_seconds": {
             "load_corpus": load_seconds,

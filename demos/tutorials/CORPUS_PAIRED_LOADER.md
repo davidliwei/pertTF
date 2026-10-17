@@ -1,47 +1,39 @@
 # pertTF Paired Corpus Loader
 
-`PertTFPairedBatchLoader` builds pertTF-style source/target paired batches from a
-canonicalized `scorpus` corpus. It is the recommended public path when a
-training loop needs pertTF-compatible tensors. The adapter is owned by pertTF;
-scorpus supplies the model-independent corpus interface.
+`PertTFPairedBatchLoader` builds pertTF source/target batches from a `scorpus`
+corpus. `scorpus.pairing` decides which cells are paired; the loader reads the
+cells and turns them into pertTF tensors: gene tokens, sampled genes, log1p
+expression, masking, CLS, full expression and labels. `produce_corpus_datasets`
+(see [CORPUS_TRAINING.md](CORPUS_TRAINING.md)) builds both loaders for training;
+use the loader directly to inspect batches or to pair cells differently.
 
 ## Requirements
 
-- The corpus may be directly converted or use the curated canonical workflow.
-- `load_corpus(corpus_root)` must succeed.
-- The canonical obs metadata must contain the columns used in `label_fields`.
-- `size_factor` must be available in the loaded metadata index.
+- `load_corpus(corpus_root)` must succeed (scorpus >= 0.4.0).
+- The metadata must contain the columns in `label_fields`, `dataset_index` and
+  `size_factor`, with no missing labels in the loader's rows.
 
 ## Basic Usage
-
-Which cells are paired is described with `scorpus.pairing` (see scorpus
-`docs/pairing.md`). `default_pair_sampler` builds pertTF's default pairs; the
-loader turns them into batches.
 
 ```python
 import numpy as np
 from scorpus import load_corpus
 from perttf.model.corpus_adapter import (
+    GeneTokens,
     PertTFAdapterConfig,
     PertTFPairedBatchLoader,
     default_pair_sampler,
 )
 
 corpus = load_corpus("/path/to/corpus")
+rows = np.arange(len(corpus.metadata_index))      # or the training rows
 
 config = PertTFAdapterConfig(
-    label_fields={
-        "perturb_label": "perturbation",
-        "cell_context": "celltype",
-        "batch_id": "batch",
-    },
-    perturbation_label="perturbation",
-    control_labels=("ctrl",),
-    normalize_expression="log1p",
+    label_fields={"perturb_label": "perturbation", "cell_context": "celltype", "batch_id": "batch"},
     normalization_scale=1.0,
+    sampling_mode="hvg",
+    hvg_top_k=2000,
 )
-
-rows = np.arange(len(corpus.metadata_index))      # or the training rows
 sampler = default_pair_sampler(
     corpus.metadata_index.df[rows],
     context_columns=("dataset_index", "cell_context"),
@@ -53,47 +45,32 @@ loader = PertTFPairedBatchLoader(
     corpus,
     sampler=sampler,
     rows=rows,
-    cover="source",
-    batch_size=8,
-    seq_len=1024,
     config=config,
-    sampling_mode="hvg",
-    hvg_top_k=2000,
-    num_workers=0,
+    tokens=GeneTokens.from_corpus(corpus),
+    seq_len=1024,
+    batch_size=8,
+    cover="source",
 )
 
 batch = next(iter(loader))
+batch = loader.build_batch(np.array([0, 1]), np.array([1, 1]), seed=0)   # chosen cells
 ```
 
-## Label Configuration
+## Gene Tokens
 
-`label_fields` maps corpus metadata columns to pertTF label names.
+`GeneTokens.from_corpus(corpus)` makes a new vocabulary: `<pad>`, `<cls>`,
+`<unk>`, `<eos>`, then the corpus genes. For a pretrained checkpoint pass its
+vocabulary, `GeneTokens.from_corpus(corpus, tokenizer_stoi, feature_id_to_token)`;
+corpus genes it lacks get no token and are never sampled or scored.
 
-Example:
+## Labels
 
-```python
-label_fields={
-    "perturb_label": "perturbation",
-    "cell_context": "celltype",
-    "batch_id": "batch",
-}
-```
-
-This produces batch keys such as:
-
-- `perturbation_labels`
-- `perturbation_labels_next`
-- `celltype_labels`
-- `celltype_labels_next`
-- `batch_labels`
-- `batch_labels_next`
-
-`perturbation_label` names the configured label used for the perturbation
-label tensors. It must refer to one of the label names, not the raw metadata
-column name. The target's perturbation label is always the target cell's own.
-
-`control_labels` lists the metadata values treated as controls. Match these to
-the values produced by canonicalization, for example `("ctrl",)` or `("WT",)`.
+`label_fields` maps metadata columns to pertTF label names and gives the batch
+keys `{name}_labels` (source) and `{name}_labels_next` (target), for example
+`perturbation_labels` and `celltype_labels_next`. The target's labels are the
+target cell's own. Pass `labels={name: {label: id}}` to fix IDs (for example a
+checkpoint's `genotype_to_index`); other labels are numbered in order of first
+appearance in `rows`. Rows with a missing label raise: leave them out of `rows`.
 
 ## Which Cells Are Paired
 
@@ -131,7 +108,8 @@ groups = make_groups(metadata, by=["dataset_index", "perturb_label"])
 is_ctrl = pl.col("perturb_label") == "ctrl"
 pairs = cross(groups, on=["dataset_index"], source=~is_ctrl, target=is_ctrl)
 loader = PertTFPairedBatchLoader(
-    corpus, sampler=Sampler(groups, pairs), rows=rows, batch_size=16, seq_len=512, config=config,
+    corpus, sampler=Sampler(groups, pairs), rows=rows, config=config,
+    tokens=GeneTokens.from_corpus(corpus), seq_len=512, batch_size=16,
 )
 ```
 
@@ -140,60 +118,37 @@ pairs and cuts them into batches of `batch_size`; with `drop_last=True` the
 final incomplete batch is omitted. pertTF needs one source cell per target
 cell, so set-level samples must have equal numbers of cells on both sides.
 
-`loader.effective_label_row_indices` lists the rows kept for label lookup after
-null-label filtering.
-
-## Null Labels
-
-By default, rows with null values for the perturbation label are dropped from
-the loader's label lookup; `default_pair_sampler` never pairs them.
-
-Use `drop_null_labels` to control which labels trigger dropping (a custom pair
-table must not pair the dropped rows):
-
-```python
-config = PertTFAdapterConfig(
-    label_fields={"perturb_label": "perturbation", "cell_context": "celltype"},
-    perturbation_label="perturbation",
-    drop_null_labels=("perturbation", "celltype"),
-)
-```
-
-The names in `drop_null_labels` are label names from `label_fields`.
-
 ## Sampling and Tensor Shape
 
-Main sampling knobs:
+`seq_len` genes are drawn per source cell, without replacement, from the genes
+its dataset measured that have a token; the target cell is read at the same
+genes. `sampling_mode` sets the weights:
 
-- `seq_len`: number of sampled gene tokens before optional CLS insertion
-- `sampling_mode`: usually `"hvg"`
-- `hvg_top_k`: optional limit for HVG-prioritized sampling
-- `expressed_weight` and `hvg_weight`: weights for expressed and HVG genes
-- `missing_token_policy`: behavior for genes that cannot be tokenized
+- `"uniform"`: every gene the same
+- `"expressed"`: expressed genes get `1 + expressed_weight`
+- `"hvg"`: HVGs get `1 + hvg_weight`; the dataset's default HVGs, or its
+  `hvg_top_k` highest ranked (from `hvg.parquet`)
 
-Major output keys:
+Batch keys:
 
-- `gene_ids`, `next_gene_ids`: sampled token IDs
-- `values`: masked source expression values
+- `gene_ids`, `next_gene_ids`: CLS, then the sampled genes' token IDs
+- `values`: source values with a `mask_ratio` share replaced by `mask_value`
 - `target_values`: unmasked source values
-- `target_values_next`: paired target values aligned to sampled source genes
-- with `normalize_expression="log1p"`, expression values are `log1p(count / size_factor * normalization_scale)`
-- `sf`, `sf_next`: `normalization_scale / size_factor`, matching pertTF's normalization-multiplier convention
-- `index`, `next_index`: source and target global row indices
-- `{label}_labels`, `{label}_labels_next`: integer label IDs for configured labels
-
-If `PertTFAdapterConfig(include_full_expr=True)` is used, the loader also emits:
-
-- `full_gene_ids`
-- `full_expr`
-- `full_expr_next`
-- `full_expr_mask`
-- `full_expr_next_mask`
+- `target_values_next`: target values at the source's genes
+- expression values are `log1p(count / size_factor * normalization_scale)`;
+  positions without a gene hold `pad_value`, the CLS position `cls_value`
+- `sf`, `sf_next`: `normalization_scale / size_factor`, pertTF's normalization multiplier
+- `index`, `next_index`: source and target corpus rows
+- `{label}_labels`, `{label}_labels_next`: label IDs
+- `full_gene_ids`, `full_expr`, `full_expr_next`: every corpus gene, after CLS
+- `full_expr_mask`, `full_expr_next_mask`: genes the cell's dataset measured and
+  that have a token; the full-expression losses use only these
 
 ## Workers and Epochs
 
-With `num_workers > 0`, pair planning stays in the main process. Worker processes
-only read source and target expression rows.
+With `num_workers > 0`, worker processes only read source and target
+expression; pairing and the tensors stay in the main process. For Lance-backed
+corpora, `multiprocessing_context="spawn"` is usually safest.
 
 Use `set_epoch(epoch)` for deterministic reshuffling between epochs:
 
@@ -204,13 +159,10 @@ for epoch in range(10):
         train_step(batch)
 ```
 
-For Lance-backed corpora, `multiprocessing_context="spawn"` is usually safest
-when using workers.
-
 ## Common Failures
 
-- Missing metadata column: load the corpus with the needed canonical obs column or fix `label_fields`.
-- No valid control rows: make sure `control_labels` matches canonical `perturb_label` values.
+- Missing metadata column: load the corpus with the needed column or fix `label_fields`.
+- No valid control rows: make sure `control_labels` matches the `perturb_label` values.
 - Perturbed groups without a control (validation): relax `context_columns` or include those contexts' controls in `rows`.
-- Too many rows dropped: inspect nulls in the metadata columns listed in `drop_null_labels`.
-- Missing HVG rankings: run `recalc-hvg` or use a sampling mode that does not depend on HVG ranks.
+- Missing labels: filter those rows out of `rows`.
+- No HVG rankings: `"hvg"` then samples uniformly; run `recalc-hvg` for rankings.
