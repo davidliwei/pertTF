@@ -1,4 +1,7 @@
-"""pertTF-owned pairing, vocabulary, and tensor assembly for on-disk corpora."""
+"""pertTF vocabulary, default pairing and tensor assembly for on-disk corpora.
+
+Which cells are paired is described with ``scorpus.pairing``; this module turns those
+pairs into pertTF batches."""
 
 from __future__ import annotations
 
@@ -16,6 +19,7 @@ from scorpus.loaders.expression import ExpressionBatch
 from scorpus.loaders.gene_token_mapper import GeneTokenMapper
 from scorpus.loaders.index import MetadataIndex, _normalize_candidate_row_indices
 from scorpus.loaders.sparse_batch import SparseBatchProcessor
+from scorpus.pairing import Sampler, combine, cross, make_groups
 
 if TYPE_CHECKING:
     from scorpus.loaders.corpus_loader import Corpus
@@ -25,8 +29,8 @@ __all__ = [
     "PertTFPairedBatchLoader",
     "PertTFPairedBatchBuilder",
     "PerturbationPairBatch",
-    "PerturbationPairSampler",
     "PertTFCorpusAdapter",
+    "default_pair_sampler",
 ]
 
 
@@ -96,7 +100,6 @@ class PertTFAdapterConfig:
         default_factory=lambda: dict(_DEFAULT_LABEL_FIELD_ITEMS)
     )
     perturbation_label: str = "perturbation"
-    pairing_group_labels: tuple[str, ...] = ()
     drop_null_labels: tuple[str, ...] | None = None
     null_label_value: str = "<null>"
     control_labels: tuple[str, ...] = ("WT",)
@@ -125,13 +128,10 @@ class PertTFAdapterConfig:
         if len(label_names) != len(self.label_fields):
             raise ValueError("label_fields label names must be unique")
         _check_nonempty_string(self.perturbation_label, field_name="perturbation_label")
-        _check_unique_strings(self.pairing_group_labels, field_name="pairing_group_labels")
         if self.perturbation_label not in label_names:
             raise ValueError(
                 "perturbation_label must name one configured label field"
             )
-        if set(self.pairing_group_labels) - label_names:
-            raise ValueError("pairing_group_labels must name configured label fields")
 
         drop_labels = set(self.drop_null_labels or ())
         if self.drop_null_labels is not None:
@@ -182,15 +182,8 @@ class PertTFAdapterConfig:
 
 
 @dataclass(frozen=True)
-class _PertTFRowSelection:
-    base_indices: np.ndarray
-    source_positions: np.ndarray
-    target_candidate_positions: np.ndarray
-
-
-@dataclass(frozen=True)
 class _PertTFPreparedMetadata:
-    row_selection: _PertTFRowSelection
+    row_indices: np.ndarray
     frame: pl.DataFrame
     global_to_local: dict[int, int]
     labels_by_name: dict[str, tuple[str, ...]]
@@ -214,20 +207,10 @@ def _prepare_perttf_metadata(
     *,
     config: PertTFAdapterConfig,
     row_indices: Sequence[int] | np.ndarray | None,
-    source_indices: Sequence[int] | np.ndarray | None,
-    target_candidate_indices: Sequence[int] | np.ndarray | None,
     labels_by_name: dict[str, tuple[str, ...]] | None = None,
     label_to_index_by_name: dict[str, dict[str, int]] | None = None,
 ) -> _PertTFPreparedMetadata:
     candidate_row_indices = _normalize_candidate_row_indices(metadata_index, row_indices)
-    normalized_source_indices = _normalize_candidate_row_indices(
-        metadata_index,
-        source_indices,
-    )
-    normalized_target_candidate_indices = _normalize_candidate_row_indices(
-        metadata_index,
-        target_candidate_indices,
-    )
     if candidate_row_indices is None:
         candidate_row_indices = np.arange(len(metadata_index), dtype=np.int64)
     else:
@@ -265,37 +248,13 @@ def _prepare_perttf_metadata(
         int(global_row_index): local_position
         for local_position, global_row_index in enumerate(candidate_row_indices.tolist())
     }
-    if normalized_source_indices is None:
-        source_positions = np.arange(candidate_row_indices.size, dtype=np.int64)
-    else:
-        source_positions = np.asarray(
-            [global_to_local[int(idx)] for idx in normalized_source_indices if int(idx) in global_to_local],
-            dtype=np.int64,
-        )
-    if normalized_target_candidate_indices is None:
-        target_candidate_positions = np.arange(candidate_row_indices.size, dtype=np.int64)
-    else:
-        target_candidate_positions = np.asarray(
-            [
-                global_to_local[int(idx)]
-                for idx in normalized_target_candidate_indices
-                if int(idx) in global_to_local
-            ],
-            dtype=np.int64,
-        )
-    row_selection = _PertTFRowSelection(
-        base_indices=candidate_row_indices,
-        source_positions=source_positions,
-        target_candidate_positions=target_candidate_positions,
-    )
-
-    if row_selection.base_indices.size == 0:
+    if candidate_row_indices.size == 0:
         raise ValueError("pertTF metadata row pool is empty")
 
     resolved_labels_by_name: dict[str, tuple[str, ...]] = {}
     resolved_label_to_index_by_name: dict[str, dict[str, int]] = {}
     frame_columns: dict[str, Any] = {
-        "global_row_index": row_selection.base_indices.copy(),
+        "global_row_index": candidate_row_indices.copy(),
         "dataset_index": np.asarray(selected_metadata["dataset_index"], dtype=np.int32),
     }
     preset_labels_by_name = labels_by_name or {}
@@ -349,7 +308,7 @@ def _prepare_perttf_metadata(
     )
 
     return _PertTFPreparedMetadata(
-        row_selection=row_selection,
+        row_indices=candidate_row_indices,
         frame=pl.DataFrame(frame_columns),
         global_to_local=global_to_local,
         labels_by_name=resolved_labels_by_name,
@@ -382,379 +341,56 @@ def _take_prepared_column(
 
 @dataclass(frozen=True)
 class PerturbationPairBatch:
-    """Paired source and target metadata for one pertTF batch."""
+    """Corpus rows of the source and target cells of one pertTF batch."""
 
     source_indices: np.ndarray
     target_indices: np.ndarray
-    target_perturbation_ids: np.ndarray
 
 
-class PerturbationPairSampler:
-    """Sample perturbation/control pairs from a prepared metadata frame."""
+def default_pair_sampler(
+    metadata: pl.DataFrame,
+    *,
+    context_columns: Sequence[str],
+    perturbation_column: str,
+    control_labels: Sequence[str],
+    perturbed_to_self: bool,
+) -> Sampler:
+    """pertTF's default pairs over the rows of ``metadata``, as a ``scorpus.pairing`` sampler.
 
-    def __init__(
-        self,
-        metadata: pl.DataFrame,
-        *,
-        batch_size: int,
-        perturbation_column: str,
-        control_perturbation_ids: Sequence[int],
-        pairing_group_columns: Sequence[str] = (),
-        source_positions: Sequence[int] | np.ndarray | None = None,
-        target_candidate_positions: Sequence[int] | np.ndarray | None = None,
-        global_positions: str | None = None,
-        seed: int = 0,
-        drop_last: bool = True,
-        perturbed_target_policy: str = "self_to_control_label",
-        pairing_mode: str = "source_driven",
-    ) -> None:
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive")
-        if perturbed_target_policy not in {
-            "self_to_control_label",
-            "self_to_self_label",
-            "matched_control_cell",
-        }:
+    Controls are paired with a random cell of a perturbation in the same context. A cell with
+    no such partner is paired with itself: controls whose context has no perturbation and, with
+    ``perturbed_to_self`` (training, covering sources), every perturbed cell. Without it
+    (validation, covering targets) control targets are paired with themselves and every
+    perturbed target needs a control in its context. Rows with a missing perturbation are never
+    paired.
+    """
+    context = list(context_columns)
+    same_group = [*context, perturbation_column]
+    groups = make_groups(metadata.select(same_group), by=same_group)
+    is_ctrl = pl.col(perturbation_column).is_in(list(control_labels))
+    is_perturbed = pl.col(perturbation_column).is_not_null() & ~is_ctrl
+
+    ctrl_to_pert = cross(groups, on=context, source=is_ctrl, target=is_perturbed)
+    ctrl_self = cross(groups, on=same_group, source=is_ctrl)
+    if perturbed_to_self:
+        ctrl_self = ctrl_self.filter(~pl.col("source_group").is_in(ctrl_to_pert["source_group"].to_list()))
+        self_pairs = combine(ctrl_self, cross(groups, on=same_group, source=is_perturbed))
+    else:
+        # Covering targets, a perturbed target without a control would silently never be used.
+        unmatched = groups.table.filter(
+            is_perturbed & ~pl.col("group").is_in(ctrl_to_pert["target_group"].to_list())
+        )
+        if unmatched.height:
             raise ValueError(
-                "perturbed_target_policy must be 'self_to_control_label', "
-                "'self_to_self_label', or 'matched_control_cell'"
+                f"{unmatched.height} perturbed group(s) have no control in their context, e.g. "
+                f"{unmatched.select(same_group).rows()[:3]}"
             )
-        if pairing_mode not in {"source_driven", "target_driven"}:
-            raise ValueError("pairing_mode must be 'source_driven' or 'target_driven'")
-        required_columns = [perturbation_column, *pairing_group_columns]
-        if global_positions is not None:
-            required_columns.append(global_positions)
-        missing_columns = [column for column in required_columns if column not in metadata.columns]
-        if missing_columns:
-            missing_list = ", ".join(repr(column) for column in missing_columns)
-            raise ValueError(f"metadata is missing required column(s): {missing_list}")
-
-        self.metadata = metadata
-        self.batch_size = int(batch_size)
-        self.seed = int(seed)
-        self.drop_last = bool(drop_last)
-        self.epoch = 0
-        self.perturbed_target_policy = perturbed_target_policy
-        self.pairing_mode = pairing_mode
-        self.perturbation_column = perturbation_column
-        self.pairing_group_columns = tuple(pairing_group_columns)
-        self.global_positions = global_positions
-        self._control_label_ids = tuple(int(label_id) for label_id in control_perturbation_ids)
-        if not self._control_label_ids:
-            raise ValueError("control_perturbation_ids must contain at least one label")
-        self._control_label_id_set = frozenset(self._control_label_ids)
-
-        row_count = len(metadata)
-        if row_count == 0:
-            raise ValueError("metadata row pool is empty")
-        self._source_positions = self._normalize_positions(
-            source_positions,
-            row_count=row_count,
-            field_name="source_positions",
-        )
-        self._target_candidate_positions = self._normalize_positions(
-            target_candidate_positions,
-            row_count=row_count,
-            field_name="target_candidate_positions",
-        )
-        self.effective_source_positions = self._source_positions.copy()
-        self.effective_target_candidate_positions = self._target_candidate_positions.copy()
-        self._source_position_set = set(self._source_positions.tolist())
-        self._target_candidate_position_set = set(self._target_candidate_positions.tolist())
-        self._source_row_count = int(self._source_positions.size)
-        self._perturbation_ids = np.asarray(metadata[perturbation_column], dtype=np.int64)
-        self._group_ids = (
-            np.stack(
-                [np.asarray(metadata[column], dtype=np.int64) for column in self.pairing_group_columns],
-                axis=1,
-            )
-            if self.pairing_group_columns
-            else np.zeros((row_count, 0), dtype=np.int64)
-        )
-        self._global_position_values = (
-            None
-            if global_positions is None
-            else np.asarray(metadata[global_positions], dtype=np.int64)
-        )
-        self._target_pool_by_key: dict[tuple[int, ...], list[int]] = {}
-        self._control_pool_by_group: dict[tuple[int, ...], list[int]] = {}
-        self._control_source_pool_by_group: dict[tuple[int, ...], list[int]] = {}
-        self._treated_perturbation_ids_by_group: dict[tuple[int, ...], set[int]] = {}
-        self._build_pools()
-        if self.pairing_mode == "target_driven":
-            self._validate_target_driven_pools()
-        self.effective_pair_count = (
-            int(self._target_candidate_positions.size)
-            if self.pairing_mode == "target_driven"
-            else self._source_row_count
-        )
-
-    def __len__(self) -> int:
-        if self.drop_last:
-            return self.effective_pair_count // self.batch_size
-        return (self.effective_pair_count + self.batch_size - 1) // self.batch_size
-
-    def set_epoch(self, epoch: int) -> None:
-        self.epoch = int(epoch)
-
-    def __iter__(self):
-        for _, _, pair_batch in self.iter_batches():
-            yield pair_batch
-
-    def iter_batches(self) -> Iterator[tuple[int, int, PerturbationPairBatch]]:
-        if self.effective_pair_count == 0:
-            return
-        epoch = int(self.epoch)
-        iteration_order = (
-            self._target_candidate_positions.copy()
-            if self.pairing_mode == "target_driven"
-            else self._source_positions.copy()
-        )
-        if self.effective_pair_count > 1:
-            rng = np.random.default_rng(self._stream_seed(epoch, 0, 0))
-            rng.shuffle(iteration_order)
-        for batch_index, start in enumerate(range(0, self.effective_pair_count, self.batch_size)):
-            positions = iteration_order[start : start + self.batch_size]
-            if len(positions) < self.batch_size and self.drop_last:
-                continue
-            seed = self._stream_seed(epoch, batch_index, 1)
-            pair_batch = (
-                self.pair_target_positions(positions, seed=seed)
-                if self.pairing_mode == "target_driven"
-                else self.pair_source_positions(positions, seed=seed)
-            )
-            yield (
-                batch_index,
-                seed,
-                pair_batch,
-            )
-
-    def _stream_seed(self, epoch: int, batch_index: int, stream_id: int) -> int:
-        return _derive_perttf_stream_seed(
-            self.seed,
-            epoch=epoch,
-            batch_index=batch_index,
-            stream_id=stream_id,
-        )
-
-    def pair_source_positions(
-        self,
-        source_positions: Sequence[int] | np.ndarray,
-        *,
-        seed: int | None = None,
-    ) -> PerturbationPairBatch:
-        source_array = np.asarray(source_positions, dtype=np.int64)
-        if source_array.ndim != 1:
-            raise ValueError("source_positions must be a 1-D sequence")
-        if source_array.size == 0:
-            return self._assemble_batch(
-                source_array,
-                np.asarray([], dtype=np.int64),
-                np.asarray([], dtype=np.int64),
-            )
-        if np.any(source_array < 0) or np.any(source_array >= len(self.metadata)):
-            raise IndexError("source_positions contain out-of-range rows")
-        if any(int(position) not in self._source_position_set for position in source_array.tolist()):
-            raise ValueError("source_positions must come from the configured source pool")
-
-        rng = np.random.default_rng(self.seed if seed is None else int(seed))
-        targets = [
-            self._sample_target_for_source_position(source_position, rng)
-            for source_position in source_array.tolist()
-        ]
-
-        return self._assemble_batch(
-            source_array.copy(),
-            np.asarray([target_position for target_position, _ in targets], dtype=np.int64),
-            np.asarray([label_id for _, label_id in targets], dtype=np.int64),
-        )
-
-    def pair_target_positions(
-        self,
-        target_positions: Sequence[int] | np.ndarray,
-        *,
-        seed: int | None = None,
-    ) -> PerturbationPairBatch:
-        target_array = np.asarray(target_positions, dtype=np.int64)
-        if target_array.ndim != 1:
-            raise ValueError("target_positions must be a 1-D sequence")
-        if target_array.size == 0:
-            return self._assemble_batch(
-                np.asarray([], dtype=np.int64),
-                target_array,
-                np.asarray([], dtype=np.int64),
-            )
-        if np.any(target_array < 0) or np.any(target_array >= len(self.metadata)):
-            raise IndexError("target_positions contain out-of-range rows")
-        if any(
-            int(position) not in self._target_candidate_position_set
-            for position in target_array.tolist()
-        ):
-            raise ValueError("target_positions must come from the configured target pool")
-
-        rng = np.random.default_rng(self.seed if seed is None else int(seed))
-        source_positions = []
-        target_perturbation_ids = []
-        for target_position in target_array.tolist():
-            perturbation_id = int(self._perturbation_ids[target_position])
-            if perturbation_id in self._control_label_id_set:
-                source_positions.append(target_position)
-            else:
-                group_key = self._group_key_for_position(target_position)
-                source_positions.append(
-                    int(rng.choice(self._control_source_pool_by_group[group_key]))
-                )
-            target_perturbation_ids.append(perturbation_id)
-
-        return self._assemble_batch(
-            np.asarray(source_positions, dtype=np.int64),
-            target_array.copy(),
-            np.asarray(target_perturbation_ids, dtype=np.int64),
-        )
-
-    def _group_key_for_position(self, row_position: int) -> tuple[int, ...]:
-        return tuple(int(value) for value in self._group_ids[int(row_position)].tolist())
-
-    def _build_pools(self) -> None:
-        for source_position in self._source_positions.tolist():
-            perturbation_id = int(self._perturbation_ids[int(source_position)])
-            if perturbation_id in self._control_label_id_set:
-                group_key = self._group_key_for_position(int(source_position))
-                self._control_source_pool_by_group.setdefault(group_key, []).append(
-                    int(source_position)
-                )
-        for target_position in self._target_candidate_positions.tolist():
-            group_key = self._group_key_for_position(int(target_position))
-            perturbation_id = int(self._perturbation_ids[int(target_position)])
-            self._target_pool_by_key.setdefault(group_key + (perturbation_id,), []).append(
-                int(target_position)
-            )
-            if perturbation_id in self._control_label_id_set:
-                self._control_pool_by_group.setdefault(group_key, []).append(int(target_position))
-            else:
-                self._treated_perturbation_ids_by_group.setdefault(group_key, set()).add(
-                    perturbation_id
-                )
-
-    def _validate_target_driven_pools(self) -> None:
-        if any(
-            int(self._perturbation_ids[position]) not in self._control_label_id_set
-            for position in self._source_positions.tolist()
-        ):
-            raise ValueError("target_driven pairing requires control-only source_positions")
-        control_targets_outside_source_pool = [
-            int(position)
-            for position in self._target_candidate_positions.tolist()
-            if int(self._perturbation_ids[position]) in self._control_label_id_set
-            and int(position) not in self._source_position_set
-        ]
-        if control_targets_outside_source_pool:
-            raise ValueError(
-                "target_driven pairing requires control targets to be present in source_positions"
-            )
-
-        missing_control_groups = {
-            self._group_key_for_position(position)
-            for position in self._target_candidate_positions.tolist()
-            if int(self._perturbation_ids[position]) not in self._control_label_id_set
-            if self._group_key_for_position(position) not in self._control_source_pool_by_group
-        }
-        if missing_control_groups:
-            raise ValueError(
-                "target_driven pairing has no matched control source for target group(s): "
-                f"{sorted(missing_control_groups)}"
-            )
-
-    def _sample_target_for_source_position(
-        self,
-        source_position: int,
-        rng: np.random.Generator,
-    ) -> tuple[int, int]:
-        group_key = self._group_key_for_position(source_position)
-        perturbation_id = int(self._perturbation_ids[source_position])
-        if perturbation_id in self._control_label_id_set:
-            candidate_perturbation_ids = tuple(
-                self._treated_perturbation_ids_by_group.get(group_key, ())
-            )
-            if not candidate_perturbation_ids:
-                if self.perturbed_target_policy == "self_to_self_label":
-                    if source_position not in self._target_candidate_position_set:
-                        raise RuntimeError(
-                            f"unable to pair source position {source_position}: "
-                            "self_to_self_label target row is not present in the configured target pool"
-                        )
-                    return source_position, perturbation_id
-                raise RuntimeError(
-                    f"unable to pair source position {source_position}: "
-                    "no treated target pool exists for control source"
-                )
-            target_perturbation_id = int(rng.choice(candidate_perturbation_ids))
-            pool = self._target_pool_by_key[group_key + (target_perturbation_id,)]
-            target_position = int(rng.choice(pool))
-            return target_position, target_perturbation_id
-
-        if self.perturbed_target_policy in {
-            "self_to_control_label",
-            "self_to_self_label",
-        }:
-            if source_position not in self._target_candidate_position_set:
-                raise RuntimeError(
-                    f"unable to pair source position {source_position}: "
-                    f"{self.perturbed_target_policy} target row is not present in the configured target pool"
-                )
-            target_label_id = (
-                self._control_label_ids[0]
-                if self.perturbed_target_policy == "self_to_control_label"
-                else perturbation_id
-            )
-            return source_position, target_label_id
-
-        control_pool = self._control_pool_by_group.get(group_key)
-        if not control_pool:
-            raise RuntimeError(
-                f"unable to pair source position {source_position}: "
-                "no matched control pool exists for perturbed source"
-            )
-        target_position = int(rng.choice(control_pool))
-        return target_position, int(self._perturbation_ids[target_position])
-
-    def _assemble_batch(
-        self,
-        source_positions: np.ndarray,
-        target_positions: np.ndarray,
-        target_perturbation_ids: np.ndarray,
-    ) -> PerturbationPairBatch:
-        resolved_target_perturbation_ids = np.asarray(
-            target_perturbation_ids,
-            dtype=np.int64,
-        )
-        return PerturbationPairBatch(
-            source_indices=self._emit_positions(source_positions),
-            target_indices=self._emit_positions(target_positions),
-            target_perturbation_ids=resolved_target_perturbation_ids,
-        )
-
-    def _emit_positions(self, positions: np.ndarray) -> np.ndarray:
-        resolved = np.asarray(positions, dtype=np.int64)
-        if self._global_position_values is None:
-            return resolved
-        return self._global_position_values[resolved].astype(np.int64, copy=False)
-
-    @staticmethod
-    def _normalize_positions(
-        positions: Sequence[int] | np.ndarray | None,
-        *,
-        row_count: int,
-        field_name: str,
-    ) -> np.ndarray:
-        if positions is None:
-            return np.arange(row_count, dtype=np.int64)
-        normalized = np.asarray(positions, dtype=np.int64)
-        if normalized.ndim != 1:
-            raise ValueError(f"{field_name} must be a 1-D sequence")
-        if np.any(normalized < 0) or np.any(normalized >= row_count):
-            raise IndexError(f"{field_name} contain out-of-range rows")
-        return normalized.copy()
+        self_pairs = ctrl_self
+    pairs = combine(
+        ctrl_to_pert.with_columns(link=pl.lit("random")),
+        self_pairs.with_columns(link=pl.lit("self")),
+    )
+    return Sampler(groups, pairs, links="link")
 
 
 @dataclass(frozen=True)
@@ -766,23 +402,62 @@ class _PertTFPairReadRequest:
 
 
 class _PertTFPairReadBatchSampler:
-    def __init__(self, pair_sampler: PerturbationPairSampler) -> None:
-        self._pair_sampler = pair_sampler
+    """One read request per batch of cell pairs, from one epoch of a ``scorpus.pairing`` sampler."""
 
-    def __len__(self) -> int:
-        return len(self._pair_sampler)
+    def __init__(
+        self,
+        sampler: Sampler,
+        rows: np.ndarray,
+        *,
+        cover: str,
+        batch_size: int,
+        seed: int,
+        drop_last: bool,
+    ) -> None:
+        self._sampler = sampler
+        self._rows = rows
+        self._cover = cover
+        self._batch_size = int(batch_size)
+        self._seed = int(seed)
+        self._drop_last = bool(drop_last)
+        self.epoch = 0
+        self._batches: list[PerturbationPairBatch] | None = None
 
     def set_epoch(self, epoch: int) -> None:
-        self._pair_sampler.set_epoch(epoch)
+        self.epoch = int(epoch)
+        self._batches = None
+
+    def _epoch_batches(self) -> list[PerturbationPairBatch]:
+        if self._batches is None:
+            source_rows, target_rows = [], []
+            for sample in self._sampler.epoch(self.epoch, seed=self._seed, cover=self._cover):
+                for source, target in sample:
+                    source_rows.extend(source)
+                    target_rows.extend(target)
+            # Sampler rows are positions in the table it was built from; map them to corpus rows.
+            source_rows = self._rows[np.asarray(source_rows, dtype=np.int64)]
+            target_rows = self._rows[np.asarray(target_rows, dtype=np.int64)]
+            size = self._batch_size
+            stop = len(source_rows) - size + 1 if self._drop_last else len(source_rows)
+            self._batches = [
+                PerturbationPairBatch(source_rows[start:start + size], target_rows[start:start + size])
+                for start in range(0, stop, size)
+            ]
+        return self._batches
+
+    def __len__(self) -> int:
+        return len(self._epoch_batches())
 
     def __iter__(self):
-        for batch_index, seed, pair_batch in self._pair_sampler.iter_batches():
+        for batch_index, pair_batch in enumerate(self._epoch_batches()):
             yield [
                 _PertTFPairReadRequest(
                     pair_batch=pair_batch,
                     batch_index=batch_index,
-                    seed=seed,
-                    epoch=self._pair_sampler.epoch,
+                    seed=_derive_perttf_stream_seed(
+                        self._seed, epoch=self.epoch, batch_index=batch_index, stream_id=1,
+                    ),
+                    epoch=self.epoch,
                 )
             ]
 
@@ -948,8 +623,6 @@ class PertTFPairedBatchBuilder:
             corpus.metadata_index,
             config=self.config,
             row_indices=None,
-            source_indices=None,
-            target_candidate_indices=None,
             labels_by_name=self.adapter.labels_by_name,
             label_to_index_by_name=self.adapter.label_to_index_by_name,
         )
@@ -1097,8 +770,6 @@ class PertTFPairedBatchBuilder:
                 label_name,
                 pair_batch.target_indices,
             )
-            if label_name == self.config.perturbation_label:
-                target_label_ids = np.asarray(pair_batch.target_perturbation_ids, dtype=np.int64)
             batch[f"{label_name}_labels"] = torch.as_tensor(
                 source_label_ids,
                 dtype=torch.long,
@@ -1157,9 +828,6 @@ class PertTFPairedBatchBuilder:
     ) -> None:
         if pair_batch.source_indices.shape != pair_batch.target_indices.shape:
             raise ValueError("pair_batch source and target indices must have matching shapes")
-        target_perturbation_ids = np.asarray(pair_batch.target_perturbation_ids, dtype=np.int64)
-        if target_perturbation_ids.shape != pair_batch.source_indices.shape:
-            raise ValueError("pair_batch target_perturbation_ids must match source shape")
         for name, raw_batch, expected_indices in (
             ("source_raw", source_raw, pair_batch.source_indices),
             ("target_raw", target_raw, pair_batch.target_indices),
@@ -1457,8 +1125,6 @@ class PertTFCorpusAdapter:
                 corpus.metadata_index,
                 config=resolved,
                 row_indices=row_indices,
-                source_indices=None,
-                target_candidate_indices=None,
                 labels_by_name=ordered_labels,
                 label_to_index_by_name=label_mappings,
             )
@@ -1555,23 +1221,28 @@ class PertTFCorpusAdapter:
 
 
 class PertTFPairedBatchLoader:
-    """Slim public iterable that yields final pertTF paired batches."""
+    """Slim public iterable that yields final pertTF paired batches.
+
+    ``sampler`` (``scorpus.pairing``) decides which cells are paired. Its rows are positions in
+    ``rows``, the corpus rows of the table its groups were built from (see
+    ``default_pair_sampler``). Each epoch uses every cell of the covered side once
+    (``cover="source"`` for training, ``"target"`` for validation), and the cell pairs are cut
+    into batches of ``batch_size``. The target's perturbation label is the target cell's own.
+    """
 
     def __init__(
         self,
         corpus: Corpus,
         *,
+        sampler: Sampler,
+        rows: Sequence[int] | np.ndarray,
         batch_size: int,
         seq_len: int,
+        cover: str = "source",
         config: PertTFAdapterConfig | None = None,
         adapter: PertTFCorpusAdapter | None = None,
-        row_indices: Sequence[int] | np.ndarray | None = None,
         seed: int = 0,
         drop_last: bool = True,
-        perturbed_target_policy: str = "self_to_control_label",
-        pairing_mode: str = "source_driven",
-        source_indices: Sequence[int] | np.ndarray | None = None,
-        target_candidate_indices: Sequence[int] | np.ndarray | None = None,
         sampling_mode: str = "hvg",
         expressed_weight: float = 3.0,
         hvg_weight: float = 3.0,
@@ -1585,31 +1256,15 @@ class PertTFPairedBatchLoader:
         device: torch.device | str | None = "cpu",
     ) -> None:
         self.corpus = corpus
+        self.sampler = sampler
+        self.rows = np.asarray(rows, dtype=np.int64).copy()
         resolved_config = adapter.config if adapter is not None else (config or PertTFAdapterConfig())
         prepared_metadata = _prepare_perttf_metadata(
             corpus.metadata_index,
             config=resolved_config,
-            row_indices=row_indices,
-            source_indices=source_indices,
-            target_candidate_indices=target_candidate_indices,
+            row_indices=self.rows,
             labels_by_name=None if adapter is None else adapter.labels_by_name,
             label_to_index_by_name=None if adapter is None else adapter.label_to_index_by_name,
-        )
-        self.pair_sampler = PerturbationPairSampler(
-            prepared_metadata.frame,
-            batch_size=batch_size,
-            perturbation_column=f"{resolved_config.perturbation_label}_id",
-            control_perturbation_ids=prepared_metadata.control_label_ids,
-            pairing_group_columns=tuple(
-                f"{label_name}_id" for label_name in resolved_config.pairing_group_labels
-            ),
-            source_positions=prepared_metadata.row_selection.source_positions,
-            target_candidate_positions=prepared_metadata.row_selection.target_candidate_positions,
-            global_positions="global_row_index",
-            seed=seed,
-            drop_last=drop_last,
-            perturbed_target_policy=perturbed_target_policy,
-            pairing_mode=pairing_mode,
         )
         resolved_adapter = adapter
         if resolved_adapter is None:
@@ -1629,17 +1284,15 @@ class PertTFPairedBatchLoader:
         )
         self.adapter = self._builder.adapter
         self.config = self._builder.config
-        self.row_indices = None if row_indices is None else np.asarray(row_indices, dtype=np.int64).copy()
-        self.effective_label_row_indices = prepared_metadata.row_selection.base_indices.copy()
-        global_rows = np.asarray(prepared_metadata.frame["global_row_index"], dtype=np.int64)
-        self.effective_source_indices = global_rows[
-            self.pair_sampler.effective_source_positions
-        ].copy()
-        self.effective_target_candidate_indices = (
-            global_rows[self.pair_sampler.effective_target_candidate_positions].copy()
+        self.effective_label_row_indices = prepared_metadata.row_indices.copy()
+        self._request_sampler = _PertTFPairReadBatchSampler(
+            sampler,
+            self.rows,
+            cover=cover,
+            batch_size=batch_size,
+            seed=seed,
+            drop_last=drop_last,
         )
-        self.effective_pair_count = self.pair_sampler.effective_pair_count
-        self._request_sampler = _PertTFPairReadBatchSampler(self.pair_sampler)
         self._dataset = _PertTFPairExpressionDataset(
             corpus.expression_reader,
             total_rows=len(corpus.metadata_index),
@@ -1672,7 +1325,7 @@ class PertTFPairedBatchLoader:
 
     @property
     def epoch(self) -> int:
-        return int(self.pair_sampler.epoch)
+        return self._request_sampler.epoch
 
     def set_epoch(self, epoch: int) -> None:
         self._request_sampler.set_epoch(epoch)

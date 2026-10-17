@@ -16,7 +16,7 @@ from perttf.model.corpus_adapter import (
     PertTFPairedBatchLoader,
     PertTFCorpusAdapter,
     PerturbationPairBatch,
-    PerturbationPairSampler,
+    default_pair_sampler,
 )
 
 
@@ -69,7 +69,6 @@ def test_perttf_config_defaults_expose_generic_label_fields() -> None:
     assert config.metadata_columns == ("perturb_label", "cell_context", "batch_id")
     assert config.label_names == ("perturbation", "celltype", "batch")
     assert config.perturbation_label == "perturbation"
-    assert config.pairing_group_labels == ()
     assert config.label_columns_by_name == {
         "perturbation": "perturb_label",
         "celltype": "cell_context",
@@ -81,7 +80,7 @@ def test_perttf_config_defaults_expose_generic_label_fields() -> None:
     assert not hasattr(config, "batch_column")
 
 
-def test_perttf_config_accepts_explicit_dataset_pairing_and_null_policy() -> None:
+def test_perttf_config_accepts_extra_label_field_and_null_policy() -> None:
     config = PertTFAdapterConfig(
         label_fields={
             "perturb_label": "perturbation",
@@ -89,11 +88,9 @@ def test_perttf_config_accepts_explicit_dataset_pairing_and_null_policy() -> Non
             "batch_id": "batch",
             "dataset_id": "dataset",
         },
-        pairing_group_labels=("dataset",),
     )
 
     assert config.label_columns_by_name["dataset"] == "dataset_id"
-    assert config.pairing_group_labels == ("dataset",)
     assert config.resolved_drop_null_labels == ("perturbation",)
 
 
@@ -131,12 +128,6 @@ def test_perttf_config_accepts_explicit_dataset_pairing_and_null_policy() -> Non
                 "perturbation_label": "dataset",
             },
             "perturbation_label must name one configured label field",
-        ),
-        (
-            {
-                "pairing_group_labels": ("dataset",),
-            },
-            "pairing_group_labels must name configured label fields",
         ),
         ({"drop_null_labels": ("dataset",)}, "drop_null_labels must name configured label fields"),
     ],
@@ -345,7 +336,6 @@ def test_corpus_adapter_builds_from_loaded_small_corpus(tmp_path: Path) -> None:
                 "batch_id": "batch",
                 "dataset_id": "dataset",
             },
-            pairing_group_labels=("dataset",),
         ),
     )
 
@@ -383,7 +373,7 @@ def test_retained_perttf_classes_still_import_from_public_modules() -> None:
         "PertTFAdapterConfig": PertTFAdapterConfig,
         "PertTFCorpusAdapter": PertTFCorpusAdapter,
         "PerturbationPairBatch": PerturbationPairBatch,
-        "PerturbationPairSampler": PerturbationPairSampler,
+        "default_pair_sampler": default_pair_sampler,
         "PertTFPairedBatchBuilder": PertTFPairedBatchBuilder,
         "PertTFPairedBatchLoader": PertTFPairedBatchLoader,
     }

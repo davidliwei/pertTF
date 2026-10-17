@@ -27,6 +27,7 @@ from perttf.model.corpus_adapter import (
     PertTFAdapterConfig,
     PertTFPairedBatchLoader,
     PertTFCorpusAdapter,
+    default_pair_sampler,
 )
 from scorpus.materializers.paths import resolve_corpus_paths
 
@@ -342,8 +343,8 @@ def _write_markdown_summary(path: Path, summary: dict[str, Any]) -> None:
                 f"- `Public Loader Batch Index`: `{summary['batch']['public_loader_batch_index']}`",
                 f"- `Public Loader Workers`: `{summary['loader']['num_workers']}` ({summary['loader']['multiprocessing_context']})",
                 f"- `Effective Label Rows`: `{summary['loader']['effective_label_row_count']}` / `{summary['loader']['total_row_count']}`",
-                f"- `Effective Source Rows`: `{summary['loader']['effective_source_row_count']}`",
-                f"- `Effective Target Candidate Rows`: `{summary['loader']['effective_target_candidate_row_count']}`",
+                f"- `Pair Groups`: `{summary['loader']['pair_group_count']}`",
+                f"- `Allowed Group Pairs`: `{summary['loader']['allowed_pair_count']}`",
                 "",
                 "## HVG Discovery",
                 "",
@@ -488,14 +489,24 @@ def main() -> None:
             "perturb_label": "perturbation",
             "cell_context": "celltype",
             "batch_id": "batch",
-            "dataset_index": "dataset",
+            "dataset_id": "dataset",
         },
         mask_ratio=0.0,
-        pairing_group_labels=("dataset", "celltype"),
+    )
+    # pertTF's default training pairs within the same dataset and cell context.
+    pairing_context_columns = ("dataset_index", "cell_context")
+    sampler = default_pair_sampler(
+        corpus.metadata_index.df,
+        context_columns=pairing_context_columns,
+        perturbation_column="perturb_label",
+        control_labels=config.control_labels,
+        perturbed_to_self=True,
     )
     multiprocessing_context = command_snapshot["multiprocessing_context"]
     loader = PertTFPairedBatchLoader(
         corpus,
+        sampler=sampler,
+        rows=np.arange(len(corpus.metadata_index), dtype=np.int64),
         batch_size=int(args.batch_size),
         seq_len=int(args.seq_len),
         config=config,
@@ -513,8 +524,8 @@ def main() -> None:
         "Built public pertTF loader in "
         f"{loader_seconds:.2f}s with "
         f"{len(loader.effective_label_row_indices)} effective label rows, "
-        f"{len(loader.effective_source_indices)} effective source rows, "
-        f"{len(loader.effective_target_candidate_indices)} effective target rows"
+        f"{len(sampler.groups.rows)} pair groups, "
+        f"{sampler.n_bundles} allowed group pairs"
     )
 
     dataset_state = dict(loader._data_loader.dataset.__dict__)
@@ -549,8 +560,8 @@ def main() -> None:
         )
     )
     mixed_dataset = bool(len(set(observed.source_dataset_ids)) > 1)
-    require_same_dataset = "dataset" in config.pairing_group_labels
-    require_same_celltype = "celltype" in config.pairing_group_labels
+    require_same_dataset = "dataset_index" in pairing_context_columns
+    require_same_celltype = "cell_context" in pairing_context_columns
     alignment = _verify_sampled_alignment(corpus, loader.adapter, observed, batch)
     full_expr_masks = _verify_full_expression_masks(corpus, loader.adapter, observed, batch)
 
@@ -567,13 +578,11 @@ def main() -> None:
             ),
             "expression_only_state_passed": bool(expression_only_state_passed),
             "dataset_state_keys": sorted(dataset_state.keys()),
-            "pairing_group_labels": list(config.pairing_group_labels),
+            "pairing_context_columns": list(pairing_context_columns),
             "total_row_count": int(len(corpus.metadata_index)),
             "effective_label_row_count": int(len(loader.effective_label_row_indices)),
-            "effective_source_row_count": int(len(loader.effective_source_indices)),
-            "effective_target_candidate_row_count": int(
-                len(loader.effective_target_candidate_indices)
-            ),
+            "pair_group_count": int(len(sampler.groups.rows)),
+            "allowed_pair_count": int(sampler.n_bundles),
         },
         "batch": {
             "hvg_top_k": int(args.hvg_top_k),

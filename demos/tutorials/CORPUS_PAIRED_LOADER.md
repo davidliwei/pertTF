@@ -14,11 +14,17 @@ scorpus supplies the model-independent corpus interface.
 
 ## Basic Usage
 
+Which cells are paired is described with `scorpus.pairing` (see scorpus
+`docs/pairing.md`). `default_pair_sampler` builds pertTF's default pairs; the
+loader turns them into batches.
+
 ```python
+import numpy as np
 from scorpus import load_corpus
 from perttf.model.corpus_adapter import (
     PertTFAdapterConfig,
     PertTFPairedBatchLoader,
+    default_pair_sampler,
 )
 
 corpus = load_corpus("/path/to/corpus")
@@ -28,17 +34,26 @@ config = PertTFAdapterConfig(
         "perturb_label": "perturbation",
         "cell_context": "celltype",
         "batch_id": "batch",
-        "dataset_index": "dataset",
     },
     perturbation_label="perturbation",
     control_labels=("ctrl",),
-    pairing_group_labels=("dataset", "celltype"),
     normalize_expression="log1p",
     normalization_scale=1.0,
 )
 
+rows = np.arange(len(corpus.metadata_index))      # or the training rows
+sampler = default_pair_sampler(
+    corpus.metadata_index.df[rows],
+    context_columns=("dataset_index", "cell_context"),
+    perturbation_column="perturb_label",
+    control_labels=("ctrl",),
+    perturbed_to_self=True,
+)
 loader = PertTFPairedBatchLoader(
     corpus,
+    sampler=sampler,
+    rows=rows,
+    cover="source",
     batch_size=8,
     seq_len=1024,
     config=config,
@@ -73,128 +88,68 @@ This produces batch keys such as:
 - `batch_labels`
 - `batch_labels_next`
 
-`perturbation_label` names the configured label that drives source/target
-perturbation pairing. It must refer to one of the label names, not the raw
-metadata column name.
+`perturbation_label` names the configured label used for the perturbation
+label tensors. It must refer to one of the label names, not the raw metadata
+column name. The target's perturbation label is always the target cell's own.
 
 `control_labels` lists the metadata values treated as controls. Match these to
 the values produced by canonicalization, for example `("ctrl",)` or `("WT",)`.
 
-## Pairing Groups
+## Which Cells Are Paired
 
-By default, pairing is perturbation-aware but does not force same-dataset or
-same-celltype matches.
+`default_pair_sampler(metadata, context_columns=..., perturbation_column=...,
+control_labels=..., perturbed_to_self=...)` pairs cells only within the same
+values of `context_columns` (metadata columns, for example dataset, cell type or
+donor):
 
-Use `pairing_group_labels` when pairs must match extra labels:
+- Training (`perturbed_to_self=True`, loader `cover="source"`): every cell is a
+  source once per epoch. A control is paired with a random cell of a
+  perturbation in its context; a perturbed cell is paired with itself; a control
+  whose context has no perturbation is paired with itself.
+- Validation (`perturbed_to_self=False`, loader `cover="target"`): every cell is
+  a target once per epoch. A perturbed target gets a random control of its
+  context; a control target is paired with itself. Every perturbed target needs
+  a control in its context, otherwise `default_pair_sampler` raises.
 
-```python
-# Same dataset only
-PertTFAdapterConfig(
-    label_fields={"perturb_label": "perturbation", "dataset_index": "dataset"},
-    perturbation_label="perturbation",
-    pairing_group_labels=("dataset",),
-)
+Rows with a missing perturbation are never paired.
 
-# Same dataset and same cell type
-PertTFAdapterConfig(
-    label_fields={
-        "perturb_label": "perturbation",
-        "dataset_index": "dataset",
-        "cell_context": "celltype",
-    },
-    perturbation_label="perturbation",
-    pairing_group_labels=("dataset", "celltype"),
-)
-```
+The sampler's rows are positions in the metadata table it was built from;
+`rows` gives the corpus row of each of them. Build the sampler on
+`corpus.metadata_index.df[rows]` and pass the same `rows` to the loader.
 
-Every label listed in `pairing_group_labels` must be present in `label_fields`.
+## Custom Pairings
 
-## Row Pools
-
-The loader can restrict which rows participate in pairing.
-
-- `row_indices`: restrict both source and target pools to a global row subset
-- `source_indices`: restrict only source rows
-- `target_candidate_indices`: restrict only possible target rows
-
-All indices are corpus-global row indices.
+Any `scorpus.pairing` sampler works. For example, perturbed cells paired with a
+control of the same dataset:
 
 ```python
+import polars as pl
+from scorpus.pairing import Sampler, cross, make_groups
+
+metadata = corpus.metadata_index.df[rows]
+groups = make_groups(metadata, by=["dataset_index", "perturb_label"])
+is_ctrl = pl.col("perturb_label") == "ctrl"
+pairs = cross(groups, on=["dataset_index"], source=~is_ctrl, target=is_ctrl)
 loader = PertTFPairedBatchLoader(
-    corpus,
-    batch_size=16,
-    seq_len=512,
-    config=config,
-    source_indices=source_rows,
-    target_candidate_indices=target_rows,
+    corpus, sampler=Sampler(groups, pairs), rows=rows, batch_size=16, seq_len=512, config=config,
 )
 ```
 
-The loader exposes useful effective pools after null-label filtering:
+The loader covers one side per epoch (`cover`), flattens each sample's cell
+pairs and cuts them into batches of `batch_size`; with `drop_last=True` the
+final incomplete batch is omitted. pertTF needs one source cell per target
+cell, so set-level samples must have equal numbers of cells on both sides.
 
-```python
-loader.effective_label_row_indices
-loader.effective_source_indices
-loader.effective_target_candidate_indices
-loader.effective_pair_count
-```
-
-## Target-Driven Pairing
-
-Use target-driven pairing to visit every target cell once per epoch. Perturbed
-targets sample a matched control source with replacement, while control targets
-pair to the identical control cell:
-
-```python
-loader = PertTFPairedBatchLoader(
-    corpus,
-    batch_size=16,
-    seq_len=512,
-    config=config,
-    row_indices=train_rows,
-    source_indices=control_rows,
-    target_candidate_indices=np.concatenate([control_rows, perturbed_rows]),
-    pairing_mode="target_driven",
-    drop_last=False,
-)
-```
-
-Target-driven pairing requires control-only sources. Every control target must
-also be in the source pool so it can self-pair. Pairing groups configured by
-`pairing_group_labels` constrain each control sampled for a perturbed target to
-the target's group. Epoch length is determined by the number of target rows;
-with `drop_last=True`, the final incomplete batch is omitted. Source-driven
-pairing remains the default.
-
-## Perturbed Source Policy
-
-`perturbed_target_policy` controls how a source row that is already perturbed is
-paired:
-
-- `"self_to_control_label"` (default): reuse the source expression as the target and emit the control label
-- `"self_to_self_label"`: reuse the source expression as the target and emit its own perturbation label
-- `"matched_control_cell"`: pair to a control row from the same configured pairing group
-
-With `"self_to_self_label"`, a control source still pairs to a treated target when one exists in its pairing group. If none exists, the control pairs to itself with the control label.
-
-For an idempotent perturbation target, use:
-
-```python
-loader = PertTFPairedBatchLoader(
-    corpus,
-    batch_size=16,
-    seq_len=512,
-    config=config,
-    perturbed_target_policy="self_to_self_label",
-)
-```
+`loader.effective_label_row_indices` lists the rows kept for label lookup after
+null-label filtering.
 
 ## Null Labels
 
-By default, rows with null values for the perturbation label are dropped during
-loader construction.
+By default, rows with null values for the perturbation label are dropped from
+the loader's label lookup; `default_pair_sampler` never pairs them.
 
-Use `drop_null_labels` to control which labels trigger dropping:
+Use `drop_null_labels` to control which labels trigger dropping (a custom pair
+table must not pair the dropped rows):
 
 ```python
 config = PertTFAdapterConfig(
@@ -256,6 +211,6 @@ when using workers.
 
 - Missing metadata column: load the corpus with the needed canonical obs column or fix `label_fields`.
 - No valid control rows: make sure `control_labels` matches canonical `perturb_label` values.
-- No valid paired target pool: relax `pairing_group_labels` or provide broader target rows.
+- Perturbed groups without a control (validation): relax `context_columns` or include those contexts' controls in `rows`.
 - Too many rows dropped: inspect nulls in the metadata columns listed in `drop_null_labels`.
 - Missing HVG rankings: run `recalc-hvg` or use a sampling mode that does not depend on HVG ranks.

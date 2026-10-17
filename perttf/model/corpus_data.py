@@ -9,7 +9,7 @@ import numpy as np
 
 from scorpus.loaders import GeneTokenMapper
 
-from .corpus_adapter import PertTFAdapterConfig, PertTFCorpusAdapter, PertTFPairedBatchLoader
+from .corpus_adapter import PertTFAdapterConfig, PertTFCorpusAdapter, PertTFPairedBatchLoader, default_pair_sampler
 from .pert_emb import build_perturbation_mapping
 from ..utils.custom_tokenizer import SimpleVocab
 from ..utils.split_check import check_train_valid_split
@@ -62,10 +62,12 @@ def produce_corpus_datasets(
 ):
     """Return the data_gen dictionary consumed by wrapper_train.
 
-    This counts-based route uses continuous log1p expression, same-dataset and
-    same-celltype pairs, source-driven training and target-driven validation.
-    Additional pairing columns can constrain donor/condition. Train and valid
-    indices each include their available controls; only controls may overlap.
+    This counts-based route uses continuous log1p expression and pertTF's default
+    pairs (``default_pair_sampler``) within the same dataset and celltype: training
+    uses every training cell once as a source, validation every validation cell
+    once as a target. Additional pairing columns can constrain donor/condition.
+    Train and valid indices each include their available controls; only controls
+    may overlap.
     The one expanded perturbation mapping is shared by both loaders and must be
     passed unchanged to the model/UnifiedPertEncoder. Supply tokenizer_stoi when
     using a pretrained expression vocabulary.
@@ -87,13 +89,9 @@ def produce_corpus_datasets(
     label_fields = {perturbation_column: "perturbation", celltype_column: "celltype", batch_column: "batch"}
     if len(label_fields) != 3:
         raise ValueError("Perturbation, celltype, and batch columns must be distinct")
-    groups = []
-    for column in dict.fromkeys(("dataset_id", celltype_column, *pairing_columns)):
-        if column not in label_fields:
-            label_fields[column] = f"pair_{len(groups)}"
-        groups.append(label_fields[column])
+    context_columns = list(dict.fromkeys(("dataset_id", celltype_column, *pairing_columns)))
     selected_rows = np.union1d(train_indices, valid_indices)
-    if frame.iloc[selected_rows][list(label_fields)].isna().any().any():
+    if frame.iloc[selected_rows][list(dict.fromkeys([*label_fields, *context_columns]))].isna().any().any():
         raise ValueError("Selected training/validation metadata contains missing labels")
     split_report = check_train_valid_split(
         ad.AnnData(obs=frame), train_indices, valid_indices, "pert",
@@ -108,8 +106,7 @@ def produce_corpus_datasets(
     if source_ids.difference(mapping):
         raise ValueError("genotype_to_index must include external source IDs")
     adapter_config = PertTFAdapterConfig(
-        label_fields=label_fields, control_labels=(control_label,),
-        pairing_group_labels=tuple(groups), include_full_expr=True,
+        label_fields=label_fields, control_labels=(control_label,), include_full_expr=True,
         normalize_expression="log1p", normalization_scale=normalization_scale,
         mask_ratio=config.get("mask_ratio", 0.15),
         pad_token=config.get("pad_token", "<pad>"),
@@ -150,14 +147,17 @@ def produce_corpus_datasets(
     )
     if options["seq_len"] < 1:
         raise ValueError("max_seq_len must allow at least one gene and CLS")
+    metadata = corpus.metadata_index.df
+    pairing = dict(context_columns=context_columns, perturbation_column=perturbation_column, control_labels=(control_label,))
+    train_rows = np.asarray(train_indices, dtype=np.int64)
     train_loader = PertTFPairedBatchLoader(
-        corpus, row_indices=train_indices, perturbed_target_policy="self_to_self_label", **options,
+        corpus, rows=train_rows, cover="source",
+        sampler=default_pair_sampler(metadata[train_rows], perturbed_to_self=True, **pairing), **options,
     )
     valid_rows = np.asarray(valid_indices, dtype=np.int64)
-    controls = valid_rows[frame.iloc[valid_rows][perturbation_column].to_numpy() == control_label]
     valid_loader = PertTFPairedBatchLoader(
-        corpus, row_indices=valid_rows, source_indices=controls, target_candidate_indices=valid_rows,
-        pairing_mode="target_driven", **options,
+        corpus, rows=valid_rows, cover="target",
+        sampler=default_pair_sampler(metadata[valid_rows], perturbed_to_self=False, **pairing), **options,
     )
     datasets = frame.iloc[valid_rows]["dataset_index"].unique()
     metric_gene_mask = corpus.feature_registry.dataset_has_gene[datasets].all(axis=0)

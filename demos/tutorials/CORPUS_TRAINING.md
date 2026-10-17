@@ -47,11 +47,14 @@ data_gen = produce_corpus_datasets(
 )
 ```
 
-Training uses source-driven pairs with perturbed identity pairs retaining their
-own label. Validation is target-driven and visits every validation target,
-using matched controls. Both are constrained to the same dataset and cell type,
-plus any supplied pairing columns. Controls may overlap splits; perturbed target
-rows may not. Split checks and missing-control checks run before training.
+Pairs come from `default_pair_sampler` (`scorpus.pairing`). Training uses every
+training cell once as a source: controls are paired with a random perturbed cell
+of their context, perturbed cells with themselves (keeping their own label).
+Validation visits every validation cell once as a target: perturbed targets get
+a random control of their context, controls are paired with themselves. The
+context is the same dataset and cell type, plus any supplied pairing columns.
+Controls may overlap splits; perturbed target rows may not. Split checks and
+missing-control checks run before training.
 
 The same expanded perturbation mapping is used by both loaders, the encoder,
 and classifier. Source-only IDs remain in the mapping, even without positive
