@@ -429,14 +429,10 @@ class _PertTFPairReadBatchSampler:
 
     def _epoch_batches(self) -> list[PerturbationPairBatch]:
         if self._batches is None:
-            source_rows, target_rows = [], []
-            for sample in self._sampler.epoch(self.epoch, seed=self._seed, cover=self._cover):
-                for source, target in sample:
-                    source_rows.extend(source)
-                    target_rows.extend(target)
+            source_rows, target_rows = self._sampler.epoch_rows(self.epoch, seed=self._seed, cover=self._cover)
             # Sampler rows are positions in the table it was built from; map them to corpus rows.
-            source_rows = self._rows[np.asarray(source_rows, dtype=np.int64)]
-            target_rows = self._rows[np.asarray(target_rows, dtype=np.int64)]
+            source_rows = self._rows[source_rows]
+            target_rows = self._rows[target_rows]
             size = self._batch_size
             stop = len(source_rows) - size + 1 if self._drop_last else len(source_rows)
             self._batches = [
