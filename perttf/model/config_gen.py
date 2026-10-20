@@ -79,7 +79,6 @@ def generate_config(parameter_dict,
           config=parameter_dict,
           project=project_name,
           reinit=True,
-          settings=wandb.Settings(start_method="fork"),
           #mode="online",
           mode=wandb_mode, #
           name = run_name

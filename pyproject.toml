@@ -35,7 +35,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest", "torch>=2.2", "tqdm"]
+test = ["pytest", "torch>=2.2", "tqdm", "omegaconf", "safetensors", "wandb", "peft"]
 # Sphinx toolchain used to build docs/. Nothing here imports perttf itself
 # (no autodoc directives exist yet), so perttf's own runtime dependencies
 # (torch, scanpy, ...) aren't needed for this extra.
