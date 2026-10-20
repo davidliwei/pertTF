@@ -40,7 +40,10 @@ def test_multi_mode_control_pairs_to_a_set():
 def test_wt_plus_wt_is_control_for_pairing():
     a = tiny(["WT+WT", "A"])
     ds = PertTFDataset(a, next_cell_pred="pert", pert_delimiter="+")
-    assert ds[0]["pert_name_next"] == "A" and ds[0]["perturbation_labels"].tolist()[0] == ds.genotype_to_index["WT"]
+    # target sampling may draw the control (identity pair), so check over repeated draws
+    draws = [ds[0] for _ in range(60)]
+    assert {d["pert_name_next"] for d in draws} == {"WT", "A"}
+    assert all(d["perturbation_labels"].tolist()[0] == ds.genotype_to_index["WT"] for d in draws)
 
 def test_max_perts_per_cell_enforced():
     with pytest.raises(ValueError):

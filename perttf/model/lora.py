@@ -77,7 +77,8 @@ def prepare_config(model, adata: AnnData, input_layer_key: str, batch_size: Opti
     return config, ps_columns
 
 
-def label_mappings(model, adata: AnnData, require_known, delimiter: Optional[str] = None) -> Tuple[Optional[Dict], Optional[Dict]]:
+def label_mappings(model, adata: AnnData, require_known, delimiter: Optional[str] = None,
+                   control: str = "WT") -> Tuple[Optional[Dict], Optional[Dict]]:
     """
     Label -> index mappings for celltype and genotype. A label column listed in require_known keeps
     the pretrained mapping and must only contain model labels; for the others, a mapping missing
@@ -88,7 +89,7 @@ def label_mappings(model, adata: AnnData, require_known, delimiter: Optional[str
         mapping = getattr(model, attr, None)
         labels = adata.obs[obs_col].unique()
         if obs_col == "genotype":
-            labels = unique_perturbations(labels, delimiter)
+            labels = unique_perturbations(labels, delimiter, control)
         missing = [x for x in labels if mapping is None or x not in mapping]
         if obs_col in require_known and missing:
             raise ValueError(
