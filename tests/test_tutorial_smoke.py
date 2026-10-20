@@ -519,3 +519,24 @@ def test_multi_lora_pert_tutorial(multi_checkpoint, tmp_path):
     )
     assert (adapter_dir / "lora_heads.json").exists()
     assert set(peft_model.get_base_model().genotype_to_index) == set(multi_checkpoint["singles"]) | {"WT"}
+
+
+def test_multi_virtual_screen_rejects_config_delimiter_mismatch(multi_checkpoint):
+    from perttf.utils.virtual_screen import virtual_screen_src2dest
+
+    adata, model = multi_checkpoint["adata"], multi_checkpoint["model"]
+    running_parameters = torch.load(multi_checkpoint["save_dir"] / "running_parameters.pt", weights_only=False)
+    vocab = torch.load(multi_checkpoint["save_dir"] / "vocab.pt", weights_only=False)
+    config = OmegaConf.create(multi_checkpoint["config"].as_dict())
+    config.pert_delimiter = None  # running_parameters say "+": eval_testdata would silently drop "A+B" rows
+    is_t1 = adata.obs["celltype"] == "T1"
+    adata_src = adata[is_t1 & (adata.obs["genotype"] == "WT")].copy()
+    adata_des = adata[is_t1 & (adata.obs["genotype"] == "A+B+C")].copy()
+    for a in (adata_src, adata_des):
+        a.obs["genotype_next"] = a.obs["genotype"].astype("category")
+    with pytest.raises(ValueError, match="pert_delimiter"):
+        virtual_screen_src2dest(
+            adata_src, adata_des, model, vocab, config, running_parameters,
+            screen_genes=["A+B", "C"], device=DEVICE,
+            n_expands_per_epoch=1, n_epoch=1, wt_pred_next_label="A+B+C",
+        )

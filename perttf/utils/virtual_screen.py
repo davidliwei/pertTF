@@ -41,15 +41,22 @@ def virtual_screen_src2dest(adata_src,
   if device is None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+  # wrapper_train stores the run's config (with pert_delimiter) inside running_parameters['config'].
+  sources = (running_parameters, running_parameters.get('config'), config, getattr(model, 'training_config', None))
+  delimiter = _first_set('pert_delimiter', *sources)
+  control = _first_set('perturbation_control_value', *sources, default='WT')
+  # eval_testdata parses labels with config's delimiter; a different one would silently drop rows.
+  config_delimiter = config.get('pert_delimiter') if config is not None else None
+  if config_delimiter != delimiter:
+    raise ValueError(
+      f"config pert_delimiter={config_delimiter!r} does not match the run's pert_delimiter={delimiter!r}; "
+      "pass the training config")
+
   # default: screen_genes
   gene_available_for_screen=genotype_to_index.keys()
   if screen_genes is None:
     screen_genes_next=gene_available_for_screen
   else:
-    # wrapper_train stores the run's config (with pert_delimiter) inside running_parameters['config'].
-    sources = (running_parameters, running_parameters.get('config'), config, getattr(model, 'training_config', None))
-    delimiter = _first_set('pert_delimiter', *sources)
-    control = _first_set('perturbation_control_value', *sources, default='WT')
     screenable = labels_in_mapping(screen_genes, genotype_to_index, delimiter, control)
     filtered_genes=[x for x, ok in zip(screen_genes, screenable) if not ok]
     if len(filtered_genes)>0:
