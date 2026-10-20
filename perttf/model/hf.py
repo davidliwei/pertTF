@@ -69,6 +69,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         ps_decoder2_nlayer: int = 3,
         pert_pad_id: Optional[int] = None,
         pert_dim: Optional[int] = None,
+        pert_aggregation: str = "sum",
         distribution: Optional[str] = None,
         pert_sources: Optional[Dict] = None,
         control_label: str = "WT",
@@ -174,6 +175,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             ps_decoder2_nlayer=ps_decoder2_nlayer,
             pert_pad_id=pert_pad_id,
             pert_dim=pert_dim,
+            pert_aggregation=pert_aggregation,
             pert_features=self.pert_features,
             # Note: We do NOT pass **kwargs here, so parent doesn't see extra params.
         )
