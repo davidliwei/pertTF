@@ -163,3 +163,30 @@ class UnifiedPertEncoder(nn.Module):
                 for name, genes in self.source_genes.items()
             },
         }
+
+
+_AGGREGATIONS = ("sum", "mean", "sqrt")
+
+
+def reduce_perturbation_embeddings(emb: Tensor, labels: Tensor, aggregation: str) -> Tensor:
+    """Reduce ``(batch, k, dim)`` embeddings to ``(batch, dim)``, ignoring ``-1`` pads."""
+    if aggregation not in _AGGREGATIONS:
+        raise ValueError(f"aggregation must be one of {_AGGREGATIONS}, got {aggregation!r}")
+    mask = (labels >= 0).unsqueeze(-1).to(emb.dtype)
+    total = (emb * mask).sum(dim=1)
+    if aggregation == "sum":
+        return total
+    n_valid = mask.sum(dim=1).clamp_min(1.0)
+    if aggregation == "mean":
+        return total / n_valid
+    return total / n_valid.sqrt()
+
+
+def encode_perturbation_set(encoder: nn.Module, labels: Tensor, aggregation: str = "sum") -> Tensor:
+    """Encode scalar labels ``(batch,)`` or padded sets ``(batch, k)`` into ``(batch, dim)``."""
+    if aggregation not in _AGGREGATIONS:
+        raise ValueError(f"aggregation must be one of {_AGGREGATIONS}, got {aggregation!r}")
+    if labels.dim() == 1:
+        return encoder(labels)
+    emb = encoder(labels.clamp_min(0))
+    return reduce_perturbation_embeddings(emb, labels, aggregation)
