@@ -17,7 +17,30 @@ Set `pert_delimiter` in the training configuration:
 ```python
 from perttf.model.config_gen import generate_config
 
-config, _ = generate_config(dict(pert_delimiter="+"), wandb_mode="disabled")
+# A complete minimal hyperparameter dict (the one used by tests/test_tutorial_smoke.py,
+# shrunk for CPU). For real runs use the dict from your training tutorial instead.
+hyperparameters = dict(
+    seed=0, dataset_name="multi_pert_demo", do_train=True,
+    GEPC=True, ecs_thres=0.0, ecs_weight=1.0, dab_weight=0.0,
+    this_weight=0.0, next_weight=1.0, next_cell_pred_type="pert",
+    cell_type_classifier=True, cell_type_classifier_weight=1.0,
+    genotype_classifier=True, perturbation_classifier_weight=1.0,
+    ps_weight=0.0, perturbation_input=False, CCE=False, mask_ratio=0.0,
+    epochs=1, n_bins=0, lr=1e-3, batch_size=32,
+    layer_size=16, nlayers=1, nhead=2, dropout=0.0,
+    schedule_ratio=0.97, schedule_interval=1, log_interval=1000,
+    fast_transformer=False, pre_norm=False, amp=False, do_sample_in_train=False,
+    ADV=False, adv_weight=0, adv_E_delay_epochs=0, adv_D_delay_epochs=0, lr_ADV=1e-3,
+    DSBN=False, per_seq_batch_sample=False, use_batch_label=False, explicit_zero_prob=False,
+    n_hvg=60, mask_value=-1, pad_value=-2, pad_token="<pad>", cls_token="<cls>",
+    sampling_mode="simple", non_hvg_size=0, fix_nonzero_prop=True, nonzero_prop=0.0,
+    hvg_col="highly_variable", mvc_masked_train=False, distribution=None, use_ot=False,
+    save_eval_interval=1, eval_expr_interval=2,
+    perturbation_metric_min_cells=5, perturbation_checkpoint_metric="mvc_next",
+)
+config, _ = generate_config({**hyperparameters, "pert_delimiter": "+", "perturbation_unit": "set"},
+                            wandb_mode="disabled")
+print(config.pert_delimiter, config.pert_aggregation, config.perturbation_unit)
 ```
 
 In practice, pass `pert_delimiter="+"` together with your usual hyperparameters (and the regime settings below). The delimiter is stored with the checkpoint, so `predict_perturbations` reads it from the saved training config and you do not need to repeat it. The perturbation head becomes a multi-label head: one independent sigmoid per single perturbation, trained with binary cross-entropy.
@@ -42,15 +65,21 @@ Pick the settings that match your screen:
 In regime B a plain sum of many normalised embeddings grows with the set size and can saturate the downstream MLP, so use `"sqrt"` or `"mean"`. These are the same settings used by the multi-perturbation tests in `tests/test_tutorial_smoke.py`:
 
 ```python
-hyperparameters = dict(
-    pert_delimiter="+",
-    perturbation_unit="single",                   # regime B
-    pert_aggregation="sqrt",
-    pairing_config={"target_sampling": "cell"},
-)
-config, _ = generate_config(hyperparameters, wandb_mode="disabled")
+# `hyperparameters` is the complete dict from the snippet above (or from your training tutorial)
+config, _ = generate_config(
+    {**hyperparameters, "pert_delimiter": "+", "perturbation_unit": "single",   # regime B
+     "pert_aggregation": "sqrt", "pairing_config": {"target_sampling": "cell"}},
+    wandb_mode="disabled")
 # then run the usual produce_training_datasets / build_model / wrapper_train steps
 ```
+
+When you construct `PerturbationTFModel` (or `HFPerturbationTFModel`) by hand, pass the aggregation to the constructor yourself:
+
+```python
+model = PerturbationTFModel(..., pert_aggregation=config.get("pert_aggregation", "sum"))
+```
+
+The model reads `pert_aggregation` from its constructor, not from the training config, so omitting this kwarg silently trains with `"sum"` whatever the config says.
 
 During `produce_training_datasets`, the split check adds an `unseen_combination` category to `data_gen["split_check"]["combination_type_counts"]`. It appears only when a delimiter is set and `perturbation_unit="set"`: a validation set whose components were all seen in training but never together. It also warns if fewer than half of the validation (context, set) groups have enough cells, in which case consider `perturbation_unit="single"`.
 
@@ -59,7 +88,7 @@ During `produce_training_datasets`, the split check adds an `unseen_combination`
 
 - `obsm["X_pert_pred_probs"]`: independent sigmoid probabilities, one column per single perturbation. They do not sum to one, unlike the softmax output of legacy mode.
 - `obs["predicted_genotype"]`: the predicted set, as a canonical label such as `"A+B"`. A perturbation joins the set when its probability exceeds `pert_pred_threshold`; if none does, the top class is used. The control never appears together with other classes.
-- The set is capped by `max_perts_per_cell` if you set it, otherwise by the largest set seen in training (recorded in the config as `max_n_pert`). It is never capped by the data being predicted.
+- The set is capped by `max_perts_per_cell` if you set it, otherwise by the largest set seen in training (recorded in the config as `max_n_pert`), and if neither is available (for example a legacy checkpoint) by the number of perturbation classes only. It is never capped by the data being predicted.
 - No `genotype_id` column is written in multi-perturbation mode.
 
 ```python
@@ -82,9 +111,9 @@ result = model.predict_perturbations(query, prediction_mode="mean", device="cuda
 print(result.uns["perttf_prediction"]["pert_delimiter"])  # "+"
 ```
 
-You can also use an existing single-perturbation checkpoint zero-shot on combinations of its known genes by passing `pert_delimiter="+"` explicitly; the model then sums or averages the known gene embeddings according to its `pert_aggregation`. An explicit delimiter is accepted when the checkpoint has none, but it raises when it contradicts the delimiter stored in the checkpoint.
+You can also use an existing single-perturbation checkpoint zero-shot on combinations of its known genes by passing `pert_delimiter="+"` explicitly; the model then combines the known gene embeddings according to its `pert_aggregation`. An explicit delimiter is accepted when the checkpoint has none, but it raises when it contradicts the delimiter stored in the checkpoint.
 
-The same label rules apply to `virtual_screen_src2dest` (`screen_genes` may contain sets such as `"A+B"`; entries with an unknown component are filtered out with a printed warning) and to `run_lora_pert_train`, which builds its label mapping from the single components found in the data.
+The same label rules apply to `virtual_screen_src2dest` (`screen_genes` may contain sets such as `"A+B"`; entries with an unknown component are filtered out with a printed warning) and to `run_lora_pert_train`: the genotype labels in your data must all be known model labels, where sets are split into components with the config delimiter and control value before the check.
 
 ### What raises
 - A malformed label (empty or whitespace-padded component): `ValueError` listing the labels.
