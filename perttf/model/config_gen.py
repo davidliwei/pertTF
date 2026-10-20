@@ -62,6 +62,13 @@ def generate_config(parameter_dict,
     parameter_dict['perturbation_checkpoint_metric'] = parameter_dict.get(
       'perturbation_checkpoint_metric', 'mvc_next'
     )
+    # multi-perturbation (high-MOI) settings; pert_delimiter=None keeps single-label behaviour
+    parameter_dict['pert_delimiter'] = parameter_dict.get('pert_delimiter', None)
+    parameter_dict['pert_aggregation'] = parameter_dict.get('pert_aggregation', 'sum')
+    parameter_dict['perturbation_unit'] = parameter_dict.get('perturbation_unit', 'set')
+    parameter_dict['pert_pred_threshold'] = parameter_dict.get('pert_pred_threshold', 0.5)
+    parameter_dict['pert_bce_pos_weight'] = parameter_dict.get('pert_bce_pos_weight', None)
+    parameter_dict['max_perts_per_cell'] = parameter_dict.get('max_perts_per_cell', None)
     if parameter_dict['next_cell_pred_type'] == 'identity':
       parameter_dict['next_weight'] = 0
     #mask_ratio = config.mask_ratio

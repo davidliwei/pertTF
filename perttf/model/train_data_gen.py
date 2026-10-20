@@ -85,6 +85,8 @@ def produce_training_datasets(adata_input, config,
         control_value=control_value,
         check_columns=split_check_columns,
         min_cells=config.get('perturbation_metric_min_cells', 30),
+        perturbation_unit=config.get('perturbation_unit', 'set'),
+        pert_delimiter=config.get('pert_delimiter', None),
     )
     split_summary = {
         'mode': effective_next_cell_pred,

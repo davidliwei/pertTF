@@ -13,7 +13,6 @@ Tutorial -> test map
   virtual_pooled_screen                                      -> test_virtual_screen_tutorial
 """
 import json
-import os
 
 import numpy as np
 import pandas as pd
@@ -118,6 +117,7 @@ def build_model(data_gen, config):
         n_input_bins=config.n_bins, ecs_threshold=config.ecs_thres,
         explicit_zero_prob=config.explicit_zero_prob, use_fast_transformer=config.fast_transformer,
         pre_norm=config.pre_norm, n_cls=data_gen["n_cls"], nlayers_cls=3,
+        pert_aggregation=config.get("pert_aggregation", "sum"),
     )
 
 
@@ -143,7 +143,7 @@ def to_hf_checkpoint(model, config, data_gen, save_dir):
         num_batch_labels=data_gen["num_batch_types"], n_bins=config.n_bins,
         ecs_threshold=config.ecs_thres, use_fast_transformer=False,
         genotype_to_index=data_gen["genotype_to_index"], cell_type_to_index=data_gen["cell_type_to_index"],
-        ps_names=data_gen["ps_names"],
+        ps_names=data_gen["ps_names"], pert_aggregation=config.get("pert_aggregation", "sum"),
     )
     hf.load_state_dict(model.state_dict(), strict=True)
     hf.save_pretrained(str(save_dir), training_config=config.as_dict())
@@ -159,7 +159,7 @@ def single_process_loaders():
 
     mp = pytest.MonkeyPatch()
     mp.setattr(pert_data_loader, "DataLoader",
-               lambda *args, **kwargs: DataLoader(*args, **{**kwargs, "num_workers": 0}))
+               lambda *args, **kwargs: DataLoader(*args, **{**kwargs, "num_workers": 0, "pin_memory": False}))
     yield
     mp.undo()
 
@@ -329,3 +329,112 @@ def test_virtual_screen_tutorial(adata, pert_checkpoint):
     assert set(ranked.index) == {"A", "B"}
     assert {"mean", "median", "percentile_90", "rank"} <= set(ranked.columns)
     assert "X_scGPT_next" in results["adata_last_eva"].obsm
+
+
+# --- multi-perturbation (high-MOI) variants of the tutorials ---------------------------------
+# regime "set": designed combinations, evaluated per set; regime "single": random 1-6 guides
+# per cell, evaluated per single perturbation (spec §1.1).
+
+MULTI_GENES = [f"P{i}" for i in range(8)]
+SET_LABELS = ["WT", "A", "B", "C", "A+B", "B+C", "A+B+C"]
+
+
+def make_multi_adata(regime, seed=0):
+    rng = np.random.default_rng(seed)
+    n_per_label = CELLS_PER_GROUP * len(CELLTYPES)
+    if regime == "set":
+        genotype = np.repeat(SET_LABELS, n_per_label)
+    else:
+        sets = ["+".join(sorted(rng.choice(MULTI_GENES, rng.integers(1, 7), replace=False)))
+                for _ in range(6 * n_per_label)]
+        genotype = np.array(["WT"] * n_per_label + sets)
+    celltype = np.tile(np.repeat(CELLTYPES, CELLS_PER_GROUP), genotype.size // n_per_label)
+    singles = sorted({g for label in genotype for g in label.split("+") if g != "WT"})
+    base = rng.gamma(2.0, 1.0, size=N_GENES)
+    rate = np.tile(base, (genotype.size, 1))
+    for i, g in enumerate(singles):
+        has_g = np.array([g in label.split("+") for label in genotype])
+        rate[has_g, i * 5:(i + 1) * 5] *= 3.0  # additive per-guide signatures
+    rate[celltype == "T2", 50:55] *= 2.5
+    counts = rng.poisson(rate).astype(np.float32)
+    normed = np.log1p(counts / counts.sum(1, keepdims=True) * 1e4).astype(np.float32)
+    adata = anndata.AnnData(
+        X=normed,
+        obs=pd.DataFrame({"genotype": genotype, "celltype": celltype},
+                         index=[f"cell_{i}" for i in range(genotype.size)]),
+        var=pd.DataFrame(index=[f"G{i}" for i in range(N_GENES)]),
+    )
+    adata.layers["X_binned"] = normed.copy()
+    adata.var["highly_variable"] = np.arange(N_GENES) < 40
+    return adata, singles
+
+
+def split_by_control(adata, seed=0, frac=0.2):
+    """Random split that keeps control and perturbed cells of every cell type in both halves."""
+    rng = np.random.default_rng(seed)
+    valid = []
+    key = adata.obs["celltype"].astype(str) + "|" + (adata.obs["genotype"] == "WT").astype(str)
+    for _, idx in adata.obs.groupby(key, observed=True).indices.items():
+        valid.extend(rng.choice(idx, max(5, int(frac * len(idx))), replace=False))
+    valid = np.sort(np.array(valid))
+    return np.setdiff1d(np.arange(adata.n_obs), valid), valid
+
+
+def multi_hyperparameters(regime):
+    return pert_hyperparameters(
+        pert_delimiter="+", perturbation_unit=regime,
+        pert_aggregation="sqrt" if regime == "single" else "sum",
+        pairing_config={"target_sampling": "cell"} if regime == "single" else {},
+    )
+
+
+def train_multi_model(regime, save_dir):
+    adata, singles = make_multi_adata(regime)
+    config, _ = generate_config(multi_hyperparameters(regime), wandb_mode="disabled")
+    train_idx, valid_idx = split_by_control(adata)
+    data_gen = produce_training_datasets(adata, config, next_cell_pred="pert",
+                                         train_indices=train_idx, valid_indices=valid_idx)
+    model = build_model(data_gen, config)
+    best = wrapper_train(model, config, data_gen, save_dir=save_dir, device=DEVICE, eval_adata_dict={})
+    return adata, singles, best, config, data_gen
+
+
+@pytest.fixture(scope="module")
+def multi_checkpoint(tmp_path_factory):
+    """Regime "set" training run reused by the multi-mode inference tests."""
+    save_dir = tmp_path_factory.mktemp("multi_run")
+    adata, singles, best, config, data_gen = train_multi_model("set", save_dir)
+    hf_dir = tmp_path_factory.mktemp("multi_hf")
+    to_hf_checkpoint(best, config, data_gen, hf_dir)
+    return {"adata": adata, "singles": singles, "model": best, "config": config,
+            "data_gen": data_gen, "save_dir": save_dir, "hf_dir": hf_dir}
+
+
+@pytest.mark.parametrize("regime", ["set", "single"])
+def test_multi_pert_training_tutorial(regime, tmp_path):
+    adata, singles, best, config, data_gen = train_multi_model(regime, tmp_path)
+    assert set(data_gen["genotype_to_index"]) == set(singles) | {"WT"}
+    assert data_gen["n_perturb"] == len(singles) + 1
+    counts = data_gen["split_check"]["combination_type_counts"]
+    if regime == "set":
+        assert "unseen_combination" in counts
+    assert (tmp_path / "best_model.pt").exists()
+
+    adata_eva = eval_testdata(best, data_gen["adata_sorted"], data_gen["gene_ids"],
+                              train_data_dict=data_gen, config=config, device=DEVICE)
+    probs = adata_eva.obsm["X_pert_pred_probs"]
+    assert probs.shape == (adata_eva.n_obs, data_gen["n_perturb"])
+    assert probs.min() >= 0.0 and probs.max() <= 1.0  # sigmoid, not softmax, in multi mode
+    for label in adata_eva.obs["predicted_genotype"]:
+        assert set(label.split("+")) <= set(data_gen["genotype_to_index"])
+    assert "genotype_id" not in adata_eva.obs
+
+
+def test_legacy_mode_warns_on_plus_labels():
+    adata, _ = make_multi_adata("set")
+    config, _ = generate_config(pert_hyperparameters(), wandb_mode="disabled")  # pert_delimiter=None
+    train_idx, valid_idx = split_by_control(adata)
+    with pytest.warns(UserWarning, match=r"\+"):
+        data_gen = produce_training_datasets(adata, config, next_cell_pred="pert",
+                                             train_indices=train_idx, valid_indices=valid_idx)
+    assert "A+B" in data_gen["genotype_to_index"]  # legacy: the combination is its own class

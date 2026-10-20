@@ -31,7 +31,9 @@ from ..custom_loss import (
     criterion_neg_log_bernoulli, 
     masked_mse_loss, 
     masked_relative_error,
-    GenerativeExpressionLoss
+    GenerativeExpressionLoss,
+    perturbation_classification_loss,
+    perturbation_overlap_mask,
 )
 from ..utils.plot import process_and_log_umaps
 from ..utils.misc import append_tensor as _append_tensor
@@ -40,9 +42,11 @@ from ..utils.misc import get_config_value as _cfg
 from ..utils.misc import init_plot_worker
 from ..utils.misc import to_numpy as _to_numpy
 from ..utils.pert_data_loader import PertBatchCollator, PertTFDataset
+from ..utils.pert_labels import canonical_label, canonicalize_perturbation_columns, labels_in_mapping
 from ..utils.pert_metrics import (
     GroupMoments,
     compute_perturbation_metrics,
+    expand_perturbation_rows,
     group_moments_from_anndata,
     labels_to_names,
     normalize_expression,
@@ -50,6 +54,11 @@ from ..utils.pert_metrics import (
     resolve_checkpoint_score,
 )
 from .expr_sampler import DistributionGenerator
+
+
+def _cce_labels(contrastive_dict, labels, labels_next):
+    """Labels concatenated in the order cce_loss concatenates the contrastive features."""
+    return torch.cat([labels if 'orig' in key else labels_next for key in contrastive_dict])
 
 
 def train(model: nn.Module,
@@ -67,7 +76,6 @@ def train(model: nn.Module,
     criterion = masked_mse_loss 
     criterion_dab = nn.CrossEntropyLoss()
     criterion_cls = nn.CrossEntropyLoss()
-    criterion_pert = nn.CrossEntropyLoss()
     criterion_adv = nn.CrossEntropyLoss()  # consider using label smoothing
     criterion_ps = nn.MSELoss() # this is the loss for predicting PS scores
     criterion_mvc = GenerativeExpressionLoss()
@@ -155,11 +163,21 @@ def train(model: nn.Module,
             if config.CCE and len(output_dict["contrastive_dict"]) > 0:
                 cce_mode = config.get('cce_mode', 'cell+geno')
                 logit_norm = config.get('logit_norm', False)
+                # multi mode: (batch, k) padded label sets; positives are pairs sharing a perturbation
+                pert_mask = None
+                if perturbation_labels.dim() == 2 and cce_mode in ('cell_geno', 'genotype', 'cell+geno'):
+                    pert_cat = _cce_labels(output_dict["contrastive_dict"], perturbation_labels, perturbation_labels_next)
+                    pert_mask = perturbation_overlap_mask(pert_cat, pert_cat, model.n_pert)
                 if cce_mode == 'cell_geno': ## supervised contrastive loss plus a custom contrastive loss
                     cce_weight = max(config.perturbation_classifier_weight*config.cell_type_classifier_weight, 1)
-                    input_labels = celltype_labels*1000+perturbation_labels # x1000 make labels unique combination of celltype and genotype
-                    pert_labels = celltype_labels_next*1000+perturbation_labels_next
-                    loss_cce = cce_loss(output_dict["contrastive_dict"], input_labels, pert_labels, logit_norm=logit_norm)
+                    if pert_mask is None:
+                        input_labels = celltype_labels*1000+perturbation_labels # x1000 make labels unique combination of celltype and genotype
+                        pert_labels = celltype_labels_next*1000+perturbation_labels_next
+                        loss_cce = cce_loss(output_dict["contrastive_dict"], input_labels, pert_labels, logit_norm=logit_norm)
+                    else:
+                        celltype_cat = _cce_labels(output_dict["contrastive_dict"], celltype_labels, celltype_labels_next)
+                        cell_geno_mask = pert_mask * (celltype_cat[:, None] == celltype_cat[None, :]).to(pert_mask.dtype)
+                        loss_cce = cce_loss(output_dict["contrastive_dict"], None, None, logit_norm=logit_norm, pert_mask=cell_geno_mask)
                     metrics_to_log["train/cce"] = loss_cce.item()
                     loss += loss_cce * cce_weight
 
@@ -169,7 +187,7 @@ def train(model: nn.Module,
                     loss += loss_cce_celltype * max(config.cell_type_classifier_weight, 1)
 
                 if cce_mode == 'genotype' or cce_mode == 'cell+geno':
-                    loss_cce_genotype = cce_loss(output_dict["contrastive_dict"], perturbation_labels, perturbation_labels_next, logit_norm=logit_norm)
+                    loss_cce_genotype = cce_loss(output_dict["contrastive_dict"], perturbation_labels, perturbation_labels_next, logit_norm=logit_norm, pert_mask=pert_mask)
                     metrics_to_log["train/cce_genotype"] = loss_cce_genotype.item()
                     loss += loss_cce_genotype * max(config.perturbation_classifier_weight,1)
                 
@@ -249,11 +267,11 @@ def train(model: nn.Module,
                 ) / celltype_labels.size(0)
 
             if config.get('genotype_classifier', True):
-                loss_pert = criterion_pert(output_dict["pert_output"], perturbation_labels)
+                loss_pert = perturbation_classification_loss(output_dict["pert_output"], perturbation_labels, config.get('pert_bce_pos_weight'))
                 loss = loss + config.perturbation_classifier_weight * loss_pert
                 metrics_to_log.update({"train/pert": loss_pert.item()})
                 # add for next pert prediction
-                loss_pert_next = criterion_pert(output_dict["pert_output_next"], perturbation_labels_next)
+                loss_pert_next = perturbation_classification_loss(output_dict["pert_output_next"], perturbation_labels_next, config.get('pert_bce_pos_weight'))
                 loss = loss + config.perturbation_classifier_weight * config.next_weight * loss_pert_next
                 metrics_to_log.update({"train/pert_next": loss_pert_next.item()})
 
@@ -461,7 +479,6 @@ def _run_evaluation_batches(
     criterion = masked_mse_loss
     criterion_dab = nn.CrossEntropyLoss()
     criterion_cls = nn.CrossEntropyLoss()
-    criterion_pert = nn.CrossEntropyLoss()
     criterion_ps = nn.MSELoss()
     criterion_mvc = GenerativeExpressionLoss()
     generator = DistributionGenerator(getattr(model, "distribution", None))
@@ -525,7 +542,11 @@ def _run_evaluation_batches(
             use_mvc = predict_expr or _cfg(config, "GEPC", False)
             perturbation_kwargs = {}
             if perturbation_embeddings is not None and perturbation_labels_next is not None:
-                perturbation_kwargs["pert_embeddings_next"] = perturbation_embeddings[perturbation_labels_next]
+                if perturbation_labels_next.dim() == 2:
+                    # (batch, k, dim); the model reduces it with pert_labels_next, which masks the -1 pads
+                    perturbation_kwargs["pert_embeddings_next"] = perturbation_embeddings[perturbation_labels_next.clamp_min(0)]
+                else:
+                    perturbation_kwargs["pert_embeddings_next"] = perturbation_embeddings[perturbation_labels_next]
 
             with torch.amp.autocast("cuda", enabled=_cfg(config, "amp", False)) if device.type == "cuda" else nullcontext():
                 output_dict = model(
@@ -565,7 +586,7 @@ def _run_evaluation_batches(
                         loss_gepc_next = output_values.new_tensor(0.0)
                     loss_dab = criterion_dab(output_dict["dab_output"], batch_labels) if _cfg(config, "dab_weight", 0) > 0 else output_values.new_tensor(0.0)
                     loss_cls = criterion_cls(output_dict["cls_output"], celltype_labels) if _cfg(config, "cell_type_classifier", True) else output_values.new_tensor(0.0)
-                    loss_pert = criterion_pert(output_dict["pert_output"], perturbation_labels) if _cfg(config, "genotype_classifier", True) else output_values.new_tensor(0.0)
+                    loss_pert = perturbation_classification_loss(output_dict["pert_output"], perturbation_labels, _cfg(config, "pert_bce_pos_weight", None)) if _cfg(config, "genotype_classifier", True) else output_values.new_tensor(0.0)
                     loss_ps = criterion_ps(output_dict["ps_output"], batch_data["ps"].to(device)) if _cfg(config, "ps_weight", 0) > 0 else output_values.new_tensor(0.0)
                     loss_ps_next = criterion_ps(output_dict["ps_output_next"], batch_data["ps_next"].to(device)) if ps_next_training_weight > 0 else output_values.new_tensor(0.0)
 
@@ -585,7 +606,10 @@ def _run_evaluation_batches(
             if perturbation_validation:
                 assert moments is not None
                 contexts = labels_to_names(batch_data["celltype_labels"], index_to_celltype)
-                perturbations = labels_to_names(batch_data["perturbation_labels_next"], index_to_genotype)
+                if "pert_name_next" in batch_data:
+                    perturbations = np.asarray(batch_data["pert_name_next"])
+                else:
+                    perturbations = labels_to_names(batch_data["perturbation_labels_next"], index_to_genotype)
                 predicted = generator.generate(
                     output_dict["mvc_output_next"],
                     sample=expr_prediction_mode == "sample",
@@ -595,6 +619,12 @@ def _run_evaluation_batches(
                     _to_numpy(predicted),
                     target_sum=target_sum,
                     input_scale=prediction_scale(getattr(model, "distribution", None)),
+                )
+                normalized, contexts, perturbations = expand_perturbation_rows(
+                    normalized, contexts, perturbations,
+                    _cfg(config, "pert_delimiter", None),
+                    _cfg(config, "perturbation_unit", "set"),
+                    getattr(loader.dataset, "control_value", _cfg(config, "perturbation_control_value", "WT")),
                 )
                 moments.update(normalized, contexts, perturbations)
 
@@ -723,8 +753,15 @@ def eval_testdata(
     logger.info(f"{sum(shared_genes)} genes shared between model vocab's {len(vocab)} and anndata's {adata_t.shape[1]} genes")
     adata_t = adata_t[:, shared_genes].copy()
     gene_ids = np.array(vocab(adata_t.var.index.tolist()), dtype=int)
+    pert_delimiter = _cfg(config, "pert_delimiter", None)
+    control_value = _cfg(config, "perturbation_control_value", "WT")
+    canonicalize_perturbation_columns(adata_t, pert_delimiter, control_value)
     if "genotype_next" in adata_t.obs.keys():
-        adata_t = adata_t[adata_t.obs["genotype_next"].isin(genotype_to_index)].copy()
+        keep = labels_in_mapping(adata_t.obs["genotype_next"], genotype_to_index, pert_delimiter, control_value)
+        n_dropped = int((~keep).sum())
+        if n_dropped > 0:
+            logger.info(f"Dropped {n_dropped} cells whose genotype_next has a perturbation absent from genotype_to_index")
+        adata_t = adata_t[keep].copy()
 
     if _cfg(config, "next_cell_pred_type", "identity") == "pert":
         if "genotype_next" not in adata_t.obs.columns:
@@ -810,13 +847,27 @@ def eval_testdata(
             adata_t.obsm[key] = value
 
     pert_preds = outputs["pert_logits"]
-    pert_shift = pert_preds - pert_preds.max(axis=1, keepdims=True)
-    X_genotype_cls_probs = np.exp(pert_shift) / np.sum(np.exp(pert_shift), axis=1, keepdims=True)
-    adata_t.obsm["X_pert_pred_probs"] = X_genotype_cls_probs
-    adata_t.obsm["genotype_pred_probs"] = X_genotype_cls_probs
     index_to_genotype = {v: k for k, v in genotype_to_index.items()}
-    adata_t.obs["predicted_genotype"] = [index_to_genotype[i] for i in np.argmax(X_genotype_cls_probs, axis=1)]
-    if "genotype" in adata_t.obs.columns:
+    if pert_delimiter is None:
+        pert_shift = pert_preds - pert_preds.max(axis=1, keepdims=True)
+        X_genotype_cls_probs = np.exp(pert_shift) / np.sum(np.exp(pert_shift), axis=1, keepdims=True)
+        adata_t.obsm["X_pert_pred_probs"] = X_genotype_cls_probs
+        adata_t.obsm["genotype_pred_probs"] = X_genotype_cls_probs
+        adata_t.obs["predicted_genotype"] = [index_to_genotype[i] for i in np.argmax(X_genotype_cls_probs, axis=1)]
+    else:
+        # multi-label head: independent sigmoid per perturbation
+        X_genotype_cls_probs = torch.sigmoid(torch.from_numpy(np.asarray(pert_preds, dtype=np.float32))).numpy()
+        adata_t.obsm["X_pert_pred_probs"] = X_genotype_cls_probs
+        adata_t.obsm["genotype_pred_probs"] = X_genotype_cls_probs
+        threshold = _cfg(config, "pert_pred_threshold", 0.5)
+        top = np.argsort(-X_genotype_cls_probs, axis=1, kind="stable")[:, :dataset.max_n_pert]
+        predicted = []
+        for row_probs, row_top in zip(X_genotype_cls_probs, top):
+            chosen = [i for i in row_top if row_probs[i] > threshold] or [row_top[0]]
+            predicted.append(canonical_label(
+                pert_delimiter.join(index_to_genotype[i] for i in chosen), pert_delimiter, control_value))
+        adata_t.obs["predicted_genotype"] = predicted
+    if "genotype" in adata_t.obs.columns and pert_delimiter is None:
         adata_t.obs["genotype_id"] = adata_t.obs["genotype"].map(genotype_to_index).astype(pd.CategoricalDtype(categories=list(genotype_to_index.values())))
 
     cls_preds = outputs["cls_logits"]
@@ -891,6 +942,11 @@ def wrapper_train(model, config, data_gen,
             layer=config.get('perturbation_metric_real_layer', None),
             input_scale=config.get('perturbation_metric_real_scale', 'log1p'),
             target_sum=config.get('perturbation_metric_target_sum', 10000.0),
+            perturbation_unit=config.get('perturbation_unit', 'set'),
+            pert_delimiter=config.get('pert_delimiter', None),
+            control_value=(config.get('pairing_config', {}) or {}).get(
+                'control_value', config.get('perturbation_control_value', 'WT')
+            ),
         ).finalize()
     executor = ProcessPoolExecutor(
         max_workers=4,

@@ -859,6 +859,12 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             "distribution": None,
             "use_ot": False,
             "dataset_name": "adata",
+            "pert_delimiter": None,
+            "pert_aggregation": getattr(self, "pert_aggregation", "sum"),
+            "perturbation_unit": "set",
+            "pert_pred_threshold": 0.5,
+            "pert_bce_pos_weight": None,
+            "max_perts_per_cell": None,
         }
 
         base_config = self.training_config if self.training_config is not None else OmegaConf.create({})
@@ -1091,6 +1097,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         reference_indices = np.concatenate([data_gen["pert_valid_target_indices"], data_gen["pert_valid_control_indices"]])
         real_groups = group_moments_from_anndata(
             data_gen["adata_manager"].adata, reference_indices, layer=input_layer_key, input_scale="log1p", target_sum=target_sum,
+            perturbation_unit=config.get("perturbation_unit", "set"), pert_delimiter=config.get("pert_delimiter", None),
+            control_value=(config.get("pairing_config", {}) or {}).get(
+                "control_value", config.get("perturbation_control_value", "WT")),
         ).finalize()
         metric_name = checkpoint_metric if checkpoint_metric == "mvc_next" else f"{checkpoint_metric}_sample"
 
