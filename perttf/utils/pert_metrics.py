@@ -1,9 +1,11 @@
 from dataclasses import dataclass
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
 from scipy import sparse
 from scipy.stats import t as student_t
+
+from perttf.utils.pert_labels import split_perturbation_label
 
 
 def normalize_expression(values, target_sum=10000.0, input_scale="counts"):
@@ -23,6 +25,39 @@ def normalize_expression(values, target_sum=10000.0, input_scale="counts"):
     return np.log1p(normalized * target_sum)
 
 
+def expand_perturbation_rows(
+    values,
+    contexts,
+    perturbations,
+    delimiter: Optional[str],
+    unit: str,
+    control: str = "WT",
+):
+    """Repeat each row once per component perturbation when ``unit == "single"``.
+
+    ``unit == "set"`` (or ``delimiter is None``) returns the inputs unchanged. Control
+    rows stay as one row labelled ``control``.
+    """
+    if unit not in {"set", "single"}:
+        raise ValueError("perturbation_unit must be 'set' or 'single'")
+    if unit == "set" or delimiter is None:
+        return values, contexts, perturbations
+    values = np.asarray(values)
+    contexts = np.asarray(contexts)
+    perturbations = np.asarray(perturbations)
+    rows, labels = [], []
+    cache = {}
+    for i, label in enumerate(perturbations):
+        label = str(label)
+        if label not in cache:
+            cache[label] = split_perturbation_label(label, delimiter, control)
+        for component in cache[label]:
+            rows.append(i)
+            labels.append(component)
+    rows = np.asarray(rows, dtype=np.int64)
+    return values[rows], contexts[rows], np.asarray(labels, dtype=object)
+
+
 def group_moments_from_anndata(
     adata,
     indices,
@@ -32,8 +67,15 @@ def group_moments_from_anndata(
     input_scale="log1p",
     target_sum=10000.0,
     chunk_size=1024,
+    perturbation_unit="set",
+    pert_delimiter=None,
+    control_value="WT",
 ):
-    """Build normalized group moments from selected AnnData rows."""
+    """Build normalized group moments from selected AnnData rows.
+
+    With ``perturbation_unit="single"`` each cell contributes to one group per
+    component perturbation.
+    """
     indices = np.asarray(indices, dtype=np.int64)
     moments = GroupMoments()
     matrix = adata.X if layer is None else adata.layers[layer]
@@ -42,11 +84,12 @@ def group_moments_from_anndata(
         values = normalize_expression(
             matrix[chunk], target_sum=target_sum, input_scale=input_scale
         )
-        moments.update(
-            values,
-            adata.obs.iloc[chunk][context_col].to_numpy(),
-            adata.obs.iloc[chunk][perturbation_col].to_numpy(),
+        contexts = adata.obs.iloc[chunk][context_col].to_numpy()
+        perturbations = adata.obs.iloc[chunk][perturbation_col].to_numpy()
+        values, contexts, perturbations = expand_perturbation_rows(
+            values, contexts, perturbations, pert_delimiter, perturbation_unit, control_value
         )
+        moments.update(values, contexts, perturbations)
     return moments
 
 
