@@ -466,3 +466,56 @@ def test_legacy_mode_warns_on_plus_labels():
         data_gen = produce_training_datasets(adata, config, next_cell_pred="pert",
                                              train_indices=train_idx, valid_indices=valid_idx)
     assert "A+B" in data_gen["genotype_to_index"]  # legacy: the combination is its own class
+
+
+def test_multi_predict_perturbations_tutorial(multi_checkpoint):
+    model = HFPerturbationTFModel.from_pretrained(str(multi_checkpoint["hf_dir"]))
+    assert model.training_config.pert_delimiter == "+"
+    assert model.training_config.pert_aggregation == "sum"
+    adata = multi_checkpoint["adata"]
+    query = adata[adata.obs["genotype"] == "WT"].copy()
+    query.obs["genotype_next"] = "A+C"  # a combination never seen in training, of known singles
+    result = model.predict_perturbations(query, prediction_mode="mean", device=DEVICE)
+    assert result.obs_names.equals(query.obs_names)
+    assert result.obsm["mvc_next_expr"].shape == query.shape
+    assert result.uns["perttf_prediction"]["pert_delimiter"] == "+"
+    with pytest.raises(ValueError):
+        model.predict_perturbations(query, pert_delimiter="|", device=DEVICE)
+    bad = query.copy()
+    bad.obs["genotype_next"] = "A+Z"
+    with pytest.raises(ValueError, match="Z"):
+        model.predict_perturbations(bad, device=DEVICE)
+
+
+def test_multi_virtual_screen_tutorial(multi_checkpoint):
+    from perttf.utils.virtual_screen import virtual_screen_src2dest
+
+    adata, model, config = multi_checkpoint["adata"], multi_checkpoint["model"], multi_checkpoint["config"]
+    running_parameters = torch.load(multi_checkpoint["save_dir"] / "running_parameters.pt", weights_only=False)
+    vocab = torch.load(multi_checkpoint["save_dir"] / "vocab.pt", weights_only=False)
+    is_t1 = adata.obs["celltype"] == "T1"
+    adata_src = adata[is_t1 & (adata.obs["genotype"] == "WT")].copy()
+    adata_des = adata[is_t1 & (adata.obs["genotype"] == "A+B+C")].copy()
+    for a in (adata_src, adata_des):
+        a.obs["genotype_next"] = a.obs["genotype"].astype("category")
+    results = virtual_screen_src2dest(
+        adata_src, adata_des, model, vocab, config, running_parameters,
+        screen_genes=["A+B", "C", "A+Z"], device=DEVICE,
+        n_expands_per_epoch=1, n_epoch=1, wt_pred_next_label="A+B+C",
+    )
+    assert set(results["sim_ranked"].index) == {"A+B", "C"}  # "A+Z" filtered: Z is unknown
+
+
+def test_multi_lora_pert_tutorial(multi_checkpoint, tmp_path):
+    pytest.importorskip("peft")
+    model = HFPerturbationTFModel.from_pretrained(str(multi_checkpoint["hf_dir"]))
+    adata = multi_checkpoint["adata"]
+    is_t1 = (adata.obs["celltype"] == "T1").to_numpy()
+    adapter_dir = tmp_path / "multi_pert_adapter"
+    peft_model = model.run_lora_pert_train(
+        adata, np.where(~is_t1)[0], np.where(is_t1)[0], epochs=1, batch_size=32,
+        lora_config=model.build_lora_config(r=4, lora_alpha=8, lora_dropout=0.0),
+        save_dir=str(adapter_dir), seed=0, device=DEVICE,
+    )
+    assert (adapter_dir / "lora_heads.json").exists()
+    assert set(peft_model.get_base_model().genotype_to_index) == set(multi_checkpoint["singles"]) | {"WT"}

@@ -6,6 +6,15 @@ import matplotlib.pyplot as plt
 
 from perttf.model.pert_emb import generate_pert_embeddings, calculate_avg_cosine_similarity
 from perttf.model.train_function import eval_testdata
+from perttf.utils.pert_labels import labels_in_mapping
+
+
+def _first_set(key, *sources, default=None):
+  for source in sources:
+    value = source.get(key) if source is not None else None
+    if value is not None:
+      return value
+  return default
 
 
 def virtual_screen_src2dest(adata_src,
@@ -37,10 +46,15 @@ def virtual_screen_src2dest(adata_src,
   if screen_genes is None:
     screen_genes_next=gene_available_for_screen
   else:
-    filtered_genes=[x for x in screen_genes if x not in gene_available_for_screen]
+    # wrapper_train stores the run's config (with pert_delimiter) inside running_parameters['config'].
+    sources = (running_parameters, running_parameters.get('config'), config, getattr(model, 'training_config', None))
+    delimiter = _first_set('pert_delimiter', *sources)
+    control = _first_set('perturbation_control_value', *sources, default='WT')
+    screenable = labels_in_mapping(screen_genes, genotype_to_index, delimiter, control)
+    filtered_genes=[x for x, ok in zip(screen_genes, screenable) if not ok]
     if len(filtered_genes)>0:
       print("warning: the following genes are filtered (not in genotype index; cannot screen):" + ','.join(filtered_genes))
-    screen_genes_next=[x for x in screen_genes if x in gene_available_for_screen]
+    screen_genes_next=[x for x, ok in zip(screen_genes, screenable) if ok]
     if len(screen_genes_next)==0:
       raise ValueError('None of the genes are screenable')
 
