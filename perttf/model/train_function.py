@@ -849,7 +849,11 @@ def eval_testdata(
 
     pert_preds = outputs["pert_logits"]
     index_to_genotype = {v: k for k, v in genotype_to_index.items()}
-    if pert_delimiter is None:
+    # After LoRA pert_mode='new' the model has a new perturbation dictionary but keeps the pretrained genotype
+    # classifier, whose outputs then index a different label set; no genotype prediction is written.
+    if pert_preds.shape[1] != len(genotype_to_index):
+        pass
+    elif pert_delimiter is None:
         pert_shift = pert_preds - pert_preds.max(axis=1, keepdims=True)
         X_genotype_cls_probs = np.exp(pert_shift) / np.sum(np.exp(pert_shift), axis=1, keepdims=True)
         adata_t.obsm["X_pert_pred_probs"] = X_genotype_cls_probs

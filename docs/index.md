@@ -21,6 +21,7 @@ tutorials/PERTURBATION_SOURCES
 tutorials/INFERENCE
 tutorials/lora_finetuning_tutorial
 tutorials/MULTI_PERTURBATION
+tutorials/pretrain_finetune_tutorial
 ```
 
 ```{toctree}
