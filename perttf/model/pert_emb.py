@@ -17,6 +17,7 @@ from anndata import AnnData
 
 
 from .train_function import eval_testdata
+from ..utils.pert_labels import unique_perturbations
 
 EMBEDDING_REPO_ID = "weililab/perturbation-embeddings"
 DEFAULT_EMBEDDING_REVISION = "5b01881945b81d9250cf600fb07968539ed8292b"
@@ -68,6 +69,7 @@ def build_perturbation_mapping(
     perturbations: Sequence[str],
     sources: dict,
     control_label: str = "WT",
+    delimiter: Optional[str] = None,
 ) -> Dict[str, int]:
     """Build one vocabulary for dataset labels, unified encoding and classification.
 
@@ -75,7 +77,7 @@ def build_perturbation_mapping(
     Source-only names are appended in sorted order. Call before preparing loaders
     and pass the returned mapping unchanged to dataset preparation and the model.
     """
-    names = list(dict.fromkeys(list(perturbations) + [control_label]))
+    names = list(dict.fromkeys(unique_perturbations(perturbations, delimiter, control_label) + [control_label]))
     external_names = {gene for genes, _ in sources.values() for gene in genes}
     names.extend(sorted(external_names.difference(names)))
     return {gene: index for index, gene in enumerate(names)}

@@ -18,6 +18,7 @@ from peft.tuners.tuners_utils import BaseTunerLayer
 from . import train_function
 from ..custom_loss import GenerativeExpressionLoss, criterion_neg_log_bernoulli, masked_mse_loss
 from ..utils.set_optimizer import create_optimizer_dict
+from ..utils.pert_labels import unique_perturbations
 
 
 def check_no_adapter(model) -> None:
@@ -76,7 +77,7 @@ def prepare_config(model, adata: AnnData, input_layer_key: str, batch_size: Opti
     return config, ps_columns
 
 
-def label_mappings(model, adata: AnnData, require_known) -> Tuple[Optional[Dict], Optional[Dict]]:
+def label_mappings(model, adata: AnnData, require_known, delimiter: Optional[str] = None) -> Tuple[Optional[Dict], Optional[Dict]]:
     """
     Label -> index mappings for celltype and genotype. A label column listed in require_known keeps
     the pretrained mapping and must only contain model labels; for the others, a mapping missing
@@ -85,7 +86,10 @@ def label_mappings(model, adata: AnnData, require_known) -> Tuple[Optional[Dict]
     mappings = {}
     for obs_col, attr in (("celltype", "cell_type_to_index"), ("genotype", "genotype_to_index")):
         mapping = getattr(model, attr, None)
-        missing = [x for x in adata.obs[obs_col].unique() if mapping is None or x not in mapping]
+        labels = adata.obs[obs_col].unique()
+        if obs_col == "genotype":
+            labels = unique_perturbations(labels, delimiter)
+        missing = [x for x in labels if mapping is None or x not in mapping]
         if obs_col in require_known and missing:
             raise ValueError(
                 f"adata.obs['{obs_col}'] has labels the model does not know: {sorted(map(str, missing))}. "
