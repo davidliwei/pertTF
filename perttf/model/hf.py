@@ -266,6 +266,18 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         distribution = getattr(self, "distribution", None)
         return "log1p" if distribution in {None, "zig", "gaussian"} else "counts"
 
+    def _resolve_pert_delimiter(self, pert_delimiter):
+        """The "__from_config__" sentinel reads the training config; an explicit value is accepted when
+        the checkpoint has none, and a non-None value contradicting a non-None checkpoint value raises."""
+        config_delimiter = (self.training_config or {}).get("pert_delimiter")
+        if pert_delimiter == "__from_config__":
+            return config_delimiter
+        if pert_delimiter is not None and config_delimiter is not None and pert_delimiter != config_delimiter:
+            raise ValueError(
+                f"pert_delimiter={pert_delimiter!r} contradicts the training config pert_delimiter={config_delimiter!r}"
+            )
+        return pert_delimiter
+
     def predict_perturbations(
         self,
         adata,
@@ -318,13 +330,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         if not hasattr(self, "cell_type_to_index"):
             raise RuntimeError("Loaded model does not contain cell_type_to_index")
 
-        config_delimiter = (self.training_config or {}).get("pert_delimiter")
-        if pert_delimiter == "__from_config__":
-            pert_delimiter = config_delimiter
-        elif pert_delimiter is not None and config_delimiter is not None and pert_delimiter != config_delimiter:
-            raise ValueError(
-                f"pert_delimiter={pert_delimiter!r} contradicts the training config pert_delimiter={config_delimiter!r}"
-            )
+        pert_delimiter = self._resolve_pert_delimiter(pert_delimiter)
         control_value = (self.training_config or {}).get("perturbation_control_value", "WT")
         observed_labels = pd.concat([adata.obs["genotype"], adata.obs[perturbation_col]]).dropna().astype(str).unique()
         validate_perturbation_labels(observed_labels, pert_delimiter, control_value,
@@ -953,6 +959,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         stratify_by=None,
         split_check_columns=None,
         this_weight: float = 1.0,
+        pert_delimiter: Optional[str] = "__from_config__",
     ):
         """
         LoRA fine-tuning with a new head that predicts a cell-level target from the cell embedding.
@@ -968,6 +975,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         The split is random (train_val_split, optionally stratify_by) unless train_indices/valid_indices
         are given. For classification, cls_col is checked so every validation class is also in training;
         split_check_columns adds further columns to check. Checkpoints are selected on the validation loss of the head.
+        pert_delimiter: separator of multi-perturbation labels such as "A+B"; resolved as in predict_perturbations
+            (default: the training config value; an explicit value contradicting a non-None checkpoint value raises).
         """
         import copy
         import numpy as np
@@ -979,7 +988,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             raise ValueError(f"cls_task must be 'classification' or 'regression'; got {cls_task!r}")
         lora.check_no_adapter(self)
 
+        pert_delimiter = self._resolve_pert_delimiter(pert_delimiter)
         config, ps_columns = lora.prepare_config(self, adata, input_layer_key, batch_size, lr, amp, None, seed)
+        config.pert_delimiter = pert_delimiter
         # Always the identity objective, whatever the checkpoint was trained for (e.g. a pert checkpoint
         # has this_weight=0, next_weight=1, mask_ratio=0); the pretrained classifier heads are not trained.
         config.next_cell_pred_type = "identity"
@@ -1052,7 +1063,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             return val_head
 
         lora.fit(peft_model, epochs, run_epoch, device, optimizer_dict["scheduler"])
-        lora.save(peft_model, save_dir, {"mode": "cls", "cls_info": cls_info})
+        lora.save(peft_model, save_dir, lora.heads_info("cls", cls_info, pert_delimiter))
         return peft_model
 
     def run_lora_pert_train(
@@ -1071,6 +1082,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         log_interval: Optional[int] = None,
         seed: Optional[int] = None,
         checkpoint_metric: str = "pearson_delta",
+        pert_delimiter: Optional[str] = "__from_config__",
     ):
         """
         LoRA fine-tuning of perturbation prediction (control cell + target perturbation -> perturbed expression).
@@ -1088,6 +1100,11 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
 
         lr: AdamW learning rate (default: the checkpoint's training_config lr), multiplied by schedule_ratio
         after each epoch; the checkpoint's optimizer/scheduler settings are not used.
+
+        pert_delimiter: separator of multi-perturbation labels such as "A+B"; resolved as in predict_perturbations
+        (default: the training config value; an explicit value is accepted when the checkpoint has none, e.g. to
+        fine-tune a single-perturbation checkpoint on combinations of its labels; a value contradicting a
+        non-None checkpoint value raises).
         """
         import numpy as np
         from . import lora
@@ -1103,7 +1120,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
                 f"(training_config.next_cell_pred_type='pert'); this one has {checkpoint_mode!r}."
             )
 
+        pert_delimiter = self._resolve_pert_delimiter(pert_delimiter)
         config, ps_columns = lora.prepare_config(self, adata, input_layer_key, batch_size, lr, amp, log_interval, seed)
+        config.pert_delimiter = pert_delimiter
         # Keep the checkpoint's perturbation objective (next_weight, this_weight, mask_ratio, classifier flags).
         config.next_cell_pred_type = "pert"
 
@@ -1181,7 +1200,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             return score if mode == "min" else -score
 
         lora.fit(peft_model, epochs, run_epoch, device, optimizer_dict["scheduler"])
-        lora.save(peft_model, save_dir, {"mode": "pert", "cls_info": None})
+        lora.save(peft_model, save_dir, lora.heads_info("pert", None, pert_delimiter))
         return peft_model
 
     @classmethod

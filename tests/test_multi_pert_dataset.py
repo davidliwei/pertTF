@@ -61,3 +61,24 @@ def test_prediction_only_emits_padded_next():
     a = tiny(["WT", "WT"]); a.obs["genotype_next"] = ["A+B", "WT"]
     ds = PertTFDataset(a, genotype_to_index={"WT": 0, "A": 1, "B": 2}, prediction_only=True, pert_delimiter="+")
     assert ds[0]["perturbation_labels_next"].tolist() == [1, 2] and ds[0]["pert_name_next"] == "A+B"
+
+def test_legacy_prediction_only_missing_genotype_maps_to_zero():
+    a = tiny(["WT", "A", "WT"])
+    a.obs["genotype"] = pd.Series(["WT", np.nan, "A"], index=a.obs.index, dtype=object)
+    ds = PertTFDataset(a, genotype_to_index={"WT": 0, "A": 1}, prediction_only=True)
+    assert [ds[i]["perturbation_labels"] for i in range(3)] == [0, 0, 1]
+
+def test_multi_prediction_only_unknown_source_component_is_padded():
+    a = tiny(["C+A", "WT"]); a.obs["genotype_next"] = ["A", "B"]
+    ds = PertTFDataset(a, genotype_to_index={"WT": 0, "A": 1, "B": 2}, prediction_only=True, pert_delimiter="+")
+    assert ds[0]["perturbation_labels"].tolist() == [1, -1]
+    assert ds[1]["perturbation_labels"].tolist() == [0, -1]
+    b = tiny(["C+D", "WT"]); b.obs["genotype_next"] = ["A", "B"]
+    ds = PertTFDataset(b, genotype_to_index={"WT": 0, "A": 1, "B": 2}, prediction_only=True, pert_delimiter="+")
+    assert ds[0]["perturbation_labels"].tolist() == [-1, -1]
+
+def test_multi_unknown_next_component_still_raises():
+    a = tiny(["WT", "WT"]); a.obs["genotype_next"] = ["A+Z", "WT"]
+    ds = PertTFDataset(a, genotype_to_index={"WT": 0, "A": 1}, prediction_only=True, pert_delimiter="+")
+    with pytest.raises(ValueError, match="Z"):
+        ds[0]

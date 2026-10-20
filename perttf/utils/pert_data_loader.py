@@ -216,12 +216,15 @@ class PertTFDataset(Dataset):
         self.ps_matrix = self.adata.obs[self.ps_columns].values.astype(np.float32) if self.ps_columns else np.zeros((self.adata.shape[0],1), dtype=np.float32)
 
 
-    def _to_label(self, label_str):
-        """Index for a label (legacy) or a -1 padded index array of shape (max_n_pert,) (multi mode)."""
+    def _to_label(self, label_str, drop_unknown=False):
+        """Index for a label (legacy) or a -1 padded index array of shape (max_n_pert,) (multi mode).
+
+        ``drop_unknown`` (multi mode) pads components missing from the mapping instead of raising."""
         if self.pert_delimiter is None:
             return self.genotype_to_index[label_str]
         return labels_to_padded_array(
-            label_str, self.genotype_to_index, self.pert_delimiter, self.max_n_pert, self.control_value)
+            label_str, self.genotype_to_index, self.pert_delimiter, self.max_n_pert, self.control_value,
+            drop_unknown=drop_unknown)
 
     def _check_anndata_content(self):
         assert 'genotype' in self.adata.obs.columns and 'celltype' in self.adata.obs.columns, 'no genotype or celltype column found in anndata'
@@ -301,7 +304,8 @@ class PertTFDataset(Dataset):
                 "celltype_labels": self.cell_type_to_index.get(current_cell_celltype, 0),
                 "perturbation_labels": (
                     self.genotype_to_index.get(current_cell_genotype, 0)
-                    if self.pert_delimiter is None else self._to_label(current_cell_genotype)
+                    # Source labels are lenient like legacy .get(x, 0): unknown components become padding.
+                    if self.pert_delimiter is None else self._to_label(current_cell_genotype, drop_unknown=True)
                 ),
                 "pert_name": str(current_cell_genotype),
                 "batch_labels": current_cell_batch_label,

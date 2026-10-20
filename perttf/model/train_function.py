@@ -606,7 +606,8 @@ def _run_evaluation_batches(
             if perturbation_validation:
                 assert moments is not None
                 contexts = labels_to_names(batch_data["celltype_labels"], index_to_celltype)
-                if "pert_name_next" in batch_data:
+                if _cfg(config, "pert_delimiter", None) is not None:
+                    # Multi mode: set labels are names, not single indices.
                     perturbations = np.asarray(batch_data["pert_name_next"])
                 else:
                     perturbations = labels_to_names(batch_data["perturbation_labels_next"], index_to_genotype)
@@ -909,6 +910,14 @@ def wrapper_train(model, config, data_gen,
     if save_dir is None:
         save_dir = Path(f"./save/dev_{config.dataset_name}-{time.strftime('%b%d-%H-%M')}/")
         save_dir.mkdir(parents=True, exist_ok=True)
+
+    model_aggregation = getattr(model, "pert_aggregation", "sum")
+    config_aggregation = config.get("pert_aggregation", "sum")
+    if model_aggregation != config_aggregation:
+        raise ValueError(
+            f"Model pert_aggregation={model_aggregation!r} does not match config "
+            f"pert_aggregation={config_aggregation!r}; build the model with the config value so the "
+            "saved config describes the trained model")
 
     # save the current configurations before epoch starts
     torch.save(vocab, save_dir / "vocab.pt")

@@ -14,6 +14,7 @@ from ..utils.custom_tokenizer import tokenize_and_pad_batch, random_mask_value, 
 from ..utils.pert_data_loader import PertBatchCollator, PertTFDataset, PertTFUniDataManager, add_batch_info
 from ..utils.logger import create_logger
 from ..utils.split_check import check_train_valid_split
+from ..utils.pert_labels import canonicalize_perturbation_columns
 
 
 def _record_config_value(config, key, value):
@@ -85,6 +86,14 @@ def produce_training_datasets(adata_input, config,
         )
     elif stratify_by is not None:
         raise ValueError("stratify_by cannot be used with explicit train_indices and valid_indices")
+
+    if config.get('pert_delimiter', None) is not None:
+        # Canonicalise set labels ("B+A" -> "A+B") before the split check so it compares canonical
+        # groups; the data manager's own canonicalisation is then a no-op. Same control as the manager.
+        if adata_input.is_view:
+            adata_input = adata_input.copy()
+        canonicalize_perturbation_columns(
+            adata_input, config.get('pert_delimiter'), config.get('perturbation_control_value', 'WT'))
 
     control_value = (config.get('pairing_config', {}) or {}).get(
         'control_value', config.get('perturbation_control_value', 'WT')

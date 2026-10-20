@@ -137,6 +137,14 @@ def fit(peft_model, epochs: int, run_epoch: Callable[[int], float], device: torc
         print(f"Restored best model from epoch {best_epoch}")
 
 
+def heads_info(mode: str, cls_info: Optional[Dict], pert_delimiter: Optional[str]) -> Dict:
+    """lora_heads.json content; pert_delimiter is recorded only when set, so legacy files are unchanged."""
+    info = {"mode": mode, "cls_info": cls_info}
+    if pert_delimiter is not None:
+        info["pert_delimiter"] = pert_delimiter
+    return info
+
+
 def save(peft_model, save_dir: Optional[str], heads_info: Dict) -> None:
     """Save the adapter plus lora_heads.json (mode, any new cls head and the base checkpoint hash), read by load_lora_adapter."""
     if not save_dir:

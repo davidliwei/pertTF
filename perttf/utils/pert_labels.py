@@ -7,8 +7,22 @@ import warnings
 from typing import Iterable, Mapping, Optional, Sequence
 
 import numpy as np
+import pandas as pd
 
 PAD = -1
+
+
+def _is_missing(label) -> bool:
+    """True for None, pd.NA or a float NaN (pandas missing values)."""
+    return label is None or label is pd.NA or (isinstance(label, float) and np.isnan(label))
+
+
+def _raise_if_missing(labels, where: str) -> None:
+    n_missing = sum(1 for label in labels if _is_missing(label))
+    if n_missing:
+        raise ValueError(
+            f"{where} has {n_missing} missing (NaN/None) perturbation labels; "
+            "multi-perturbation mode needs a label for every cell (use the control label for controls)")
 
 
 def split_perturbation_label(label: str, delimiter: Optional[str], control: str = "WT") -> tuple:
@@ -49,14 +63,19 @@ def labels_in_mapping(labels: Iterable[str], mapping: Mapping[str, int], delimit
 
 
 def labels_to_padded_array(label: str, mapping: Mapping[str, int], delimiter: Optional[str], width: int,
-                           control: str = "WT") -> np.ndarray:
-    """int64 array of shape ``(width,)``: component indices followed by -1 padding."""
+                           control: str = "WT", drop_unknown: bool = False) -> np.ndarray:
+    """int64 array of shape ``(width,)``: component indices followed by -1 padding.
+
+    With ``drop_unknown`` components missing from ``mapping`` become padding instead of raising
+    (an all-unknown label gives an all-padding row)."""
     parts = split_perturbation_label(label, delimiter, control)
     if len(parts) > width:
         raise ValueError(f"Label {label!r} has {len(parts)} perturbations, more than width {width}")
     unknown = [p for p in parts if p not in mapping]
     if unknown:
-        raise ValueError(f"Label {label!r} has components not in mapping: {unknown}")
+        if not drop_unknown:
+            raise ValueError(f"Label {label!r} has components not in mapping: {unknown}")
+        parts = tuple(p for p in parts if p in mapping)
     out = np.full(width, PAD, dtype=np.int64)
     out[: len(parts)] = [mapping[p] for p in parts]
     return out
@@ -73,11 +92,12 @@ def validate_perturbation_labels(labels: Iterable[str], delimiter: Optional[str]
     """Check labels against the delimiter configuration; raises ValueError on problems."""
     labels = list(labels)
     if delimiter is None:
-        if any("+" in label for label in labels):
+        if any(isinstance(label, str) and "+" in label for label in labels):
             warnings.warn(
                 "Some perturbation labels contain '+' but no multi-perturbation delimiter is set; "
                 "they are treated as single legacy labels.", UserWarning, stacklevel=2)
         return
+    _raise_if_missing(labels, "Perturbation label column")
     malformed = []
     for label in dict.fromkeys(labels):
         try:
@@ -109,6 +129,7 @@ def canonicalize_perturbation_columns(adata, delimiter: Optional[str], control: 
     for col in columns:
         if col not in adata.obs.columns:
             continue
+        _raise_if_missing(adata.obs[col].tolist(), f"obs column {col!r}")
         old = adata.obs[col].astype(str).to_numpy(dtype=object)
         cache = {}
         new = np.empty(len(old), dtype=object)

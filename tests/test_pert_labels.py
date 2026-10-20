@@ -60,3 +60,19 @@ def test_canonicalize_columns_in_place_handles_categorical():
     assert a.obs["genotype_next"].tolist() == ["A+B", "B+C", "WT"]
     assert changed == 3
     assert canonicalize_perturbation_columns(a, None) == 0
+
+def test_validate_legacy_ignores_missing_labels():
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        validate_perturbation_labels(["WT", np.nan, None, "A"], None)
+
+def test_validate_multi_rejects_missing_labels():
+    with pytest.raises(ValueError, match="2 missing"):
+        validate_perturbation_labels(["WT", np.nan, None, "A+B"], "+")
+
+def test_canonicalize_multi_rejects_missing_labels():
+    obs = pd.DataFrame({"genotype": ["A+B", np.nan, "WT"]})
+    a = ad.AnnData(X=np.zeros((3, 2), dtype=np.float32), obs=obs)
+    with pytest.raises(ValueError, match="'genotype'.*1 missing"):
+        canonicalize_perturbation_columns(a, "+")

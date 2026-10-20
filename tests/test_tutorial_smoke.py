@@ -380,17 +380,19 @@ def split_by_control(adata, seed=0, frac=0.2):
     return np.setdiff1d(np.arange(adata.n_obs), valid), valid
 
 
-def multi_hyperparameters(regime):
-    return pert_hyperparameters(
+def multi_hyperparameters(regime, **overrides):
+    hp = dict(
         pert_delimiter="+", perturbation_unit=regime,
         pert_aggregation="sqrt" if regime == "single" else "sum",
         pairing_config={"target_sampling": "cell"} if regime == "single" else {},
     )
+    hp.update(overrides)
+    return pert_hyperparameters(**hp)
 
 
-def train_multi_model(regime, save_dir):
+def train_multi_model(regime, save_dir, **overrides):
     adata, singles = make_multi_adata(regime)
-    config, _ = generate_config(multi_hyperparameters(regime), wandb_mode="disabled")
+    config, _ = generate_config(multi_hyperparameters(regime, **overrides), wandb_mode="disabled")
     train_idx, valid_idx = split_by_control(adata)
     data_gen = produce_training_datasets(adata, config, next_cell_pred="pert",
                                          train_indices=train_idx, valid_indices=valid_idx)
@@ -425,6 +427,7 @@ def test_multi_pert_training_tutorial(regime, tmp_path):
     probs = adata_eva.obsm["X_pert_pred_probs"]
     assert probs.shape == (adata_eva.n_obs, data_gen["n_perturb"])
     assert probs.min() >= 0.0 and probs.max() <= 1.0  # sigmoid, not softmax, in multi mode
+    assert not np.allclose(probs.sum(1), 1.0)
     for label in adata_eva.obs["predicted_genotype"]:
         assert set(label.split("+")) <= set(data_gen["genotype_to_index"])
         assert label == "WT" or "WT" not in label.split("+")  # control dropped inside combinations
@@ -540,3 +543,86 @@ def test_multi_virtual_screen_rejects_config_delimiter_mismatch(multi_checkpoint
             screen_genes=["A+B", "C"], device=DEVICE,
             n_expands_per_epoch=1, n_epoch=1, wt_pred_next_label="A+B+C",
         )
+
+
+def test_multi_split_check_sees_canonical_labels():
+    # Training writes the combination "B+A", validation "A+B" and a "WT+WT" control: the split check
+    # must run on canonical labels, so the validation set is a seen combination and "WT+WT" is a control.
+    adata, _ = make_multi_adata("set")
+    train_idx, valid_idx = split_by_control(adata)
+    genotype = adata.obs["genotype"].to_numpy().astype(object)
+    is_train = np.isin(np.arange(adata.n_obs), train_idx)
+    genotype[(genotype == "A+B") & is_train] = "B+A"
+    wt_valid = np.where((genotype == "WT") & ~is_train)[0]
+    genotype[wt_valid[::2]] = "WT+WT"
+    adata.obs["genotype"] = genotype
+    config, _ = generate_config(multi_hyperparameters("set"), wandb_mode="disabled")
+    data_gen = produce_training_datasets(adata, config, next_cell_pred="pert",
+                                         train_indices=train_idx, valid_indices=valid_idx)
+    types = data_gen["split_check"]["combination_types"]
+    assert ("T1", "A+B") in types["seen_combination"] and ("T2", "A+B") in types["seen_combination"]
+    groups = [g for gs in types.values() for g in gs]
+    assert not any("WT+WT" in str(g) or "B+A" in str(g) for g in groups)
+
+
+def test_wrapper_train_rejects_pert_aggregation_mismatch(tmp_path):
+    adata, _ = make_multi_adata("set")
+    config, _ = generate_config(multi_hyperparameters("set", pert_aggregation="sqrt"), wandb_mode="disabled")
+    train_idx, valid_idx = split_by_control(adata)
+    data_gen = produce_training_datasets(adata, config, next_cell_pred="pert",
+                                         train_indices=train_idx, valid_indices=valid_idx)
+    vocab = data_gen["vocab"]
+    model = PerturbationTFModel(  # no pert_aggregation kwarg: the model sums
+        data_gen["n_perturb"], 3, len(data_gen["ps_names"]), len(vocab),
+        config.layer_size, config.nhead, config.layer_size, config.nlayers,
+        vocab=vocab, dropout=config.dropout, pad_token=config.pad_token, pad_value=config.pad_value,
+        do_mvc=config.GEPC, num_batch_labels=data_gen["num_batch_types"], n_input_bins=config.n_bins,
+        use_fast_transformer=False, n_cls=data_gen["n_cls"], nlayers_cls=3,
+    )
+    with pytest.raises(ValueError, match="sum.*sqrt"):
+        wrapper_train(model, config, data_gen, save_dir=tmp_path, device=DEVICE, eval_adata_dict={})
+    assert not (tmp_path / "running_parameters.pt").exists()
+
+
+def test_lora_pert_delimiter_override_on_legacy_checkpoint(pert_checkpoint, tmp_path):
+    pytest.importorskip("peft")
+    model = HFPerturbationTFModel.from_pretrained(str(pert_checkpoint["hf_dir"]))
+    assert model.training_config.get("pert_delimiter") is None
+    assert set(model.genotype_to_index) == {"WT", "A", "B", "C"}
+    adata, _ = make_multi_adata("set")
+    is_t1 = (adata.obs["celltype"] == "T1").to_numpy()
+    adapter_dir = tmp_path / "legacy_to_multi_adapter"
+    peft_model = model.run_lora_pert_train(
+        adata, np.where(~is_t1)[0], np.where(is_t1)[0], epochs=1, batch_size=32,
+        lora_config=model.build_lora_config(r=4, lora_alpha=8, lora_dropout=0.0),
+        save_dir=str(adapter_dir), seed=0, device=DEVICE, pert_delimiter="+",
+    )
+    assert hasattr(peft_model, "get_base_model")
+    assert (adapter_dir / "lora_heads.json").exists()
+    assert json.loads((adapter_dir / "lora_heads.json").read_text())["pert_delimiter"] == "+"
+
+
+def test_lora_rejects_pert_delimiter_mismatch(multi_checkpoint):
+    pytest.importorskip("peft")
+    model = HFPerturbationTFModel.from_pretrained(str(multi_checkpoint["hf_dir"]))
+    adata = multi_checkpoint["adata"]
+    is_t1 = (adata.obs["celltype"] == "T1").to_numpy()
+    with pytest.raises(ValueError, match="pert_delimiter"):
+        model.run_lora_pert_train(adata, np.where(~is_t1)[0], np.where(is_t1)[0], epochs=1,
+                                  device=DEVICE, pert_delimiter="|")
+    with pytest.raises(ValueError, match="pert_delimiter"):
+        model.run_lora_cls_train(adata, "celltype", "classification", epochs=1,
+                                 device=DEVICE, pert_delimiter="|")
+
+
+@pytest.mark.parametrize("cce_mode", ["cell+geno", "cell_geno", "genotype"])
+def test_multi_cce_training(cce_mode, tmp_path):
+    overrides = dict(CCE=True, cce_mode=cce_mode)
+    if cce_mode == "cell+geno":
+        overrides["perturbation_input"] = True
+    adata, singles, best, config, data_gen = train_multi_model("set", tmp_path, **overrides)
+    assert config.CCE and config.cce_mode == cce_mode
+    adata_eva = eval_testdata(best, data_gen["adata_sorted"], data_gen["gene_ids"],
+                              train_data_dict=data_gen, config=config, device=DEVICE)
+    probs = adata_eva.obsm["X_pert_pred_probs"]
+    assert probs.shape == (adata_eva.n_obs, data_gen["n_perturb"]) and np.isfinite(probs).all()
