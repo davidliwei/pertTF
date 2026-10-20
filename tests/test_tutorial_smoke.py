@@ -427,7 +427,35 @@ def test_multi_pert_training_tutorial(regime, tmp_path):
     assert probs.min() >= 0.0 and probs.max() <= 1.0  # sigmoid, not softmax, in multi mode
     for label in adata_eva.obs["predicted_genotype"]:
         assert set(label.split("+")) <= set(data_gen["genotype_to_index"])
+        assert label == "WT" or "WT" not in label.split("+")  # control dropped inside combinations
     assert "genotype_id" not in adata_eva.obs
+
+
+def test_multi_pert_prediction_cap_is_model_side(multi_checkpoint):
+    # A control-only query whose labels are all one set: the cap on predicted set size must come
+    # from training (max_n_pert recorded in the config), not from the query's own labels. The
+    # 1-epoch toy model never puts two classes above 0.5 on WT cells, so threshold 0 makes every
+    # class pass and the predicted sets show the cap (top-3 classes, the control dropped).
+    data_gen = multi_checkpoint["data_gen"]
+    assert data_gen["max_n_pert"] == 3 and multi_checkpoint["config"].max_n_pert == 3
+    adata = multi_checkpoint["adata"]
+    query = adata[adata.obs["genotype"] == "WT"].copy()
+    query.obs["genotype_next"] = "A"  # the query's own labels alone would give a cap of 1
+    mapping = {k: data_gen[k] for k in ("genotype_to_index", "cell_type_to_index", "vocab")}
+    config = OmegaConf.create(multi_checkpoint["config"].as_dict())
+    config.pert_pred_threshold = 0.0
+
+    def predicted_sets(cfg):
+        res = eval_testdata(multi_checkpoint["model"], query, None, train_data_dict=mapping,
+                            config=cfg, device=DEVICE)
+        sets = [label.split("+") for label in res.obs["predicted_genotype"]]
+        assert all(set(s) <= set(data_gen["genotype_to_index"]) and "WT" not in s for s in sets)
+        return sets
+
+    sets = predicted_sets(config)  # cap from the saved training config: 3
+    assert all(2 <= len(s) <= 3 for s in sets)
+    config.max_perts_per_cell = 2  # an explicit config cap takes precedence
+    assert all(1 <= len(s) <= 2 for s in predicted_sets(config))
 
 
 def test_legacy_mode_warns_on_plus_labels():

@@ -15,6 +15,18 @@ from ..utils.pert_data_loader import PertBatchCollator, PertTFDataset, PertTFUni
 from ..utils.logger import create_logger
 from ..utils.split_check import check_train_valid_split
 
+
+def _record_config_value(config, key, value):
+    """Store ``key`` in a wandb, OmegaConf or plain-dict config so it is saved with the run."""
+    from omegaconf import OmegaConf, open_dict
+    if OmegaConf.is_config(config):
+        with open_dict(config):
+            config[key] = value
+    elif isinstance(config, dict):
+        config[key] = value
+    else:  # wandb config
+        config.update({key: value}, allow_val_change=True)
+
 def produce_training_datasets(adata_input, config,
                               input_layer_key = "X_binned",
                               next_layer_key = "X_binned_next",
@@ -157,6 +169,10 @@ def produce_training_datasets(adata_input, config,
     data_info['train_indices'] = np.asarray(train_indices, dtype=np.int64)
     data_info['valid_indices'] = np.asarray(valid_indices, dtype=np.int64)
     data_info['split_check'] = split_check
+    # Largest perturbation set over the training AnnData; caps predicted sets at inference.
+    data_info['max_n_pert'] = int(t_data.max_n_pert)
+    if config.get('pert_delimiter', None) is not None:
+        _record_config_value(config, 'max_n_pert', data_info['max_n_pert'])
     if perturbation_validation:
         if v_data.pairs is None:
             raise RuntimeError("Fixed perturbation validation did not produce stored pairs")

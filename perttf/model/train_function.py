@@ -860,7 +860,10 @@ def eval_testdata(
         adata_t.obsm["X_pert_pred_probs"] = X_genotype_cls_probs
         adata_t.obsm["genotype_pred_probs"] = X_genotype_cls_probs
         threshold = _cfg(config, "pert_pred_threshold", 0.5)
-        top = np.argsort(-X_genotype_cls_probs, axis=1, kind="stable")[:, :dataset.max_n_pert]
+        # model-side cap on predicted set size; never derived from the labels of the data being predicted
+        cap = (_cfg(config, "max_perts_per_cell", None) or train_data_dict.get("max_n_pert")
+               or _cfg(config, "max_n_pert", None) or X_genotype_cls_probs.shape[1])
+        top = np.argsort(-X_genotype_cls_probs, axis=1, kind="stable")[:, :int(cap)]
         predicted = []
         for row_probs, row_top in zip(X_genotype_cls_probs, top):
             chosen = [i for i in row_top if row_probs[i] > threshold] or [row_top[0]]
