@@ -987,6 +987,16 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         if train_config and "pert_delimiter" in train_config:
             # A checkpoint trained with a delimiter keeps it: an explicit None or a different delimiter raises.
             settings["pert_delimiter"] = self._resolve_pert_delimiter(train_config["pert_delimiter"])
+        if train_config and ("perturbation_control_value" in train_config or "pairing_config" in train_config):
+            # The control label is baked into the checkpoint (its training config and, for a unified encoder,
+            # the zero row): continuing with a different one would split and pair labels under another control.
+            checkpoint_control = (resolve_control_value(self.training_config, default=None)
+                                  or getattr(self.pert_encoder, "control_label", None))
+            requested_control = resolve_control_value(settings, default=None)
+            if checkpoint_control is not None and requested_control is not None and requested_control != checkpoint_control:
+                raise ValueError(
+                    f"control label {requested_control!r} contradicts the checkpoint's control {checkpoint_control!r}; "
+                    "continue training with the checkpoint's control, or build a new model with from_adata")
         # Avoid duplicate kwarg collision in PertBatchCollator(vocab=..., **config).
         settings.pop("vocab", None)
         if pretrain:

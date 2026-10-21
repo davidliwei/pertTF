@@ -811,3 +811,15 @@ def test_from_adata_explicit_control_label_is_the_training_control():
         HFPerturbationTFModel.from_adata(adata, {**hp, "control_label": "ctrl", "perturbation_control_value": "WT"})
     with pytest.raises(ValueError, match="control_label"):
         HFPerturbationTFModel.from_adata(adata, {**hp, "control_label": "ctrl", "pairing_config": {"control_value": "WT"}})
+
+
+def test_run_train_rejects_control_change_on_checkpoint(multi_checkpoint):
+    """Continuing a checkpoint cannot switch its control label through train_config (Codex review on PR 71)."""
+    model = HFPerturbationTFModel.from_pretrained(str(multi_checkpoint["hf_dir"]))
+    assert model.training_config.perturbation_control_value == "WT"
+    adata = multi_checkpoint["adata"]
+    train_idx, valid_idx = split_by_control(adata)
+    for bad in ({"perturbation_control_value": "ctrl"}, {"pairing_config": {"control_value": "ctrl"}}):
+        with pytest.raises(ValueError, match="contradicts the checkpoint's control"):
+            model.run_train(adata, train_config={**bad, "epochs": 1},
+                            train_indices=train_idx, valid_indices=valid_idx, device=DEVICE)
