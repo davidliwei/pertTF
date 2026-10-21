@@ -270,11 +270,13 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
 
     def _resolve_pert_delimiter(self, pert_delimiter):
         """The "__from_config__" sentinel reads the training config; an explicit value is accepted when
-        the checkpoint has none, and a non-None value contradicting a non-None checkpoint value raises."""
+        the checkpoint has none, and any explicit value (None included) that differs from a non-None
+        checkpoint value raises: a multi-perturbation checkpoint cannot be used, fine-tuned or saved under
+        legacy single-label semantics by passing pert_delimiter=None."""
         config_delimiter = (self.training_config or {}).get("pert_delimiter")
         if pert_delimiter == "__from_config__":
             return config_delimiter
-        if pert_delimiter is not None and config_delimiter is not None and pert_delimiter != config_delimiter:
+        if config_delimiter is not None and pert_delimiter != config_delimiter:
             raise ValueError(
                 f"pert_delimiter={pert_delimiter!r} contradicts the training config pert_delimiter={config_delimiter!r}"
             )

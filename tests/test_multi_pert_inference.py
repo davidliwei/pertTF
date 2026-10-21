@@ -38,3 +38,11 @@ def test_set_inference_runs_and_records_delimiter():
     r = m.predict_perturbations(adata(["A+B", "B", "WT"]), prediction_mode="mean", device="cpu")
     assert r.shape == (3, len(GENES)) and r.uns["perttf_prediction"]["pert_delimiter"] == "+"
     assert r.obs["genotype_next"].tolist() == ["A+B", "B", "WT"]
+
+
+def test_explicit_none_delimiter_rejected_for_multi_checkpoint():
+    # A checkpoint trained with a delimiter cannot be driven under legacy single-label semantics
+    # by passing pert_delimiter=None (Codex review on PR 71).
+    m = model({"WT": 0, "A": 1}, pert_delimiter="+")
+    with pytest.raises(ValueError, match="contradicts"):
+        m.predict_perturbations(adata(["A"]), pert_delimiter=None, device="cpu")
