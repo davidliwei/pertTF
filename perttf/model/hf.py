@@ -11,7 +11,8 @@ from omegaconf import OmegaConf
 # Ensure these are importable
 from .pertTF import PerturbationTFModel
 from ..utils.custom_tokenizer import SimpleVocab 
-from ..utils.pert_labels import labels_in_mapping, split_perturbation_label, validate_perturbation_labels
+from ..utils.pert_labels import (labels_in_mapping, resolve_control_value, split_perturbation_label,
+                                 unique_perturbations, validate_perturbation_labels)
 
 
 def legacy_vocab_loading(vocab_path):
@@ -332,7 +333,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             raise RuntimeError("Loaded model does not contain cell_type_to_index")
 
         pert_delimiter = self._resolve_pert_delimiter(pert_delimiter)
-        control_value = (self.training_config or {}).get("perturbation_control_value", "WT")
+        control_value = resolve_control_value(self.training_config)
         observed_labels = pd.concat([adata.obs["genotype"], adata.obs[perturbation_col]]).dropna().astype(str).unique()
         validate_perturbation_labels(observed_labels, pert_delimiter, control_value,
                                      existing_mapping=self.genotype_to_index)
@@ -924,7 +925,14 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         special_tokens = config.get("special_tokens", ["<pad>", "<cls>", "<eoc>"])
         vocab = SimpleVocab(adata.var.index.tolist(), special_tokens)
         vocab.set_default_index(vocab["<pad>"])
-        genotype_to_index = {g: i for i, g in enumerate(adata.obs["genotype"].unique())}
+        # With pert_delimiter the dictionary holds single perturbations (as PertTFUniDataManager builds it),
+        # so a label such as "A+B" contributes A and B; without it labels are opaque as before.
+        pert_delimiter = config.get("pert_delimiter", None)
+        if pert_delimiter is None:
+            genotype_to_index = {g: i for i, g in enumerate(adata.obs["genotype"].unique())}
+        else:
+            singles = unique_perturbations(adata.obs["genotype"].astype(str), pert_delimiter, resolve_control_value(config))
+            genotype_to_index = {g: i for i, g in enumerate(singles)}
         cell_type_to_index = {c: i for i, c in enumerate(adata.obs["celltype"].unique())}
         return cls(vocab=vocab, genotype_to_index=genotype_to_index, cell_type_to_index=cell_type_to_index, **config)
 
@@ -983,7 +991,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             require_known.append("celltype")
         if config.genotype_classifier or config.next_cell_pred_type != "identity":
             require_known.append("genotype")
-        cell_type_to_index, genotype_to_index = lora.label_mappings(self, adata, require_known=require_known)
+        cell_type_to_index, genotype_to_index = lora.label_mappings(
+            self, adata, require_known=require_known, delimiter=config.get("pert_delimiter"),
+            control=resolve_control_value(config))
         ps_columns = [c for c in (getattr(self, "ps_names", None) or []) if c in adata.obs.columns] or None
         data_gen = produce_training_datasets(
             adata_input=adata,
@@ -1108,7 +1118,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         # The genotype and celltype mappings only feed the data loader here (their heads are not trained).
         cell_type_to_index, genotype_to_index = lora.label_mappings(
             self, adata, require_known=[], delimiter=config.get("pert_delimiter"),
-            control=config.get("perturbation_control_value", "WT"))
+            control=resolve_control_value(config))
 
         if cls_task == "classification":
             cls_to_index = {str(x): i for i, x in enumerate(sorted(adata.obs[cls_col].astype(str).unique()))}
@@ -1249,7 +1259,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         pert_delimiter = self._resolve_pert_delimiter(pert_delimiter)
         config, ps_columns = lora.prepare_config(self, adata, input_layer_key, batch_size, lr, amp, log_interval, seed)
         config.pert_delimiter = pert_delimiter
-        control_value = config.get("perturbation_control_value", "WT")
+        control_value = resolve_control_value(config)
         config.next_cell_pred_type = "pert"
         lora_config = copy.deepcopy(lora_config) if lora_config is not None else self.build_lora_config()
 
@@ -1334,8 +1344,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         real_groups = group_moments_from_anndata(
             data_gen["adata_manager"].adata, reference_indices, layer=input_layer_key, input_scale="log1p", target_sum=target_sum,
             perturbation_unit=config.get("perturbation_unit", "set"), pert_delimiter=config.get("pert_delimiter", None),
-            control_value=(config.get("pairing_config", {}) or {}).get(
-                "control_value", config.get("perturbation_control_value", "WT")),
+            control_value=control_value,
         ).finalize()
         metric_name = checkpoint_metric if checkpoint_metric == "mvc_next" else f"{checkpoint_metric}_sample"
 
@@ -1364,7 +1373,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
                 device=device,
             )
             aggregate = compute_perturbation_metrics(
-                real_groups, evaluation["predicted_groups"], control_value="WT"
+                real_groups, evaluation["predicted_groups"], control_value=control_value
             )["aggregate"]
             validation_metrics = {"mvc_next": evaluation["losses"]["mvc_next"]}
             validation_metrics.update({f"{name}_sample": value for name, value in aggregate.items()})

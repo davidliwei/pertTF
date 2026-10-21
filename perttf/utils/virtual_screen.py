@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 
 from perttf.model.pert_emb import generate_pert_embeddings, calculate_avg_cosine_similarity
 from perttf.model.train_function import eval_testdata
-from perttf.utils.pert_labels import labels_in_mapping
+from perttf.utils.pert_labels import labels_in_mapping, resolve_control_value
 
 
 def _first_set(key, *sources, default=None):
@@ -44,7 +44,7 @@ def virtual_screen_src2dest(adata_src,
   # wrapper_train stores the run's config (with pert_delimiter) inside running_parameters['config'].
   sources = (running_parameters, running_parameters.get('config'), config, getattr(model, 'training_config', None))
   delimiter = _first_set('pert_delimiter', *sources)
-  control = _first_set('perturbation_control_value', *sources, default='WT')
+  control = next((c for c in (resolve_control_value(s, default=None) for s in sources) if c is not None), 'WT')
   # eval_testdata parses labels with config's delimiter; a different one would silently drop rows.
   config_delimiter = config.get('pert_delimiter') if config is not None else None
   if config_delimiter != delimiter:

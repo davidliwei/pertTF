@@ -14,7 +14,25 @@ PAD = -1
 
 def _is_missing(label) -> bool:
     """True for None, pd.NA or a float NaN (pandas missing values)."""
-    return label is None or label is pd.NA or (isinstance(label, float) and np.isnan(label))
+    return label is None or label is pd.NA or (isinstance(label, (float, np.floating)) and np.isnan(label))
+
+
+def resolve_control_value(config, default: Optional[str] = "WT") -> Optional[str]:
+    """The control label a config designates, in the order the pairing logic uses it:
+    ``pairing_config.control_value`` first, then ``perturbation_control_value``, then ``default``.
+
+    Every site that splits or canonicalises labels must use this so that a control configured
+    only through ``pairing_config`` is also dropped from combinations such as ``"ctrl+A"``.
+    Works with dicts, OmegaConf and wandb configs (anything with ``.get``); ``None`` gives ``default``.
+    """
+    if config is None or not hasattr(config, "get"):
+        return default
+    pairing = config.get("pairing_config", None) or {}
+    pairing_control = pairing.get("control_value", None) if hasattr(pairing, "get") else None
+    if pairing_control is not None:
+        return pairing_control
+    value = config.get("perturbation_control_value", None)
+    return default if value is None else value
 
 
 def _raise_if_missing(labels, where: str) -> None:

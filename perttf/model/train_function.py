@@ -42,7 +42,7 @@ from ..utils.misc import get_config_value as _cfg
 from ..utils.misc import init_plot_worker
 from ..utils.misc import to_numpy as _to_numpy
 from ..utils.pert_data_loader import PertBatchCollator, PertTFDataset
-from ..utils.pert_labels import canonical_label, canonicalize_perturbation_columns, labels_in_mapping
+from ..utils.pert_labels import canonical_label, canonicalize_perturbation_columns, labels_in_mapping, resolve_control_value
 from ..utils.pert_metrics import (
     GroupMoments,
     compute_perturbation_metrics,
@@ -755,7 +755,7 @@ def eval_testdata(
     adata_t = adata_t[:, shared_genes].copy()
     gene_ids = np.array(vocab(adata_t.var.index.tolist()), dtype=int)
     pert_delimiter = _cfg(config, "pert_delimiter", None)
-    control_value = _cfg(config, "perturbation_control_value", "WT")
+    control_value = resolve_control_value(config)
     canonicalize_perturbation_columns(adata_t, pert_delimiter, control_value)
     if "genotype_next" in adata_t.obs.keys():
         keep = labels_in_mapping(adata_t.obs["genotype_next"], genotype_to_index, pert_delimiter, control_value)
@@ -960,9 +960,7 @@ def wrapper_train(model, config, data_gen,
             target_sum=config.get('perturbation_metric_target_sum', 10000.0),
             perturbation_unit=config.get('perturbation_unit', 'set'),
             pert_delimiter=config.get('pert_delimiter', None),
-            control_value=(config.get('pairing_config', {}) or {}).get(
-                'control_value', config.get('perturbation_control_value', 'WT')
-            ),
+            control_value=resolve_control_value(config),
         ).finalize()
     executor = ProcessPoolExecutor(
         max_workers=4,
@@ -1023,9 +1021,7 @@ def wrapper_train(model, config, data_gen,
             metric_details = compute_perturbation_metrics(
                 perturbation_reference_groups,
                 perturbation_evaluation['predicted_groups'],
-                control_value=(config.get('pairing_config', {}) or {}).get(
-                    'control_value', config.get('perturbation_control_value', 'WT')
-                ),
+                control_value=resolve_control_value(config),
                 fdr_threshold=config.get('perturbation_metric_fdr', 0.05),
                 min_cells=config.get('perturbation_metric_min_cells', 30),
             )

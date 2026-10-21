@@ -1,5 +1,5 @@
 import numpy as np, pytest, anndata as ad, pandas as pd
-from perttf.utils.pert_labels import (split_perturbation_label, canonical_label, unique_perturbations,
+from perttf.utils.pert_labels import (resolve_control_value, split_perturbation_label, canonical_label, unique_perturbations,
     labels_in_mapping, labels_to_padded_array, max_set_size, validate_perturbation_labels,
     canonicalize_perturbation_columns)
 
@@ -76,3 +76,14 @@ def test_canonicalize_multi_rejects_missing_labels():
     a = ad.AnnData(X=np.zeros((3, 2), dtype=np.float32), obs=obs)
     with pytest.raises(ValueError, match="'genotype'.*1 missing"):
         canonicalize_perturbation_columns(a, "+")
+
+
+def test_resolve_control_value_prefers_pairing_config():
+    assert resolve_control_value({"pairing_config": {"control_value": "ctrl"}, "perturbation_control_value": "WT"}) == "ctrl"
+    assert resolve_control_value({"perturbation_control_value": "NT"}) == "NT"
+    assert resolve_control_value({"pairing_config": {}}) == "WT"
+    assert resolve_control_value({}) == "WT"
+    assert resolve_control_value(None) == "WT"
+    assert resolve_control_value({}, default=None) is None
+    # the control named only through pairing_config is dropped from combinations
+    assert canonical_label("ctrl+A", "+", resolve_control_value({"pairing_config": {"control_value": "ctrl"}})) == "A"

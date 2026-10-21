@@ -14,6 +14,7 @@ from .custom_tokenizer import tokenize_and_pad_batch, random_mask_value, SimpleV
 from .misc import _get_sf
 from .pert_pairing import ContextAwarePairing
 from .pert_labels import (
+    resolve_control_value,
     canonicalize_perturbation_columns,
     labels_to_padded_array,
     max_set_size,
@@ -535,7 +536,7 @@ class PertTFUniDataManager:
         self.next_cell_pred_type = config.get('next_cell_pred_type', next_cell_pred_type)
         self.pert_delimiter = config.get('pert_delimiter', None)
         self.max_perts_per_cell = config.get('max_perts_per_cell', None)
-        self.control_value = config.get('perturbation_control_value', 'WT')
+        self.control_value = resolve_control_value(config)
         canonicalize_perturbation_columns(self.adata, self.pert_delimiter, self.control_value)
         # --- Perform one-time data setup ---
         print("Initializing PertTFUniDataManager: Creating vocab and mappings...")

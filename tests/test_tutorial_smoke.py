@@ -626,3 +626,23 @@ def test_multi_cce_training(cce_mode, tmp_path):
                               train_data_dict=data_gen, config=config, device=DEVICE)
     probs = adata_eva.obsm["X_pert_pred_probs"]
     assert probs.shape == (adata_eva.n_obs, data_gen["n_perturb"]) and np.isfinite(probs).all()
+
+
+def test_from_adata_run_train_multi(tmp_path):
+    """The public from_adata(...).run_train(...) path with set labels: the dictionary is built from single
+    perturbations and the run records the delimiter (Codex review finding on PR 71)."""
+    adata, singles = make_multi_adata("set")
+    hp = multi_hyperparameters("set")
+    model = HFPerturbationTFModel.from_adata(adata, hp)
+    assert set(model.genotype_to_index) == set(singles) | {"WT"}
+    train_idx, valid_idx = split_by_control(adata)
+    model.run_train(adata, train_config=hp, train_indices=train_idx, valid_indices=valid_idx,
+                    save_dir=str(tmp_path / "run_train"), device=DEVICE)
+    assert model.training_config.pert_delimiter == "+"
+    assert model.training_config.max_n_pert == 3
+    reloaded = HFPerturbationTFModel.from_pretrained(str(tmp_path / "run_train"))
+    assert set(reloaded.genotype_to_index) == set(singles) | {"WT"}
+    query = adata[adata.obs["genotype"] == "WT"].copy()
+    query.obs["genotype_next"] = "A+C"
+    result = reloaded.predict_perturbations(query, prediction_mode="mean", device=DEVICE)
+    assert result.obsm["mvc_next_expr"].shape == query.shape
