@@ -234,7 +234,9 @@ class PertTFDataset(Dataset):
         groups = [np.asarray(g, dtype=np.int64) for g in index_groups if g is not None]
         rows = np.unique(np.concatenate(groups)) if groups else np.arange(self.adata.n_obs)
         width = max_set_size(self.genotype_values[rows], self.pert_delimiter, self.control_value)
-        if self.genotype_next_values is not None:
+        # genotype_next is a sample target only for prediction-only datasets; training targets come from the
+        # pairing (another row's genotype), so a pre-populated genotype_next must not widen the training cap.
+        if self.prediction_only and self.genotype_next_values is not None:
             width = max(width, max_set_size(self.genotype_next_values[rows], self.pert_delimiter, self.control_value))
         return width
 

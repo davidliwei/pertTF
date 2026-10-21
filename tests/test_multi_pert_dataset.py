@@ -95,3 +95,16 @@ def test_max_n_pert_counts_only_rows_the_dataset_can_draw():
     assert valid[0]["perturbation_labels"].tolist() == [1, 2, 3]
     everything = PertTFDataset(a, next_cell_pred="identity", pert_delimiter="+")
     assert everything.max_n_pert == 3
+
+
+def test_training_cap_ignores_prepopulated_genotype_next():
+    # Training targets come from the pairing, not from genotype_next, so a pre-populated genotype_next
+    # column must not widen the training dataset's recorded cap (Codex review on PR 71).
+    a = tiny(["WT", "WT", "A", "B"])
+    a.obs["genotype_next"] = "A+B+C"
+    train = PertTFDataset(a, next_cell_pred="pert", pert_delimiter="+")
+    assert train.max_n_pert == 1
+    predict = PertTFDataset(a, next_cell_pred="pert", pert_delimiter="+", prediction_only=True,
+                            genotype_to_index={"WT": 0, "A": 1, "B": 2, "C": 3})
+    assert predict.max_n_pert == 3
+    assert predict[0]["perturbation_labels_next"].tolist() == [1, 2, 3]
