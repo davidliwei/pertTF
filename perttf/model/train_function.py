@@ -167,7 +167,10 @@ def train(model: nn.Module,
                 pert_mask = None
                 if perturbation_labels.dim() == 2 and cce_mode in ('cell_geno', 'genotype', 'cell+geno'):
                     pert_cat = _cce_labels(output_dict["contrastive_dict"], perturbation_labels, perturbation_labels_next)
-                    pert_mask = perturbation_overlap_mask(pert_cat, pert_cat, model.n_pert)
+                    # The overlap mask only needs every index to fit: after LoRA pert_mode='new' the active
+                    # mapping can be wider than the base checkpoint's n_pert.
+                    n_classes = max(int(model.n_pert), int(pert_cat.max().item()) + 1)
+                    pert_mask = perturbation_overlap_mask(pert_cat, pert_cat, n_classes)
                 if cce_mode == 'cell_geno': ## supervised contrastive loss plus a custom contrastive loss
                     cce_weight = max(config.perturbation_classifier_weight*config.cell_type_classifier_weight, 1)
                     if pert_mask is None:

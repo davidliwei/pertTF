@@ -936,6 +936,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             singles = unique_perturbations(adata.obs["genotype"].astype(str), pert_delimiter, resolve_control_value(config))
             genotype_to_index = {g: i for i, g in enumerate(singles)}
         cell_type_to_index = {c: i for i, c in enumerate(adata.obs["celltype"].unique())}
+        # The unified encoder fixes the control row to zero: name it after the configured control, which may
+        # not be "WT" (pairing_config.control_value / perturbation_control_value).
+        config = {"control_label": resolve_control_value(config), **config}
         return cls(vocab=vocab, genotype_to_index=genotype_to_index, cell_type_to_index=cell_type_to_index, **config)
 
     def run_train(
@@ -973,6 +976,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
 
         settings = OmegaConf.to_container(self._init_default_train_config_(), resolve=True)
         settings.update(train_config or {})
+        if train_config and "pert_delimiter" in train_config:
+            # A checkpoint trained with a delimiter keeps it: an explicit None or a different delimiter raises.
+            settings["pert_delimiter"] = self._resolve_pert_delimiter(train_config["pert_delimiter"])
         # Avoid duplicate kwarg collision in PertBatchCollator(vocab=..., **config).
         settings.pop("vocab", None)
         if pretrain:

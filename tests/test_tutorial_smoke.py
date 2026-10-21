@@ -748,3 +748,50 @@ def test_virtual_screen_defaults_destination_label_to_resolved_control(adata, pe
             screen_genes=["A"], device=DEVICE, n_expands_per_epoch=1, n_epoch=1, wt_pred_next_label="A",
         )
     assert captured["label"] == "A"  # an explicit destination label still wins
+
+
+def test_from_adata_with_sources_uses_configured_control():
+    """from_adata with feature sources and a non-WT control builds the unified encoder around that control
+    (Codex review on PR 71)."""
+    adata, singles = make_multi_adata("set")
+    adata.obs["genotype"] = adata.obs["genotype"].replace("WT", "ctrl")
+    rng = np.random.default_rng(0)
+    hp = multi_hyperparameters("set")
+    hp.update(perturbation_control_value="ctrl",
+              pert_sources={"feat": (singles, rng.normal(size=(len(singles), 4)).astype(np.float32))})
+    model = HFPerturbationTFModel.from_adata(adata, hp)
+    assert set(model.genotype_to_index) == set(singles) | {"ctrl"}
+    assert model.pert_encoder.control_label == "ctrl"
+
+
+def test_run_train_rejects_delimiter_change_on_multi_checkpoint(multi_checkpoint):
+    """Continuing a multi-perturbation checkpoint cannot switch it to legacy semantics through train_config
+    (Codex review on PR 71)."""
+    model = HFPerturbationTFModel.from_pretrained(str(multi_checkpoint["hf_dir"]))
+    adata = multi_checkpoint["adata"]
+    train_idx, valid_idx = split_by_control(adata)
+    for bad in (None, "|"):
+        with pytest.raises(ValueError, match="contradicts"):
+            model.run_train(adata, train_config={"pert_delimiter": bad, "epochs": 1},
+                            train_indices=train_idx, valid_indices=valid_idx, device=DEVICE)
+
+
+def test_lora_new_mode_cce_with_wider_mapping(pert_checkpoint, tmp_path):
+    """pert_mode="new" on a CCE checkpoint with a perturbation dictionary wider than the base n_pert: the
+    overlap mask is sized from the labels present, so the first batch no longer indexes out of bounds
+    (Codex review on PR 71)."""
+    pytest.importorskip("peft")
+    model = HFPerturbationTFModel.from_pretrained(str(pert_checkpoint["hf_dir"]))
+    assert model.n_pert == 4
+    model.training_config = OmegaConf.merge(model.training_config, {"CCE": True, "cce_mode": "cell+geno"})
+    adata, singles = make_multi_adata("single")  # 8 single perturbations + WT > base n_pert
+    assert len(singles) + 1 > model.n_pert
+    train_idx, valid_idx = split_by_control(adata)
+    peft_model = model.run_lora_pert_train(
+        adata, train_idx, valid_idx, epochs=1, batch_size=32,
+        lora_config=model.build_lora_config(r=4, lora_alpha=8, lora_dropout=0.0),
+        save_dir=str(tmp_path / "wide_cce_adapter"), seed=0, device=DEVICE,
+        pert_delimiter="+", pert_mode="new", distribution=None,
+        checkpoint_metric="mvc_next",  # random sets rarely reach 30 cells per group for pearson_delta
+    )
+    assert set(peft_model.get_base_model().genotype_to_index) == set(singles) | {"WT"}
