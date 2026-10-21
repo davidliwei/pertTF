@@ -712,3 +712,39 @@ def test_lora_new_mode_uses_configured_control(pert_checkpoint, tmp_path):
     result = loaded.predict_perturbations(query, prediction_mode="mean", device=DEVICE)
     assert result.obsm["mvc_next_expr"].shape == query.shape
     assert set(result.obs["genotype_next"]) == {"A"}
+
+
+def test_virtual_screen_defaults_destination_label_to_resolved_control(adata, pert_checkpoint, monkeypatch):
+    """With a non-WT control the destination cells must be evaluated under that control, not 'WT'
+    (Codex review on PR 71). The embedding step is intercepted to capture the label it receives."""
+    from perttf.utils import virtual_screen
+
+    captured = {}
+
+    def intercept(*args, **kwargs):
+        captured["label"] = kwargs["wt_pred_next_label"]
+        raise RuntimeError("intercepted")
+
+    monkeypatch.setattr(virtual_screen, "generate_pert_embeddings", intercept)
+    running_parameters = dict(torch.load(pert_checkpoint["save_dir"] / "running_parameters.pt", weights_only=False))
+    running_parameters["config"] = {**running_parameters["config"], "perturbation_control_value": "ctrl"}
+    running_parameters["genotype_to_index"] = {"ctrl": 0, "A": 1, "B": 2}
+    vocab = torch.load(pert_checkpoint["save_dir"] / "vocab.pt", weights_only=False)
+    config = OmegaConf.create(pert_checkpoint["config"].as_dict())
+    config.perturbation_control_value = "ctrl"
+    is_t1 = adata.obs["celltype"] == "T1"
+    adata_src = adata[is_t1 & (adata.obs["genotype"] == "WT")].copy()
+    adata_des = adata[is_t1 & (adata.obs["genotype"] == "A")].copy()
+    with pytest.raises(RuntimeError, match="intercepted"):
+        virtual_screen.virtual_screen_src2dest(
+            adata_src, adata_des, pert_checkpoint["model"], vocab, config, running_parameters,
+            screen_genes=["A", "B"], device=DEVICE, n_expands_per_epoch=1, n_epoch=1,
+        )
+    assert captured["label"] == "ctrl"
+    captured.clear()
+    with pytest.raises(RuntimeError, match="intercepted"):
+        virtual_screen.virtual_screen_src2dest(
+            adata_src, adata_des, pert_checkpoint["model"], vocab, config, running_parameters,
+            screen_genes=["A"], device=DEVICE, n_expands_per_epoch=1, n_epoch=1, wt_pred_next_label="A",
+        )
+    assert captured["label"] == "A"  # an explicit destination label still wins

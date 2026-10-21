@@ -26,11 +26,13 @@ def virtual_screen_src2dest(adata_src,
                             device=None,
                             n_expands_per_epoch = 5,
                             n_epoch = 10,
-                            wt_pred_next_label = 'WT',
+                            wt_pred_next_label = None,
                             ):
   """
   A function to perform virtual screen from source to destination.
 
+  wt_pred_next_label: the genotype_next assigned to the destination cells; defaults to the run's
+  control label (pairing_config.control_value / perturbation_control_value, usually 'WT').
   """
 
   cell_type_to_index = running_parameters['cell_type_to_index']
@@ -46,6 +48,9 @@ def virtual_screen_src2dest(adata_src,
   sources = (running_parameters, running_parameters.get('config'), config, getattr(model, 'training_config', None))
   delimiter = _first_set('pert_delimiter', *sources)
   control = next((c for c in (resolve_control_value(s, default=None) for s in sources) if c is not None), 'WT')
+  if wt_pred_next_label is None:
+    # Destination rows are evaluated under the run's control, whatever label the run used for it.
+    wt_pred_next_label = control
   # eval_testdata parses labels with config's delimiter; a different one would silently drop rows.
   config_delimiter = config.get('pert_delimiter') if config is not None else None
   if config_delimiter != delimiter:
