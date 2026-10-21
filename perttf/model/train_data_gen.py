@@ -14,6 +14,19 @@ from ..utils.custom_tokenizer import tokenize_and_pad_batch, random_mask_value, 
 from ..utils.pert_data_loader import PertBatchCollator, PertTFDataset, PertTFUniDataManager, add_batch_info
 from ..utils.logger import create_logger
 from ..utils.split_check import check_train_valid_split
+from ..utils.pert_labels import canonicalize_perturbation_columns, resolve_control_value
+
+
+def _record_config_value(config, key, value):
+    """Store ``key`` in a wandb, OmegaConf or plain-dict config so it is saved with the run."""
+    from omegaconf import OmegaConf, open_dict
+    if OmegaConf.is_config(config):
+        with open_dict(config):
+            config[key] = value
+    elif isinstance(config, dict):
+        config[key] = value
+    else:  # wandb config
+        config.update({key: value}, allow_val_change=True)
 
 def produce_training_datasets(adata_input, config,
                               input_layer_key = "X_binned",
@@ -74,9 +87,16 @@ def produce_training_datasets(adata_input, config,
     elif stratify_by is not None:
         raise ValueError("stratify_by cannot be used with explicit train_indices and valid_indices")
 
-    control_value = (config.get('pairing_config', {}) or {}).get(
-        'control_value', config.get('perturbation_control_value', 'WT')
-    )
+    # One control label for canonicalisation, the split check and pairing: pairing_config.control_value
+    # takes precedence over perturbation_control_value (generate_config keeps them in sync, hand-built
+    # configs may not).
+    control_value = resolve_control_value(config)
+    if config.get('pert_delimiter', None) is not None:
+        # Canonicalise set labels ("B+A" -> "A+B") before the split check so it compares canonical
+        # groups; the data manager's own canonicalisation is then a no-op. Same control as the manager.
+        if adata_input.is_view:
+            adata_input = adata_input.copy()
+        canonicalize_perturbation_columns(adata_input, config.get('pert_delimiter'), control_value)
     split_check = check_train_valid_split(
         adata_input,
         train_indices,
@@ -85,6 +105,8 @@ def produce_training_datasets(adata_input, config,
         control_value=control_value,
         check_columns=split_check_columns,
         min_cells=config.get('perturbation_metric_min_cells', 30),
+        perturbation_unit=config.get('perturbation_unit', 'set'),
+        pert_delimiter=config.get('pert_delimiter', None),
     )
     split_summary = {
         'mode': effective_next_cell_pred,
@@ -155,6 +177,10 @@ def produce_training_datasets(adata_input, config,
     data_info['train_indices'] = np.asarray(train_indices, dtype=np.int64)
     data_info['valid_indices'] = np.asarray(valid_indices, dtype=np.int64)
     data_info['split_check'] = split_check
+    # Largest perturbation set over the training AnnData; caps predicted sets at inference.
+    data_info['max_n_pert'] = int(t_data.max_n_pert)
+    if config.get('pert_delimiter', None) is not None:
+        _record_config_value(config, 'max_n_pert', data_info['max_n_pert'])
     if perturbation_validation:
         if v_data.pairs is None:
             raise RuntimeError("Fixed perturbation validation did not produce stored pairs")

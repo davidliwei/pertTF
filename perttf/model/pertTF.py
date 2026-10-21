@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from .base_model import BaseModel
+from .pert_encoder import encode_perturbation_set, reduce_perturbation_embeddings
 
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from .expr_sampler import DistributionGenerator
@@ -34,6 +35,7 @@ class PerturbationTFModel(BaseModel):
         ps_decoder2_nlayer = kwargs.pop("ps_decoder2_nlayer",3) # additional parameter to specify ps_decoder2 nlayer
         self.pert_pad_id = kwargs.pop("pert_pad_id", None) # get the pert_pad_id
         self.pert_dim = kwargs.pop('pert_dim', None)
+        self.pert_aggregation = kwargs.pop('pert_aggregation', 'sum')
         # optional perturbation FEATURE matrix (n_pert, feat_dim). When provided, the
         # perturbation encoder maps each genotype index through its feature vector + an
         # MLP instead of an independent lookup row, so novel (unseen-in-training)
@@ -150,7 +152,7 @@ class PerturbationTFModel(BaseModel):
 
         # add additional perturbs
         if input_pert_flags is not None:
-            perts = self.pert_encoder(input_pert_flags)  # (batch, seq_len, embsize)
+            perts = encode_perturbation_set(self.pert_encoder, input_pert_flags, self.pert_aggregation)  # (batch, seq_len, embsize)
             #import pdb; pdb.set_trace()
             perts_expand = perts.unsqueeze(1).repeat(1, total_embs.shape[1], 1)
             total_embs = total_embs + perts_expand
@@ -247,7 +249,7 @@ class PerturbationTFModel(BaseModel):
             batch_emb = self.batch_encoder(batch_labels)  # (batch, embsize)
 
         if pert_labels is not None :
-            pert_emb = self.pert_encoder(pert_labels)
+            pert_emb = encode_perturbation_set(self.pert_encoder, pert_labels, self.pert_aggregation)
             # transformmer output concatenate ?
             # note only input pert_labels should be concatenated, not pert_label_next
             #import pdb; pdb.set_trace()
@@ -294,7 +296,12 @@ class PerturbationTFModel(BaseModel):
         #  concatenate cell embedding with perturbation embedding to generate next cell embedding
         if pert_labels_next is not None or pert_embeddings_next is not None:
             #import pdb; pdb.set_trace()
-            pert_emb_next = self.pert_encoder(pert_labels_next) if pert_embeddings_next is None else pert_embeddings_next
+            if pert_embeddings_next is None:
+                pert_emb_next = encode_perturbation_set(self.pert_encoder, pert_labels_next, self.pert_aggregation)
+            elif pert_embeddings_next.dim() == 3:
+                pert_emb_next = reduce_perturbation_embeddings(pert_embeddings_next, pert_labels_next, self.pert_aggregation)
+            else:
+                pert_emb_next = pert_embeddings_next
             expected_pert_dim = self.d_model if self.pert_dim is None else self.pert_dim
             if pert_emb_next.shape != (src.shape[0], expected_pert_dim):
                 raise ValueError("pert_embeddings_next must have shape (batch_size, pert_dim)")

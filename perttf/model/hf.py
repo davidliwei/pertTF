@@ -2,6 +2,7 @@ import os
 import json
 import hashlib
 import torch
+import pandas as pd
 from pathlib import Path
 from typing import Optional, Any, Union, Dict
 from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
@@ -10,6 +11,8 @@ from omegaconf import OmegaConf
 # Ensure these are importable
 from .pertTF import PerturbationTFModel
 from ..utils.custom_tokenizer import SimpleVocab 
+from ..utils.pert_labels import (labels_in_mapping, resolve_control_value, split_perturbation_label,
+                                 unique_perturbations, validate_perturbation_labels)
 
 
 def legacy_vocab_loading(vocab_path):
@@ -69,6 +72,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         ps_decoder2_nlayer: int = 3,
         pert_pad_id: Optional[int] = None,
         pert_dim: Optional[int] = None,
+        pert_aggregation: str = "sum",
         distribution: Optional[str] = None,
         pert_sources: Optional[Dict] = None,
         control_label: str = "WT",
@@ -174,6 +178,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             ps_decoder2_nlayer=ps_decoder2_nlayer,
             pert_pad_id=pert_pad_id,
             pert_dim=pert_dim,
+            pert_aggregation=pert_aggregation,
             pert_features=self.pert_features,
             # Note: We do NOT pass **kwargs here, so parent doesn't see extra params.
         )
@@ -263,6 +268,20 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         distribution = getattr(self, "distribution", None)
         return "log1p" if distribution in {None, "zig", "gaussian"} else "counts"
 
+    def _resolve_pert_delimiter(self, pert_delimiter):
+        """The "__from_config__" sentinel reads the training config; an explicit value is accepted when
+        the checkpoint has none, and any explicit value (None included) that differs from a non-None
+        checkpoint value raises: a multi-perturbation checkpoint cannot be used, fine-tuned or saved under
+        legacy single-label semantics by passing pert_delimiter=None."""
+        config_delimiter = (self.training_config or {}).get("pert_delimiter")
+        if pert_delimiter == "__from_config__":
+            return config_delimiter
+        if config_delimiter is not None and pert_delimiter != config_delimiter:
+            raise ValueError(
+                f"pert_delimiter={pert_delimiter!r} contradicts the training config pert_delimiter={config_delimiter!r}"
+            )
+        return pert_delimiter
+
     def predict_perturbations(
         self,
         adata,
@@ -276,6 +295,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         use_size_factor: bool = True,
         device: Optional[Union[str, torch.device]] = None,
         query_sources: Optional[Dict] = None,
+        pert_delimiter: Optional[str] = "__from_config__",
     ):
         """Predict row-level perturbations already assigned in an AnnData object.
 
@@ -288,6 +308,10 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         With a unified encoder, query_sources supplies temporary (genes, matrix)
         tuples for new target IDs through existing source projections. Registered
         IDs cannot be overridden, and no model vocabulary or weights are changed.
+        pert_delimiter splits labels such as "A+B" into perturbation sets; by default
+        it is read from the training config, and an explicit value that contradicts
+        a non-None training value raises. Every component must be a model label (or
+        a query_sources ID).
         """
         from .train_function import eval_testdata
 
@@ -310,6 +334,19 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         if not hasattr(self, "cell_type_to_index"):
             raise RuntimeError("Loaded model does not contain cell_type_to_index")
 
+        pert_delimiter = self._resolve_pert_delimiter(pert_delimiter)
+        control_value = resolve_control_value(self.training_config)
+        observed_labels = pd.concat([adata.obs["genotype"], adata.obs[perturbation_col]]).dropna().astype(str).unique()
+        validate_perturbation_labels(observed_labels, pert_delimiter, control_value,
+                                     existing_mapping=self.genotype_to_index)
+
+        def unknown_components(labels, known):
+            labels = list(dict.fromkeys(labels))
+            inside = labels_in_mapping(labels, known, pert_delimiter, control_value)
+            return sorted({c for label, ok in zip(labels, inside) if not ok
+                           for c in split_perturbation_label(label, pert_delimiter, control_value)
+                           if c not in known})
+
         for column, mapping in (
             ("celltype", self.cell_type_to_index),
             ("genotype", self.genotype_to_index),
@@ -317,7 +354,10 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             values = adata.obs[column]
             if values.isna().any():
                 raise ValueError(f"AnnData obs[{column!r}] contains missing values")
-            missing_labels = sorted(set(values).difference(mapping))
+            if column == "genotype":
+                missing_labels = unknown_components(values, mapping)
+            else:
+                missing_labels = sorted(set(values).difference(mapping))
             if missing_labels:
                 raise ValueError(
                     f"AnnData obs[{column!r}] contains labels absent from the model mapping: "
@@ -341,7 +381,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
                 raise ValueError("query_sources requires the unified perturbation encoder")
             # Detailed table validation and collision checks run in encode_queries.
             query_ids = {gene for genes, _ in query_sources.values() for gene in genes}
-        missing_perturbations = sorted(set(perturbations).difference(registered).difference(query_ids))
+        missing_perturbations = unknown_components(perturbations, set(registered).union(query_ids))
         if missing_perturbations:
             raise ValueError(
                 "Inference perturbations are absent from genotype_to_index: "
@@ -352,6 +392,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         if "vocab" in config:
             del config["vocab"]
         config.next_cell_pred_type = "pert"
+        config.pert_delimiter = pert_delimiter
         config.use_batch_label = bool(self.use_batch_labels or self.domain_spec_batchnorm)
         if gene_sampling_mode is not None:
             if gene_sampling_mode not in {"simple", "expressed", "hvg"}:
@@ -391,8 +432,13 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         if query_sources is not None:
             # Registered targets use the dataset/model mapping directly. Only
             # temporary query IDs need an evaluation-local extension and vectors.
+            # One row per perturbation component; eval_testdata gathers and aggregates sets.
+            requested = list(dict.fromkeys(
+                c for label in dict.fromkeys(perturbations)
+                for c in split_perturbation_label(label, pert_delimiter, control_value)
+            ))
             inference_mapping = dict(self.genotype_to_index)
-            for gene in perturbations:
+            for gene in requested:
                 if gene not in inference_mapping:
                     inference_mapping[gene] = len(inference_mapping)
             with torch.no_grad():
@@ -400,7 +446,6 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
                 query_vectors = dict(zip(names, vectors))
                 perturbation_embeddings = next(self.parameters()).new_zeros(
                     len(inference_mapping), self.pert_encoder.embedding_dim)
-                requested = list(dict.fromkeys(perturbations))
                 known = [gene for gene in requested if gene in registered]
                 if known:
                     indices = torch.tensor([registered[g] for g in known], device=device)
@@ -446,6 +491,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             "prediction_seed": prediction_seed,
             "gene_sampling_mode": str(config.sampling_mode),
             "max_seq_len": int(config.max_seq_len),
+            "pert_delimiter": pert_delimiter,
         }
         if unified:
             result.uns["perttf_prediction"]["perturbation_sources"] = list(self.pert_encoder.sources)
@@ -858,6 +904,12 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             "distribution": None,
             "use_ot": False,
             "dataset_name": "adata",
+            "pert_delimiter": None,
+            "pert_aggregation": getattr(self, "pert_aggregation", "sum"),
+            "perturbation_unit": "set",
+            "pert_pred_threshold": 0.5,
+            "pert_bce_pos_weight": None,
+            "max_perts_per_cell": None,
         }
 
         base_config = self.training_config if self.training_config is not None else OmegaConf.create({})
@@ -875,7 +927,25 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         special_tokens = config.get("special_tokens", ["<pad>", "<cls>", "<eoc>"])
         vocab = SimpleVocab(adata.var.index.tolist(), special_tokens)
         vocab.set_default_index(vocab["<pad>"])
-        genotype_to_index = {g: i for i, g in enumerate(adata.obs["genotype"].unique())}
+        # One control label for everything: the unified encoder's zero row (control_label), label parsing and
+        # the training config (perturbation_control_value / pairing_config.control_value). An explicit
+        # control_label is propagated into the training config; conflicting values raise.
+        explicit_control = config.get("control_label", None)
+        configured_control = resolve_control_value(config, default=None)
+        if explicit_control is not None and configured_control is not None and explicit_control != configured_control:
+            raise ValueError(
+                f"control_label={explicit_control!r} conflicts with the configured control "
+                f"{configured_control!r} (perturbation_control_value / pairing_config.control_value)")
+        control = explicit_control or configured_control or "WT"
+        config = {**config, "control_label": control, "perturbation_control_value": control}
+        # With pert_delimiter the dictionary holds single perturbations (as PertTFUniDataManager builds it),
+        # so a label such as "A+B" contributes A and B; without it labels are opaque as before.
+        pert_delimiter = config.get("pert_delimiter", None)
+        if pert_delimiter is None:
+            genotype_to_index = {g: i for i, g in enumerate(adata.obs["genotype"].unique())}
+        else:
+            singles = unique_perturbations(adata.obs["genotype"].astype(str), pert_delimiter, control)
+            genotype_to_index = {g: i for i, g in enumerate(singles)}
         cell_type_to_index = {c: i for i, c in enumerate(adata.obs["celltype"].unique())}
         return cls(vocab=vocab, genotype_to_index=genotype_to_index, cell_type_to_index=cell_type_to_index, **config)
 
@@ -914,6 +984,19 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
 
         settings = OmegaConf.to_container(self._init_default_train_config_(), resolve=True)
         settings.update(train_config or {})
+        if train_config and "pert_delimiter" in train_config:
+            # A checkpoint trained with a delimiter keeps it: an explicit None or a different delimiter raises.
+            settings["pert_delimiter"] = self._resolve_pert_delimiter(train_config["pert_delimiter"])
+        if train_config and ("perturbation_control_value" in train_config or "pairing_config" in train_config):
+            # The control label is baked into the checkpoint (its training config and, for a unified encoder,
+            # the zero row): continuing with a different one would split and pair labels under another control.
+            checkpoint_control = (resolve_control_value(self.training_config, default=None)
+                                  or getattr(self.pert_encoder, "control_label", None))
+            requested_control = resolve_control_value(settings, default=None)
+            if checkpoint_control is not None and requested_control is not None and requested_control != checkpoint_control:
+                raise ValueError(
+                    f"control label {requested_control!r} contradicts the checkpoint's control {checkpoint_control!r}; "
+                    "continue training with the checkpoint's control, or build a new model with from_adata")
         # Avoid duplicate kwarg collision in PertBatchCollator(vocab=..., **config).
         settings.pop("vocab", None)
         if pretrain:
@@ -934,7 +1017,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             require_known.append("celltype")
         if config.genotype_classifier or config.next_cell_pred_type != "identity":
             require_known.append("genotype")
-        cell_type_to_index, genotype_to_index = lora.label_mappings(self, adata, require_known=require_known)
+        cell_type_to_index, genotype_to_index = lora.label_mappings(
+            self, adata, require_known=require_known, delimiter=config.get("pert_delimiter"),
+            control=resolve_control_value(config))
         ps_columns = [c for c in (getattr(self, "ps_names", None) or []) if c in adata.obs.columns] or None
         data_gen = produce_training_datasets(
             adata_input=adata,
@@ -1011,6 +1096,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         stratify_by=None,
         split_check_columns=None,
         this_weight: float = 1.0,
+        pert_delimiter: Optional[str] = "__from_config__",
     ):
         """
         LoRA fine-tuning with a new head that predicts a cell-level target from the cell embedding.
@@ -1026,6 +1112,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         The split is random (train_val_split, optionally stratify_by) unless train_indices/valid_indices
         are given. For classification, cls_col is checked so every validation class is also in training;
         split_check_columns adds further columns to check. Checkpoints are selected on the validation loss of the head.
+        pert_delimiter: separator of multi-perturbation labels such as "A+B"; resolved as in predict_perturbations
+            (default: the training config value; an explicit value contradicting a non-None checkpoint value raises).
         """
         import copy
         import numpy as np
@@ -1037,7 +1125,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             raise ValueError(f"cls_task must be 'classification' or 'regression'; got {cls_task!r}")
         lora.check_no_adapter(self)
 
+        pert_delimiter = self._resolve_pert_delimiter(pert_delimiter)
         config, ps_columns = lora.prepare_config(self, adata, input_layer_key, batch_size, lr, amp, None, seed)
+        config.pert_delimiter = pert_delimiter
         # Always the identity objective, whatever the checkpoint was trained for (e.g. a pert checkpoint
         # has this_weight=0, next_weight=1, mask_ratio=0); the pretrained classifier heads are not trained.
         config.next_cell_pred_type = "identity"
@@ -1052,7 +1142,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             config.mask_ratio = 0.0
 
         # The genotype and celltype mappings only feed the data loader here (their heads are not trained).
-        cell_type_to_index, genotype_to_index = lora.label_mappings(self, adata, require_known=[])
+        cell_type_to_index, genotype_to_index = lora.label_mappings(
+            self, adata, require_known=[], delimiter=config.get("pert_delimiter"),
+            control=resolve_control_value(config))
 
         if cls_task == "classification":
             cls_to_index = {str(x): i for i, x in enumerate(sorted(adata.obs[cls_col].astype(str).unique()))}
@@ -1108,7 +1200,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             return val_head
 
         lora.fit(peft_model, epochs, run_epoch, device, optimizer_dict["scheduler"])
-        lora.save(peft_model, save_dir, {"mode": "cls", "cls_info": cls_info})
+        lora.save(peft_model, save_dir, lora.heads_info(
+            "cls", cls_info, pert_delimiter, max_n_pert=data_gen.get("max_n_pert"),
+            control_value=resolve_control_value(config)))
         return peft_model
 
     def run_lora_pert_train(
@@ -1127,6 +1221,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         log_interval: Optional[int] = None,
         seed: Optional[int] = None,
         checkpoint_metric: str = "pearson_delta",
+        pert_delimiter: Optional[str] = "__from_config__",
         pert_mode: str = "ft",
         pert_source: str = "denovo",
         distribution: Optional[str] = "nb",
@@ -1164,6 +1259,11 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
 
         lr: AdamW learning rate (default: the checkpoint's training_config lr), multiplied by schedule_ratio
         after each epoch; the checkpoint's optimizer/scheduler settings are not used.
+
+        pert_delimiter: separator of multi-perturbation labels such as "A+B"; resolved as in predict_perturbations
+        (default: the training config value; an explicit value is accepted when the checkpoint has none, e.g. to
+        fine-tune a single-perturbation checkpoint on combinations of its labels; a value contradicting a
+        non-None checkpoint value raises).
         """
         import copy
         import numpy as np
@@ -1184,7 +1284,10 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
                 "Use pert_mode='new' to train new perturbation modules on it."
             )
 
+        pert_delimiter = self._resolve_pert_delimiter(pert_delimiter)
         config, ps_columns = lora.prepare_config(self, adata, input_layer_key, batch_size, lr, amp, log_interval, seed)
+        config.pert_delimiter = pert_delimiter
+        control_value = resolve_control_value(config)
         config.next_cell_pred_type = "pert"
         lora_config = copy.deepcopy(lora_config) if lora_config is not None else self.build_lora_config()
 
@@ -1203,12 +1306,17 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             from .pert_emb import build_perturbation_mapping, load_perturbation_sources
 
             pert_sources = load_perturbation_sources(None if pert_source == "denovo" else pert_source)
-            new_genotype_to_index = build_perturbation_mapping(sorted(adata.obs["genotype"].astype(str).unique()), pert_sources)
-            lora.attach_new_pert_modules(self, new_genotype_to_index, pert_sources, distribution)
+            new_genotype_to_index = build_perturbation_mapping(
+                sorted(adata.obs["genotype"].astype(str).unique()), pert_sources,
+                control_label=control_value, delimiter=pert_delimiter)
+            lora.attach_new_pert_modules(self, new_genotype_to_index, pert_sources, distribution, control_label=control_value)
             # Validation perturbations absent from training are only meaningful with features from a source;
             # otherwise their vector in the new encoder is never trained.
             genotype = adata.obs["genotype"].astype(str)
-            unseen = set(genotype.iloc[valid_indices]) - set(genotype.iloc[train_indices])
+            # Compare single perturbations: with a delimiter a label such as "A+B" contributes A and B.
+            def _components(labels):
+                return {c for label in labels for c in split_perturbation_label(label, pert_delimiter, control_value)}
+            unseen = _components(genotype.iloc[valid_indices]) - _components(genotype.iloc[train_indices])
             untrained = sorted(g for g in unseen if self.pert_encoder.fallback_indices[new_genotype_to_index[g]] >= 0)
             if untrained:
                 raise ValueError(
@@ -1225,6 +1333,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
                     for name, source in self.pert_encoder.source_config()["sources"].items()
                 },
                 "distribution": distribution,
+                "control_label": control_value,
             }
             config.GEPC = True
             config.distribution = distribution
@@ -1237,7 +1346,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
 
         # In 'ft' mode genotype labels select rows of the pretrained perturbation embedding, so they must all be
         # model labels; in 'new' mode the model already holds the new dictionary.
-        cell_type_to_index, genotype_to_index = lora.label_mappings(self, adata, require_known=["genotype"])
+        cell_type_to_index, genotype_to_index = lora.label_mappings(
+            self, adata, require_known=["genotype"], delimiter=pert_delimiter, control=control_value)
 
         data_gen = produce_training_datasets(
             adata_input=adata,
@@ -1262,6 +1372,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         reference_indices = np.concatenate([data_gen["pert_valid_target_indices"], data_gen["pert_valid_control_indices"]])
         real_groups = group_moments_from_anndata(
             data_gen["adata_manager"].adata, reference_indices, layer=input_layer_key, input_scale="log1p", target_sum=target_sum,
+            perturbation_unit=config.get("perturbation_unit", "set"), pert_delimiter=config.get("pert_delimiter", None),
+            control_value=control_value,
         ).finalize()
         metric_name = checkpoint_metric if checkpoint_metric == "mvc_next" else f"{checkpoint_metric}_sample"
 
@@ -1290,7 +1402,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
                 device=device,
             )
             aggregate = compute_perturbation_metrics(
-                real_groups, evaluation["predicted_groups"], control_value="WT"
+                real_groups, evaluation["predicted_groups"], control_value=control_value
             )["aggregate"]
             validation_metrics = {"mvc_next": evaluation["losses"]["mvc_next"]}
             validation_metrics.update({f"{name}_sample": value for name, value in aggregate.items()})
@@ -1304,7 +1416,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             return score if mode == "min" else -score
 
         lora.fit(peft_model, epochs, run_epoch, device, optimizer_dict["scheduler"])
-        lora.save(peft_model, save_dir, {"mode": "pert", "cls_info": None, "pert_info": pert_info})
+        lora.save(peft_model, save_dir, {
+            **lora.heads_info("pert", None, pert_delimiter, max_n_pert=data_gen.get("max_n_pert"), control_value=control_value),
+            "pert_info": pert_info})
         return peft_model
 
     @classmethod
@@ -1336,7 +1450,30 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             # Feature tables of the saved shape; their values are restored from the adapter with the trained weights.
             pert_sources = {name: (source["genes"], torch.zeros(len(source["genes"]), source["dim"]))
                             for name, source in pert_info["sources"].items()}
-            lora.attach_new_pert_modules(model, pert_info["genotype_to_index"], pert_sources, pert_info["distribution"])
+            lora.attach_new_pert_modules(model, pert_info["genotype_to_index"], pert_sources, pert_info["distribution"],
+                                         control_label=pert_info.get("control_label", "WT"))
+        # An adapter trained with a per-call pert_delimiter (e.g. a legacy base fine-tuned on "A+B" labels)
+        # recorded the multi-perturbation settings it resolved in lora_heads.json; restore them so
+        # predict_perturbations parses sets, caps predicted sets at the width seen in fine-tuning and drops
+        # the same control label without the caller repeating any of it.
+        saved_delimiter = heads.get("pert_delimiter")
+        restored = {}
+        if saved_delimiter is not None:
+            base_delimiter = (model.training_config or {}).get("pert_delimiter")
+            if base_delimiter is not None and base_delimiter != saved_delimiter:
+                raise ValueError(
+                    f"adapter in {adapter_dir} was trained with pert_delimiter={saved_delimiter!r} but the base "
+                    f"checkpoint has pert_delimiter={base_delimiter!r}")
+            restored["pert_delimiter"] = saved_delimiter
+            if heads.get("max_n_pert") is not None:
+                restored["max_n_pert"] = int(heads["max_n_pert"])
+            if heads.get("perturbation_control_value") is not None:
+                restored["perturbation_control_value"] = heads["perturbation_control_value"]
+        if pert_info is not None and pert_info.get("control_label") is not None:
+            # The new perturbation modules were built around this control; label parsing must use the same one.
+            restored["perturbation_control_value"] = pert_info["control_label"]
+        if restored:
+            model.training_config = OmegaConf.merge(OmegaConf.create(model.training_config or {}), restored)
         return PeftModel.from_pretrained(model, adapter_dir)
 
     def predict_cls(self, adata, input_layer_key: str = "X_binned"):

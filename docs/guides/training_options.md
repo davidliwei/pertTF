@@ -54,3 +54,24 @@ supplies this automatically. LoRA fine-tuning (`run_lora_cls_train`,
 uses AdamW with the once-per-epoch StepLR (`schedule_ratio`). Separate
 DAB/adversarial schedules are unchanged. This extension does not add
 optimizer-state checkpoint resumption.
+
+## Multi-perturbation (high-MOI) settings
+
+These settings enable cells that carry several perturbations (labels such as
+`A+B`). With the defaults, labels stay single legacy labels. See the
+[multi-perturbation tutorial](../tutorials/MULTI_PERTURBATION.md) for the label
+convention and recommended regimes.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `pert_delimiter` | `None` | Label delimiter such as `"+"`; `None` keeps single-label behaviour |
+| `pert_aggregation` | `"sum"` | Combine component embeddings by `"sum"`, `"mean"` or `"sqrt"` (sum divided by the square root of the set size) |
+| `perturbation_unit` | `"set"` | Evaluate each full set (`"set"`) or each component (`"single"`) |
+| `pert_pred_threshold` | `0.5` | Sigmoid probability above which a perturbation joins `predicted_genotype` |
+| `pert_bce_pos_weight` | `None` | Optional positive-class weight for the multi-label binary cross-entropy |
+| `max_perts_per_cell` | `None` | Optional cap on set size; longer labels raise an error, and it caps predicted sets (otherwise the training-time set width, `max_n_pert`, is used) |
+
+For designed combinations use the defaults. For random high-MOI screens with
+about 5 to 10 guides per cell use `perturbation_unit="single"`,
+`pairing_config={"target_sampling": "cell"}` and `pert_aggregation="sqrt"` or
+`"mean"`.

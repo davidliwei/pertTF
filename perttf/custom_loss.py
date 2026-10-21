@@ -204,7 +204,7 @@ def SUPCON_loss(features, labels=None, mask=None, contrast_mode = 'all', tempera
     return loss
 
 # wrapper function to calculate cce loss on pertTF outputs contrastive dictionary
-def cce_loss(contrastive_dict, input_labels, pert_labels, logit_norm = False):
+def cce_loss(contrastive_dict, input_labels, pert_labels, logit_norm = False, pert_mask: Optional[torch.Tensor] = None):
     loss_cce = 0
     if len(contrastive_dict) == 4:
         loss_cce += perturb_embedding_loss(
@@ -217,6 +217,15 @@ def cce_loss(contrastive_dict, input_labels, pert_labels, logit_norm = False):
         ) 
     contr_keys = list(contrastive_dict.keys())
     emb_list = [contrastive_dict[k] for k in contr_keys]
+    if pert_mask is not None:
+        # pert_mask: (2*batch, 2*batch), same order as the concatenated embeddings
+        loss_cce += SUPCON_loss(
+            features = torch.concat(emb_list, dim = 0).unsqueeze(1),
+            labels = None,
+            mask = pert_mask,
+            normalize_logits = logit_norm
+        )
+        return loss_cce
     lab_list = [input_labels if 'orig' in k else pert_labels for k in contr_keys]
     loss_cce += SUPCON_loss(
         features = torch.concat(emb_list, dim = 0).unsqueeze(1), 
@@ -224,6 +233,27 @@ def cce_loss(contrastive_dict, input_labels, pert_labels, logit_norm = False):
         normalize_logits = logit_norm
     )
     return loss_cce
+
+def multi_hot_targets(labels: torch.Tensor, n_classes: int) -> torch.Tensor:
+    """Float (batch, n_classes) multi-hot targets from padded labels; -1 pads are ignored."""
+    target = torch.zeros(labels.shape[0], n_classes, dtype=torch.float32, device=labels.device)
+    valid = (labels >= 0).to(target.dtype)
+    # scatter_add_ (not scatter_): pads clamp to class 0 with weight 0 and must not overwrite a real class 0
+    target.scatter_add_(1, labels.clamp_min(0).long(), valid)
+    return target.clamp_(max=1.0)
+
+
+def perturbation_classification_loss(logits: torch.Tensor, labels: torch.Tensor, pos_weight: Optional[float] = None) -> torch.Tensor:
+    """Cross-entropy for 1-D labels; multi-hot BCE-with-logits for 2-D padded labels."""
+    if labels.dim() == 1:
+        return F.cross_entropy(logits, labels)
+    pw = None if pos_weight is None else torch.full((logits.shape[1],), float(pos_weight), dtype=logits.dtype, device=logits.device)
+    return F.binary_cross_entropy_with_logits(logits, multi_hot_targets(labels, logits.shape[1]).to(logits.dtype), pos_weight=pw)
+
+
+def perturbation_overlap_mask(labels_a: torch.Tensor, labels_b: torch.Tensor, n_classes: int) -> torch.Tensor:
+    """Float (len_a, len_b) mask, 1 where the two label sets share at least one class."""
+    return (multi_hot_targets(labels_a, n_classes) @ multi_hot_targets(labels_b, n_classes).T > 0).float()
 
 """
 -----------------------------------------

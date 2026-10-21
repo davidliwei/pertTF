@@ -1,6 +1,9 @@
 import warnings
 
 import numpy as np
+import pandas as pd
+
+from perttf.utils.pert_labels import split_perturbation_label
 
 
 def _check_indices(name, indices, n_obs):
@@ -30,10 +33,14 @@ def check_train_valid_split(
     min_cells=30,
     context_col="celltype",
     perturbation_col="genotype",
+    perturbation_unit="set",
+    pert_delimiter=None,
 ):
     """Check train/validation index coverage and summarize perturbation holdouts."""
     if mode not in {"identity", "lochness", "pert"}:
         raise ValueError("mode must be 'identity', 'lochness', or 'pert'")
+    if perturbation_unit not in {"set", "single"}:
+        raise ValueError("perturbation_unit must be 'set' or 'single'")
 
     train_indices = _check_indices("train_indices", train_indices, adata.n_obs)
     valid_indices = _check_indices("valid_indices", valid_indices, adata.n_obs)
@@ -117,9 +124,27 @@ def check_train_valid_split(
             f"incomplete contexts: {incomplete_contexts}"
         )
 
-    train_perturbations = set(train_target_obs[perturbation_col].unique())
-    train_combinations = set(zip(train_target_obs[context_col], train_target_obs[perturbation_col]))
-    valid_combinations = set(zip(valid_target_obs[context_col], valid_target_obs[perturbation_col]))
+    expand = pert_delimiter is not None and perturbation_unit == "single"
+
+    def _target_pairs(obs):
+        """(context, perturbation) per target row; one row per component in single mode."""
+        contexts = obs[context_col].to_numpy()
+        labels = obs[perturbation_col].to_numpy()
+        if not expand:
+            return list(zip(contexts, labels))
+        cache = {}
+        pairs = []
+        for context, label in zip(contexts, labels):
+            if label not in cache:
+                cache[label] = split_perturbation_label(str(label), pert_delimiter, control_value)
+            pairs.extend((context, component) for component in cache[label])
+        return pairs
+
+    train_pairs = _target_pairs(train_target_obs)
+    valid_pairs = _target_pairs(valid_target_obs)
+    train_perturbations = {pert for _, pert in train_pairs}
+    train_combinations = set(train_pairs)
+    valid_combinations = set(valid_pairs)
     combination_types = {
         "seen_combination": [],
         "context_transfer": [],
@@ -127,11 +152,28 @@ def check_train_valid_split(
         "unseen_context": [],
         "unseen_context_and_perturbation": [],
     }
+    track_unseen_combination = pert_delimiter is not None and perturbation_unit == "set"
+    if track_unseen_combination:
+        combination_types["unseen_combination"] = []
+        train_components = {
+            component
+            for label in train_perturbations
+            for component in split_perturbation_label(str(label), pert_delimiter, control_value)
+        }
     for context, perturbation in sorted(valid_combinations, key=lambda pair: (str(pair[0]), str(pair[1]))):
         if (context, perturbation) in train_combinations:
             category = "seen_combination"
         elif context in train_contexts and perturbation in train_perturbations:
             category = "context_transfer"
+        elif (
+            track_unseen_combination
+            and context in train_contexts
+            and all(
+                c in train_components
+                for c in split_perturbation_label(str(perturbation), pert_delimiter, control_value)
+            )
+        ):
+            category = "unseen_combination"
         elif context in train_contexts:
             category = "unseen_perturbation"
         elif perturbation in train_perturbations:
@@ -172,13 +214,26 @@ def check_train_valid_split(
         for context, count in valid_control_obs.groupby(context_col, observed=True).size().items()
         if count < min_cells
     ]
+    if expand:
+        valid_group_counts = pd.Series(valid_pairs).value_counts()
+        group_items = sorted(valid_group_counts.items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1])))
+    else:
+        group_items = list(valid_target_obs.groupby([context_col, perturbation_col], observed=True).size().items())
     low_target_groups = [
         (context, perturbation, int(count))
-        for (context, perturbation), count in valid_target_obs.groupby(
-            [context_col, perturbation_col], observed=True
-        ).size().items()
+        for (context, perturbation), count in group_items
         if count < min_cells
     ]
+    if track_unseen_combination:
+        set_counts = valid_obs.groupby([context_col, perturbation_col], observed=True).size()
+        set_counts = set_counts[set_counts > 0]
+        if len(set_counts) and int((set_counts >= min_cells).sum()) * 2 < len(set_counts):
+            warnings.warn(
+                f"Fewer than half of validation (context, perturbation set) groups have at least "
+                f"{min_cells} cells; consider perturbation_unit='single' to evaluate per component "
+                "perturbation.",
+                stacklevel=2,
+            )
     if low_control_groups:
         _warn_groups(f"Validation control groups with fewer than {min_cells} cells", low_control_groups)
     if low_target_groups:

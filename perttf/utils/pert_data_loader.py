@@ -13,6 +13,14 @@ from sklearn.model_selection._split import _BaseKFold
 from .custom_tokenizer import tokenize_and_pad_batch, random_mask_value, SimpleVocab
 from .misc import _get_sf
 from .pert_pairing import ContextAwarePairing
+from .pert_labels import (
+    resolve_control_value,
+    canonicalize_perturbation_columns,
+    labels_to_padded_array,
+    max_set_size,
+    unique_perturbations,
+    validate_perturbation_labels,
+)
 
 # add batch info 
 def add_batch_info(adata):
@@ -76,6 +84,8 @@ class PertTFDataset(Dataset):
                  prediction_only: bool = False,
                  config=None,
                  pairing_config=None,
+                 pert_delimiter: Optional[str] = None,
+                 max_perts_per_cell: Optional[int] = None,
                  ):
         """
         The PertTFDataset serves to interface with pytorch Dataloaders 
@@ -94,18 +104,15 @@ class PertTFDataset(Dataset):
             additional_ps_dict (dict): a dictionary {gene_name:ps} the pass the additional ps score for other genes to the training.
             only_sample_wt_pert: Legacy argument retained for callers; identity pairs now always reuse the source row.
             pairing_config: Loader-specific pairing overrides.
+            pert_delimiter: Separator of multi-perturbation labels such as "A+B"; falls back to config['pert_delimiter'].
+                None keeps legacy single-label behaviour.
+            max_perts_per_cell: Optional cap on perturbations per cell; falls back to config['max_perts_per_cell'].
         """
         self.adata = adata
         self._check_anndata_content()
         self.obs_names = self.adata.obs.index.to_numpy()
         self.celltype_values = self.adata.obs["celltype"].to_numpy()
-        self.genotype_values = self.adata.obs["genotype"].to_numpy()
         self.batch_values = self.adata.obs["batch_id"].to_numpy()
-        self.genotype_next_values = (
-            self.adata.obs["genotype_next"].to_numpy()
-            if "genotype_next" in self.adata.obs
-            else None
-        )
         indices = np.asarray(indices if indices is not None else np.arange(self.adata.n_obs), dtype=np.int64)
         self.next_cell_pred = next_cell_pred
         self.prediction_only = prediction_only
@@ -114,9 +121,10 @@ class PertTFDataset(Dataset):
         resolved_pairing_config = dict(DEFAULT_PAIRING_CONFIG)
         if config is not None:
             resolved_pairing_config["pairing_seed"] = config.get("seed", None)
-            resolved_pairing_config["control_value"] = config.get(
-                "perturbation_control_value", resolved_pairing_config["control_value"]
-            )
+            # pairing_config.control_value first, then perturbation_control_value: the same control for
+            # pairing, canonicalisation and splitting, also for prediction-only datasets.
+            resolved_pairing_config["control_value"] = resolve_control_value(
+                config, default=resolved_pairing_config["control_value"])
             if not prediction_only:
                 resolved_pairing_config.update(dict(config.get("pairing_config", {}) or {}))
         if not prediction_only:
@@ -138,12 +146,38 @@ class PertTFDataset(Dataset):
             "perturbation_mode": next_cell_pred == "pert" and not prediction_only,
             "ot_params": ot_params if use_ot and next_cell_pred == "pert" and not prediction_only else None,
         }
+        if pert_delimiter is None and config is not None:
+            pert_delimiter = config.get("pert_delimiter", None)
+        if max_perts_per_cell is None and config is not None:
+            max_perts_per_cell = config.get("max_perts_per_cell", None)
+        self.pert_delimiter = pert_delimiter
+        self.control_value = self._pairing_config["control_value"]
+        pert_columns = [c for c in ("genotype", "genotype_next") if c in self.adata.obs.columns]
+        for col in pert_columns:
+            validate_perturbation_labels(
+                self.adata.obs[col].astype(str).unique(), self.pert_delimiter, self.control_value,
+                existing_mapping=genotype_to_index, max_perts_per_cell=max_perts_per_cell,
+            )
+        # Canonicalise before reading values so pairing compares canonical strings with the control label.
+        canonicalize_perturbation_columns(self.adata, self.pert_delimiter, self.control_value)
+        self.genotype_values = self.adata.obs["genotype"].to_numpy()
+        self.genotype_next_values = (
+            self.adata.obs["genotype_next"].to_numpy()
+            if "genotype_next" in self.adata.obs
+            else None
+        )
+        # Largest set among the rows this dataset can draw (its own indices plus any pairing source/target
+        # rows), so a training dataset's width, recorded as the inference cap, never includes validation labels.
+        self.max_n_pert = self._compute_max_n_pert(indices, source_indices, target_indices)
         self._set_pairing(indices, source_indices, target_indices)
         self.expr_layer = expr_layer
         
         # Mappings
         self.cell_type_to_index = cell_type_to_index if cell_type_to_index is not None else {t: i for i, t in enumerate(self.adata.obs['celltype'].unique())}
-        self.genotype_to_index = genotype_to_index if genotype_to_index is not None else {t: i for i, t in enumerate(self.adata.obs['genotype'].unique())}
+        self.genotype_to_index = genotype_to_index if genotype_to_index is not None else {
+            t: i for i, t in enumerate(
+                unique_perturbations(self.adata.obs['genotype'], self.pert_delimiter, self.control_value))
+        }
         self.ps_columns = ps_columns or [] 
         self.ps_columns = list(self.ps_columns) # must be a list 
         self.sf = size_factors if size_factors is not None else (
@@ -180,9 +214,31 @@ class PertTFDataset(Dataset):
         self.ps_matrix = self.adata.obs[self.ps_columns].values.astype(np.float32) if self.ps_columns else np.zeros((self.adata.shape[0],1), dtype=np.float32)
 
 
+    def _to_label(self, label_str, drop_unknown=False):
+        """Index for a label (legacy) or a -1 padded index array of shape (max_n_pert,) (multi mode).
+
+        ``drop_unknown`` (multi mode) pads components missing from the mapping instead of raising."""
+        if self.pert_delimiter is None:
+            return self.genotype_to_index[label_str]
+        return labels_to_padded_array(
+            label_str, self.genotype_to_index, self.pert_delimiter, self.max_n_pert, self.control_value,
+            drop_unknown=drop_unknown)
+
     def _check_anndata_content(self):
         assert 'genotype' in self.adata.obs.columns and 'celltype' in self.adata.obs.columns, 'no genotype or celltype column found in anndata'
         add_batch_info(self.adata)
+
+    def _compute_max_n_pert(self, *index_groups) -> int:
+        if self.pert_delimiter is None:
+            return 1
+        groups = [np.asarray(g, dtype=np.int64) for g in index_groups if g is not None]
+        rows = np.unique(np.concatenate(groups)) if groups else np.arange(self.adata.n_obs)
+        width = max_set_size(self.genotype_values[rows], self.pert_delimiter, self.control_value)
+        # genotype_next is a sample target only for prediction-only datasets; training targets come from the
+        # pairing (another row's genotype), so a pre-populated genotype_next must not widen the training cap.
+        if self.prediction_only and self.genotype_next_values is not None:
+            width = max(width, max_set_size(self.genotype_next_values[rows], self.pert_delimiter, self.control_value))
+        return width
 
     def _set_pairing(self, indices, source_indices=None, target_indices=None):
         self.pairing = ContextAwarePairing(
@@ -199,7 +255,9 @@ class PertTFDataset(Dataset):
         return self.pairing.pairs
 
     def set_new_indices(self, indices):
-        self._set_pairing(np.asarray(indices, dtype=np.int64))
+        indices = np.asarray(indices, dtype=np.int64)
+        self.max_n_pert = self._compute_max_n_pert(indices)
+        self._set_pairing(indices)
 
     def get_adata_subset(self, next_cell_pred = 'identity'):
         assert next_cell_pred in ['pert', 'identity', "lochness"], 'next_cell_pred can only be identity or pert or lochness'
@@ -256,7 +314,12 @@ class PertTFDataset(Dataset):
                 "expr": current_expr,
                 "genes": curr_gene,
                 "celltype_labels": self.cell_type_to_index.get(current_cell_celltype, 0),
-                "perturbation_labels": self.genotype_to_index.get(current_cell_genotype, 0),
+                "perturbation_labels": (
+                    self.genotype_to_index.get(current_cell_genotype, 0)
+                    # Source labels are lenient like legacy .get(x, 0): unknown components become padding.
+                    if self.pert_delimiter is None else self._to_label(current_cell_genotype, drop_unknown=True)
+                ),
+                "pert_name": str(current_cell_genotype),
                 "batch_labels": current_cell_batch_label,
                 "sf": self.sf[current_cell_global_idx],
                 "index": current_cell_global_idx,
@@ -264,7 +327,11 @@ class PertTFDataset(Dataset):
             }
             if self.genotype_next_values is not None:
                 next_pert = self.genotype_next_values[current_cell_global_idx]
-                sample["perturbation_labels_next"] = self.genotype_to_index.get(next_pert, 0)
+                sample["perturbation_labels_next"] = (
+                    self.genotype_to_index.get(next_pert, 0)
+                    if self.pert_delimiter is None else self._to_label(next_pert)
+                )
+                sample["pert_name_next"] = str(next_pert)
             return sample
 
         # 3. Resolve the target selected by the pairing policy
@@ -284,14 +351,15 @@ class PertTFDataset(Dataset):
         next_sf = self.sf[next_cell_global_idx]
         # 5. Get labels and PS scores
         cell_label = self.cell_type_to_index[current_cell_celltype]
-        pert_label = self.genotype_to_index[current_cell_genotype]
+        pert_label = self._to_label(current_cell_genotype)
         
 
         batch_label = current_cell_batch_label
 
         # Next cell labels are the same for cell type, but perturbation can change
         cell_label_next = cell_label
-        pert_label_next = self.genotype_to_index[next_pert_label_str]
+        pert_label_next = self._to_label(next_pert_label_str)
+        pert_name_next = str(next_pert_label_str)
 
                 
         #ps_scores = np.array([self.adata.obs.at[current_cell_idx, ps] for ps in self.ps_columns]).astype(np.float32) if self.ps_columns else np.array([0.0], dtype=np.float32)
@@ -303,11 +371,13 @@ class PertTFDataset(Dataset):
             selection_pool_length = len(self.ps_columns_perturbed_genes) + len(self.additional_ps_names)
             random_pert_ind = random.randint(0, selection_pool_length-1)
             if random_pert_ind < len(self.ps_columns_perturbed_genes): # falls within the provided ps
-                pert_label_next = self.genotype_to_index[self.ps_columns_perturbed_genes[random_pert_ind]] # this is the randomly assigned perturbations
+                pert_name_next = self.ps_columns_perturbed_genes[random_pert_ind]
+                pert_label_next = self._to_label(pert_name_next) # this is the randomly assigned perturbations
                 ps_scores_next = np.array([ps_scores[random_pert_ind]], dtype=np.float32)  # note that the target prediction is not the PS of NEXT cell, but the current cell
             else: # falls within additional ps scores defined in additional_ps_dict
                 selected_gene = self.additional_ps_names[random_pert_ind - len(self.ps_columns_perturbed_genes)] 
-                pert_label_next = self.genotype_to_index[selected_gene]
+                pert_name_next = selected_gene
+                pert_label_next = self._to_label(selected_gene)
                 ps_scores_next = np.array([self.additional_ps_dict[selected_gene]], dtype=np.float32) 
         
         return {
@@ -317,9 +387,11 @@ class PertTFDataset(Dataset):
             "next_genes": next_gene,
             "celltype_labels": cell_label,
             "perturbation_labels": pert_label,
+            "pert_name": str(current_cell_genotype),
             "batch_labels": batch_label,
             "celltype_labels_next": cell_label_next,
             "perturbation_labels_next": pert_label_next,
+            "pert_name_next": pert_name_next,
             "ps": ps_scores,
             "ps_next": ps_scores_next,
             "sf": current_sf,
@@ -473,6 +545,10 @@ class PertTFUniDataManager:
         self.expr_layer = expr_layer
         self.only_sample_wt_pert = config.get('only_sample_wt_pert', only_sample_wt_pert)
         self.next_cell_pred_type = config.get('next_cell_pred_type', next_cell_pred_type)
+        self.pert_delimiter = config.get('pert_delimiter', None)
+        self.max_perts_per_cell = config.get('max_perts_per_cell', None)
+        self.control_value = resolve_control_value(config)
+        canonicalize_perturbation_columns(self.adata, self.pert_delimiter, self.control_value)
         # --- Perform one-time data setup ---
         print("Initializing PertTFUniDataManager: Creating vocab and mappings...")
         #if "batch_id" not in self.adata.obs.columns:
@@ -522,7 +598,12 @@ class PertTFUniDataManager:
         print("Initialization complete.")
 
     def set_genotype_index(self, genotype_to_index):
-        self.genotype_to_index = {t: i for i, t in enumerate(self.adata.obs['genotype'].unique())} if genotype_to_index is None else genotype_to_index
+        validate_perturbation_labels(
+            self.adata.obs['genotype'].astype(str).unique(), self.pert_delimiter, self.control_value,
+            existing_mapping=genotype_to_index, max_perts_per_cell=self.max_perts_per_cell)
+        self.genotype_to_index = {
+            t: i for i, t in enumerate(unique_perturbations(self.adata.obs['genotype'], self.pert_delimiter, self.control_value))
+        } if genotype_to_index is None else genotype_to_index
         self.num_genotypes = len(self.genotype_to_index)
 
     def set_celltype_index(self, celltype_to_index):

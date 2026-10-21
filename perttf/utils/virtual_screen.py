@@ -6,6 +6,16 @@ import matplotlib.pyplot as plt
 
 from perttf.model.pert_emb import generate_pert_embeddings, calculate_avg_cosine_similarity
 from perttf.model.train_function import eval_testdata
+from perttf.utils.pert_labels import labels_in_mapping, resolve_control_value
+
+
+def _first_set(key, *sources, default=None):
+  """Value of ``key`` from the first source that records it. A recorded ``None`` (a run trained
+  without a delimiter) is authoritative and is not skipped in favour of a later source."""
+  for source in sources:
+    if source is not None and key in source:
+      return source.get(key)
+  return default
 
 
 def virtual_screen_src2dest(adata_src,
@@ -16,11 +26,13 @@ def virtual_screen_src2dest(adata_src,
                             device=None,
                             n_expands_per_epoch = 5,
                             n_epoch = 10,
-                            wt_pred_next_label = 'WT',
+                            wt_pred_next_label = None,
                             ):
   """
   A function to perform virtual screen from source to destination.
 
+  wt_pred_next_label: the genotype_next assigned to the destination cells; defaults to the run's
+  control label (pairing_config.control_value / perturbation_control_value, usually 'WT').
   """
 
   cell_type_to_index = running_parameters['cell_type_to_index']
@@ -32,15 +44,30 @@ def virtual_screen_src2dest(adata_src,
   if device is None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+  # wrapper_train stores the run's config (with pert_delimiter) inside running_parameters['config'].
+  sources = (running_parameters, running_parameters.get('config'), config, getattr(model, 'training_config', None))
+  delimiter = _first_set('pert_delimiter', *sources)
+  control = next((c for c in (resolve_control_value(s, default=None) for s in sources) if c is not None), 'WT')
+  if wt_pred_next_label is None:
+    # Destination rows are evaluated under the run's control, whatever label the run used for it.
+    wt_pred_next_label = control
+  # eval_testdata parses labels with config's delimiter; a different one would silently drop rows.
+  config_delimiter = config.get('pert_delimiter') if config is not None else None
+  if config_delimiter != delimiter:
+    raise ValueError(
+      f"config pert_delimiter={config_delimiter!r} does not match the run's pert_delimiter={delimiter!r}; "
+      "pass the training config")
+
   # default: screen_genes
   gene_available_for_screen=genotype_to_index.keys()
   if screen_genes is None:
     screen_genes_next=gene_available_for_screen
   else:
-    filtered_genes=[x for x in screen_genes if x not in gene_available_for_screen]
+    screenable = labels_in_mapping(screen_genes, genotype_to_index, delimiter, control)
+    filtered_genes=[x for x, ok in zip(screen_genes, screenable) if not ok]
     if len(filtered_genes)>0:
       print("warning: the following genes are filtered (not in genotype index; cannot screen):" + ','.join(filtered_genes))
-    screen_genes_next=[x for x in screen_genes if x in gene_available_for_screen]
+    screen_genes_next=[x for x, ok in zip(screen_genes, screenable) if ok]
     if len(screen_genes_next)==0:
       raise ValueError('None of the genes are screenable')
 

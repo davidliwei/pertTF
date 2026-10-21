@@ -18,6 +18,7 @@ from peft.tuners.tuners_utils import BaseTunerLayer
 from . import train_function
 from ..custom_loss import GenerativeExpressionLoss, criterion_neg_log_bernoulli, masked_mse_loss
 from ..utils.set_optimizer import create_optimizer_dict
+from ..utils.pert_labels import unique_perturbations
 
 
 def check_no_adapter(model) -> None:
@@ -76,7 +77,8 @@ def prepare_config(model, adata: AnnData, input_layer_key: str, batch_size: Opti
     return config, ps_columns
 
 
-def label_mappings(model, adata: AnnData, require_known) -> Tuple[Optional[Dict], Optional[Dict]]:
+def label_mappings(model, adata: AnnData, require_known, delimiter: Optional[str] = None,
+                   control: str = "WT") -> Tuple[Optional[Dict], Optional[Dict]]:
     """
     Label -> index mappings for celltype and genotype. A label column listed in require_known keeps
     the pretrained mapping and must only contain model labels; for the others, a mapping missing
@@ -85,7 +87,10 @@ def label_mappings(model, adata: AnnData, require_known) -> Tuple[Optional[Dict]
     mappings = {}
     for obs_col, attr in (("celltype", "cell_type_to_index"), ("genotype", "genotype_to_index")):
         mapping = getattr(model, attr, None)
-        missing = [x for x in adata.obs[obs_col].unique() if mapping is None or x not in mapping]
+        labels = adata.obs[obs_col].unique()
+        if obs_col == "genotype":
+            labels = unique_perturbations(labels, delimiter, control)
+        missing = [x for x in labels if mapping is None or x not in mapping]
         if obs_col in require_known and missing:
             raise ValueError(
                 f"adata.obs['{obs_col}'] has labels the model does not know: {sorted(map(str, missing))}. "
@@ -98,11 +103,13 @@ def label_mappings(model, adata: AnnData, require_known) -> Tuple[Optional[Dict]
     return mappings["celltype"], mappings["genotype"]
 
 
-def attach_new_pert_modules(model, genotype_to_index: Dict[str, int], pert_sources: dict, distribution: Optional[str]) -> None:
+def attach_new_pert_modules(model, genotype_to_index: Dict[str, int], pert_sources: dict, distribution: Optional[str],
+                            control_label: str = "WT") -> None:
     """
     run_lora_pert_train(pert_mode='new'): replace the perturbation encoder, the perturbed-cell encoder and the
     expression decoder with untrained modules for a new perturbation dictionary and expression distribution.
-    Used for training and again by load_lora_adapter, before the trained weights are loaded.
+    Used for training and again by load_lora_adapter, before the trained weights are loaded. control_label is the
+    configured control (pairing_config.control_value / perturbation_control_value), which the new encoder fixes to zero.
     """
     from omegaconf import OmegaConf
     from .modules import MVCDecoder, PertExpEncoder
@@ -110,7 +117,7 @@ def attach_new_pert_modules(model, genotype_to_index: Dict[str, int], pert_sourc
 
     pert_dim = model.d_model if model.pert_dim is None else model.pert_dim
     model.genotype_to_index = genotype_to_index
-    model.pert_encoder = UnifiedPertEncoder(pert_sources, genotype_to_index, pert_dim, control_label="WT")
+    model.pert_encoder = UnifiedPertEncoder(pert_sources, genotype_to_index, pert_dim, control_label=control_label)
     model.pert_exp_encoder = PertExpEncoder(model.d_model, model.pert_dim)
     model.mvc_decoder = MVCDecoder(
         model.d_model,
@@ -157,6 +164,21 @@ def fit(peft_model, epochs: int, run_epoch: Callable[[int], float], device: torc
         peft_model.load_state_dict(best_state_dict)
         peft_model.to(device)
         print(f"Restored best model from epoch {best_epoch}")
+
+
+def heads_info(mode: str, cls_info: Optional[Dict], pert_delimiter: Optional[str],
+               max_n_pert: Optional[int] = None, control_value: Optional[str] = None) -> Dict:
+    """lora_heads.json content. The multi-perturbation settings the run resolved (delimiter, the set width
+    seen in training that caps predicted sets, the control label) are recorded only when a delimiter is set,
+    so legacy files are unchanged; load_lora_adapter restores them into training_config."""
+    info = {"mode": mode, "cls_info": cls_info}
+    if pert_delimiter is not None:
+        info["pert_delimiter"] = pert_delimiter
+        if max_n_pert is not None:
+            info["max_n_pert"] = int(max_n_pert)
+        if control_value is not None:
+            info["perturbation_control_value"] = control_value
+    return info
 
 
 def save(peft_model, save_dir: Optional[str], heads_info: Dict) -> None:
