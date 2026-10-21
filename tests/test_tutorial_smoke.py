@@ -600,6 +600,37 @@ def test_lora_pert_delimiter_override_on_legacy_checkpoint(pert_checkpoint, tmp_
     assert hasattr(peft_model, "get_base_model")
     assert (adapter_dir / "lora_heads.json").exists()
     assert json.loads((adapter_dir / "lora_heads.json").read_text())["pert_delimiter"] == "+"
+    # Reloading restores the delimiter, so sets are parsed without repeating it (Codex review on PR 71).
+    loaded = HFPerturbationTFModel.load_lora_adapter(str(pert_checkpoint["hf_dir"]), str(adapter_dir))
+    loaded.eval()
+    assert loaded.get_base_model().training_config.pert_delimiter == "+"
+    query = adata[adata.obs["genotype"] == "WT"].copy()
+    query.obs["genotype_next"] = "A+B"
+    result = loaded.predict_perturbations(query, prediction_mode="mean", device=DEVICE)
+    assert result.obsm["mvc_next_expr"].shape == query.shape
+    assert result.uns["perttf_prediction"]["pert_delimiter"] == "+"
+
+
+def test_virtual_screen_honours_recorded_null_delimiter(adata, pert_checkpoint):
+    # A legacy run records pert_delimiter=None in running_parameters['config']; that recorded value is
+    # authoritative, so a caller config that wrongly says "+" is rejected instead of silently winning.
+    from perttf.utils.virtual_screen import virtual_screen_src2dest
+
+    running_parameters = torch.load(pert_checkpoint["save_dir"] / "running_parameters.pt", weights_only=False)
+    assert "pert_delimiter" in running_parameters["config"] and running_parameters["config"]["pert_delimiter"] is None
+    vocab = torch.load(pert_checkpoint["save_dir"] / "vocab.pt", weights_only=False)
+    config = OmegaConf.create(pert_checkpoint["config"].as_dict())
+    config.pert_delimiter = "+"
+    is_t1 = adata.obs["celltype"] == "T1"
+    adata_src = adata[is_t1 & (adata.obs["genotype"] == "WT")].copy()
+    adata_des = adata[is_t1 & (adata.obs["genotype"] == "A")].copy()
+    for a in (adata_src, adata_des):
+        a.obs["genotype_next"] = a.obs["genotype"].astype("category")
+    with pytest.raises(ValueError, match="pert_delimiter"):
+        virtual_screen_src2dest(
+            adata_src, adata_des, pert_checkpoint["model"], vocab, config, running_parameters,
+            screen_genes=["A", "B"], device=DEVICE, n_expands_per_epoch=1, n_epoch=1, wt_pred_next_label="A",
+        )
 
 
 def test_lora_rejects_pert_delimiter_mismatch(multi_checkpoint):

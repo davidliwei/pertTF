@@ -10,10 +10,11 @@ from perttf.utils.pert_labels import labels_in_mapping, resolve_control_value
 
 
 def _first_set(key, *sources, default=None):
+  """Value of ``key`` from the first source that records it. A recorded ``None`` (a run trained
+  without a delimiter) is authoritative and is not skipped in favour of a later source."""
   for source in sources:
-    value = source.get(key) if source is not None else None
-    if value is not None:
-      return value
+    if source is not None and key in source:
+      return source.get(key)
   return default
 
 

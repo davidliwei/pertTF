@@ -1420,6 +1420,17 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             pert_sources = {name: (source["genes"], torch.zeros(len(source["genes"]), source["dim"]))
                             for name, source in pert_info["sources"].items()}
             lora.attach_new_pert_modules(model, pert_info["genotype_to_index"], pert_sources, pert_info["distribution"])
+        # An adapter trained with a per-call pert_delimiter (e.g. a legacy base fine-tuned on "A+B" labels)
+        # recorded it in lora_heads.json; restore it so predict_perturbations parses sets without repeating it.
+        saved_delimiter = heads.get("pert_delimiter")
+        if saved_delimiter is not None:
+            base_delimiter = (model.training_config or {}).get("pert_delimiter")
+            if base_delimiter is not None and base_delimiter != saved_delimiter:
+                raise ValueError(
+                    f"adapter in {adapter_dir} was trained with pert_delimiter={saved_delimiter!r} but the base "
+                    f"checkpoint has pert_delimiter={base_delimiter!r}")
+            model.training_config = OmegaConf.merge(
+                OmegaConf.create(model.training_config or {}), {"pert_delimiter": saved_delimiter})
         return PeftModel.from_pretrained(model, adapter_dir)
 
     def predict_cls(self, adata, input_layer_key: str = "X_binned"):
