@@ -1,5 +1,5 @@
 import numpy as np, pytest, anndata as ad, pandas as pd
-from perttf.utils.pert_labels import (resolve_control_value, split_perturbation_label, canonical_label, unique_perturbations,
+from perttf.utils.pert_labels import (predicted_set_labels, resolve_control_value, split_perturbation_label, canonical_label, unique_perturbations,
     labels_in_mapping, labels_to_padded_array, max_set_size, validate_perturbation_labels,
     canonicalize_perturbation_columns)
 
@@ -87,3 +87,20 @@ def test_resolve_control_value_prefers_pairing_config():
     assert resolve_control_value({}, default=None) is None
     # the control named only through pairing_config is dropped from combinations
     assert canonical_label("ctrl+A", "+", resolve_control_value({"pairing_config": {"control_value": "ctrl"}})) == "A"
+
+
+def test_predicted_set_labels_cap_excludes_control():
+    # Codex review on PR 71: with cap=2 and probabilities ordered WT, A, B all above threshold, the control
+    # must not consume a slot: the predicted set is A+B, not A.
+    names = {0: "WT", 1: "A", 2: "B", 3: "C"}
+    probs = np.array([[0.9, 0.8, 0.7, 0.1]])
+    assert predicted_set_labels(probs, names, 0.5, 2, "+") == ["A+B"]
+    assert predicted_set_labels(probs, names, 0.5, 1, "+") == ["A"]
+    assert predicted_set_labels(probs, names, 0.5, 10, "+") == ["A+B"]
+    # only the control passes the threshold -> control
+    assert predicted_set_labels(np.array([[0.9, 0.2, 0.1, 0.1]]), names, 0.5, 2, "+") == ["WT"]
+    # nothing passes -> the single most probable class, control included
+    assert predicted_set_labels(np.array([[0.1, 0.4, 0.2, 0.1]]), names, 0.5, 2, "+") == ["A"]
+    assert predicted_set_labels(np.array([[0.4, 0.1, 0.2, 0.1]]), names, 0.5, 2, "+") == ["WT"]
+    # canonical order and a non-default control
+    assert predicted_set_labels(np.array([[0.2, 0.6, 0.9, 0.7]]), {0: "ctrl", 1: "A", 2: "B", 3: "C"}, 0.5, 3, "+", "ctrl") == ["A+B+C"]

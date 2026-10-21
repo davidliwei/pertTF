@@ -99,6 +99,26 @@ def labels_to_padded_array(label: str, mapping: Mapping[str, int], delimiter: Op
     return out
 
 
+def predicted_set_labels(probs: np.ndarray, index_to_name: Mapping[int, str], threshold: float, cap: int,
+                         delimiter: str, control: str = "WT") -> list:
+    """Canonical multi-perturbation label per row of sigmoid probabilities ``(n_cells, n_classes)``.
+
+    Active (non-control) classes above ``threshold`` are kept in descending probability, at most ``cap``
+    of them; the control never takes one of those slots. A row with no active class above the threshold
+    falls back to its single most probable class (the control when that ranks first).
+    """
+    probs = np.asarray(probs)
+    name_to_index = {name: index for index, name in index_to_name.items()}
+    control_index = name_to_index.get(control)
+    order = np.argsort(-probs, axis=1, kind="stable")
+    labels = []
+    for row_probs, row_order in zip(probs, order):
+        active = [int(i) for i in row_order if i != control_index and row_probs[i] > threshold][: int(cap)]
+        chosen = active or [int(row_order[0])]
+        labels.append(canonical_label(delimiter.join(index_to_name[i] for i in chosen), delimiter, control))
+    return labels
+
+
 def max_set_size(labels: Iterable[str], delimiter: Optional[str], control: str = "WT") -> int:
     """Largest component count over ``labels`` (at least 1)."""
     return max([1] + [len(split_perturbation_label(label, delimiter, control)) for label in labels])

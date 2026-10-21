@@ -42,7 +42,7 @@ from ..utils.misc import get_config_value as _cfg
 from ..utils.misc import init_plot_worker
 from ..utils.misc import to_numpy as _to_numpy
 from ..utils.pert_data_loader import PertBatchCollator, PertTFDataset
-from ..utils.pert_labels import canonical_label, canonicalize_perturbation_columns, labels_in_mapping, resolve_control_value
+from ..utils.pert_labels import canonicalize_perturbation_columns, labels_in_mapping, predicted_set_labels, resolve_control_value
 from ..utils.pert_metrics import (
     GroupMoments,
     compute_perturbation_metrics,
@@ -871,13 +871,9 @@ def eval_testdata(
         # model-side cap on predicted set size; never derived from the labels of the data being predicted
         cap = (_cfg(config, "max_perts_per_cell", None) or train_data_dict.get("max_n_pert")
                or _cfg(config, "max_n_pert", None) or X_genotype_cls_probs.shape[1])
-        top = np.argsort(-X_genotype_cls_probs, axis=1, kind="stable")[:, :int(cap)]
-        predicted = []
-        for row_probs, row_top in zip(X_genotype_cls_probs, top):
-            chosen = [i for i in row_top if row_probs[i] > threshold] or [row_top[0]]
-            predicted.append(canonical_label(
-                pert_delimiter.join(index_to_genotype[i] for i in chosen), pert_delimiter, control_value))
-        adata_t.obs["predicted_genotype"] = predicted
+        # the control never takes one of the capped slots (see predicted_set_labels)
+        adata_t.obs["predicted_genotype"] = predicted_set_labels(
+            X_genotype_cls_probs, index_to_genotype, threshold, cap, pert_delimiter, control_value)
     if "genotype" in adata_t.obs.columns and pert_delimiter is None:
         adata_t.obs["genotype_id"] = adata_t.obs["genotype"].map(genotype_to_index).astype(pd.CategoricalDtype(categories=list(genotype_to_index.values())))
 
