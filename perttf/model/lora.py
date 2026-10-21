@@ -166,11 +166,18 @@ def fit(peft_model, epochs: int, run_epoch: Callable[[int], float], device: torc
         print(f"Restored best model from epoch {best_epoch}")
 
 
-def heads_info(mode: str, cls_info: Optional[Dict], pert_delimiter: Optional[str]) -> Dict:
-    """lora_heads.json content; pert_delimiter is recorded only when set, so legacy files are unchanged."""
+def heads_info(mode: str, cls_info: Optional[Dict], pert_delimiter: Optional[str],
+               max_n_pert: Optional[int] = None, control_value: Optional[str] = None) -> Dict:
+    """lora_heads.json content. The multi-perturbation settings the run resolved (delimiter, the set width
+    seen in training that caps predicted sets, the control label) are recorded only when a delimiter is set,
+    so legacy files are unchanged; load_lora_adapter restores them into training_config."""
     info = {"mode": mode, "cls_info": cls_info}
     if pert_delimiter is not None:
         info["pert_delimiter"] = pert_delimiter
+        if max_n_pert is not None:
+            info["max_n_pert"] = int(max_n_pert)
+        if control_value is not None:
+            info["perturbation_control_value"] = control_value
     return info
 
 

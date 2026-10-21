@@ -604,11 +604,15 @@ def test_lora_pert_delimiter_override_on_legacy_checkpoint(pert_checkpoint, tmp_
     loaded = HFPerturbationTFModel.load_lora_adapter(str(pert_checkpoint["hf_dir"]), str(adapter_dir))
     loaded.eval()
     assert loaded.get_base_model().training_config.pert_delimiter == "+"
+    # the set width seen in fine-tuning caps predicted sets after reload (Codex review on PR 71)
+    assert json.loads((adapter_dir / "lora_heads.json").read_text())["max_n_pert"] == 3
+    assert loaded.get_base_model().training_config.max_n_pert == 3
     query = adata[adata.obs["genotype"] == "WT"].copy()
     query.obs["genotype_next"] = "A+B"
     result = loaded.predict_perturbations(query, prediction_mode="mean", device=DEVICE)
     assert result.obsm["mvc_next_expr"].shape == query.shape
     assert result.uns["perttf_prediction"]["pert_delimiter"] == "+"
+    assert all(len(label.split("+")) <= 3 for label in result.obs["predicted_genotype"])
 
 
 def test_virtual_screen_honours_recorded_null_delimiter(adata, pert_checkpoint):
@@ -698,4 +702,13 @@ def test_lora_new_mode_uses_configured_control(pert_checkpoint, tmp_path):
     assert heads["pert_info"]["control_label"] == "ctrl"
     assert set(heads["pert_info"]["genotype_to_index"]) == set(singles) | {"ctrl"}
     loaded = HFPerturbationTFModel.load_lora_adapter(str(pert_checkpoint["hf_dir"]), str(adapter_dir))
-    assert loaded.get_base_model().pert_encoder.control_label == "ctrl"
+    loaded.eval()
+    base = loaded.get_base_model()
+    assert base.pert_encoder.control_label == "ctrl"
+    # label parsing after reload uses the same control: "ctrl+A" is the single perturbation A
+    assert base.training_config.perturbation_control_value == "ctrl"
+    query = adata[adata.obs["genotype"] == "ctrl"].copy()
+    query.obs["genotype_next"] = "ctrl+A"
+    result = loaded.predict_perturbations(query, prediction_mode="mean", device=DEVICE)
+    assert result.obsm["mvc_next_expr"].shape == query.shape
+    assert set(result.obs["genotype_next"]) == {"A"}

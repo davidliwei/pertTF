@@ -1174,7 +1174,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             return val_head
 
         lora.fit(peft_model, epochs, run_epoch, device, optimizer_dict["scheduler"])
-        lora.save(peft_model, save_dir, lora.heads_info("cls", cls_info, pert_delimiter))
+        lora.save(peft_model, save_dir, lora.heads_info(
+            "cls", cls_info, pert_delimiter, max_n_pert=data_gen.get("max_n_pert"),
+            control_value=resolve_control_value(config)))
         return peft_model
 
     def run_lora_pert_train(
@@ -1388,7 +1390,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             return score if mode == "min" else -score
 
         lora.fit(peft_model, epochs, run_epoch, device, optimizer_dict["scheduler"])
-        lora.save(peft_model, save_dir, {**lora.heads_info("pert", None, pert_delimiter), "pert_info": pert_info})
+        lora.save(peft_model, save_dir, {
+            **lora.heads_info("pert", None, pert_delimiter, max_n_pert=data_gen.get("max_n_pert"), control_value=control_value),
+            "pert_info": pert_info})
         return peft_model
 
     @classmethod
@@ -1423,16 +1427,27 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             lora.attach_new_pert_modules(model, pert_info["genotype_to_index"], pert_sources, pert_info["distribution"],
                                          control_label=pert_info.get("control_label", "WT"))
         # An adapter trained with a per-call pert_delimiter (e.g. a legacy base fine-tuned on "A+B" labels)
-        # recorded it in lora_heads.json; restore it so predict_perturbations parses sets without repeating it.
+        # recorded the multi-perturbation settings it resolved in lora_heads.json; restore them so
+        # predict_perturbations parses sets, caps predicted sets at the width seen in fine-tuning and drops
+        # the same control label without the caller repeating any of it.
         saved_delimiter = heads.get("pert_delimiter")
+        restored = {}
         if saved_delimiter is not None:
             base_delimiter = (model.training_config or {}).get("pert_delimiter")
             if base_delimiter is not None and base_delimiter != saved_delimiter:
                 raise ValueError(
                     f"adapter in {adapter_dir} was trained with pert_delimiter={saved_delimiter!r} but the base "
                     f"checkpoint has pert_delimiter={base_delimiter!r}")
-            model.training_config = OmegaConf.merge(
-                OmegaConf.create(model.training_config or {}), {"pert_delimiter": saved_delimiter})
+            restored["pert_delimiter"] = saved_delimiter
+            if heads.get("max_n_pert") is not None:
+                restored["max_n_pert"] = int(heads["max_n_pert"])
+            if heads.get("perturbation_control_value") is not None:
+                restored["perturbation_control_value"] = heads["perturbation_control_value"]
+        if pert_info is not None and pert_info.get("control_label") is not None:
+            # The new perturbation modules were built around this control; label parsing must use the same one.
+            restored["perturbation_control_value"] = pert_info["control_label"]
+        if restored:
+            model.training_config = OmegaConf.merge(OmegaConf.create(model.training_config or {}), restored)
         return PeftModel.from_pretrained(model, adapter_dir)
 
     def predict_cls(self, adata, input_layer_key: str = "X_binned"):
