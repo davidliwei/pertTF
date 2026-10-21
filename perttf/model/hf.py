@@ -927,18 +927,26 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         special_tokens = config.get("special_tokens", ["<pad>", "<cls>", "<eoc>"])
         vocab = SimpleVocab(adata.var.index.tolist(), special_tokens)
         vocab.set_default_index(vocab["<pad>"])
+        # One control label for everything: the unified encoder's zero row (control_label), label parsing and
+        # the training config (perturbation_control_value / pairing_config.control_value). An explicit
+        # control_label is propagated into the training config; conflicting values raise.
+        explicit_control = config.get("control_label", None)
+        configured_control = resolve_control_value(config, default=None)
+        if explicit_control is not None and configured_control is not None and explicit_control != configured_control:
+            raise ValueError(
+                f"control_label={explicit_control!r} conflicts with the configured control "
+                f"{configured_control!r} (perturbation_control_value / pairing_config.control_value)")
+        control = explicit_control or configured_control or "WT"
+        config = {**config, "control_label": control, "perturbation_control_value": control}
         # With pert_delimiter the dictionary holds single perturbations (as PertTFUniDataManager builds it),
         # so a label such as "A+B" contributes A and B; without it labels are opaque as before.
         pert_delimiter = config.get("pert_delimiter", None)
         if pert_delimiter is None:
             genotype_to_index = {g: i for i, g in enumerate(adata.obs["genotype"].unique())}
         else:
-            singles = unique_perturbations(adata.obs["genotype"].astype(str), pert_delimiter, resolve_control_value(config))
+            singles = unique_perturbations(adata.obs["genotype"].astype(str), pert_delimiter, control)
             genotype_to_index = {g: i for i, g in enumerate(singles)}
         cell_type_to_index = {c: i for i, c in enumerate(adata.obs["celltype"].unique())}
-        # The unified encoder fixes the control row to zero: name it after the configured control, which may
-        # not be "WT" (pairing_config.control_value / perturbation_control_value).
-        config = {"control_label": resolve_control_value(config), **config}
         return cls(vocab=vocab, genotype_to_index=genotype_to_index, cell_type_to_index=cell_type_to_index, **config)
 
     def run_train(

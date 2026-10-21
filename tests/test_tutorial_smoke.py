@@ -795,3 +795,19 @@ def test_lora_new_mode_cce_with_wider_mapping(pert_checkpoint, tmp_path):
         checkpoint_metric="mvc_next",  # random sets rarely reach 30 cells per group for pearson_delta
     )
     assert set(peft_model.get_base_model().genotype_to_index) == set(singles) | {"WT"}
+
+
+def test_from_adata_explicit_control_label_is_the_training_control():
+    """An explicit control_label becomes the control used for label parsing and training; a conflicting
+    configured control raises (Codex review on PR 71)."""
+    adata, singles = make_multi_adata("set")
+    adata.obs["genotype"] = adata.obs["genotype"].replace("WT", "ctrl")
+    hp = multi_hyperparameters("set")
+    assert "perturbation_control_value" not in hp
+    model = HFPerturbationTFModel.from_adata(adata, {**hp, "control_label": "ctrl"})
+    assert model.training_config.perturbation_control_value == "ctrl"
+    assert set(model.genotype_to_index) == set(singles) | {"ctrl"}
+    with pytest.raises(ValueError, match="control_label"):
+        HFPerturbationTFModel.from_adata(adata, {**hp, "control_label": "ctrl", "perturbation_control_value": "WT"})
+    with pytest.raises(ValueError, match="control_label"):
+        HFPerturbationTFModel.from_adata(adata, {**hp, "control_label": "ctrl", "pairing_config": {"control_value": "WT"}})
