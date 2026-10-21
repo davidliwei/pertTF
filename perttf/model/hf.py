@@ -1281,7 +1281,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             new_genotype_to_index = build_perturbation_mapping(
                 sorted(adata.obs["genotype"].astype(str).unique()), pert_sources,
                 control_label=control_value, delimiter=pert_delimiter)
-            lora.attach_new_pert_modules(self, new_genotype_to_index, pert_sources, distribution)
+            lora.attach_new_pert_modules(self, new_genotype_to_index, pert_sources, distribution, control_label=control_value)
             # Validation perturbations absent from training are only meaningful with features from a source;
             # otherwise their vector in the new encoder is never trained.
             genotype = adata.obs["genotype"].astype(str)
@@ -1305,6 +1305,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
                     for name, source in self.pert_encoder.source_config()["sources"].items()
                 },
                 "distribution": distribution,
+                "control_label": control_value,
             }
             config.GEPC = True
             config.distribution = distribution
@@ -1419,7 +1420,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             # Feature tables of the saved shape; their values are restored from the adapter with the trained weights.
             pert_sources = {name: (source["genes"], torch.zeros(len(source["genes"]), source["dim"]))
                             for name, source in pert_info["sources"].items()}
-            lora.attach_new_pert_modules(model, pert_info["genotype_to_index"], pert_sources, pert_info["distribution"])
+            lora.attach_new_pert_modules(model, pert_info["genotype_to_index"], pert_sources, pert_info["distribution"],
+                                         control_label=pert_info.get("control_label", "WT"))
         # An adapter trained with a per-call pert_delimiter (e.g. a legacy base fine-tuned on "A+B" labels)
         # recorded it in lora_heads.json; restore it so predict_perturbations parses sets without repeating it.
         saved_delimiter = heads.get("pert_delimiter")

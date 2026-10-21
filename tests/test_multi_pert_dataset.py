@@ -82,3 +82,16 @@ def test_multi_unknown_next_component_still_raises():
     ds = PertTFDataset(a, genotype_to_index={"WT": 0, "A": 1}, prediction_only=True, pert_delimiter="+")
     with pytest.raises(ValueError, match="Z"):
         ds[0]
+
+
+def test_max_n_pert_counts_only_rows_the_dataset_can_draw():
+    # Validation may hold wider sets than training; the training dataset's width (recorded as the
+    # inference cap) must come from its own rows, not from the whole AnnData (Codex review on PR 71).
+    a = tiny(["WT", "A", "A+B+C", "WT"])
+    train = PertTFDataset(a, indices=np.array([0, 1, 3]), next_cell_pred="identity", pert_delimiter="+")
+    assert train.max_n_pert == 1
+    valid = PertTFDataset(a, indices=np.array([2]), next_cell_pred="identity", pert_delimiter="+")
+    assert valid.max_n_pert == 3
+    assert valid[0]["perturbation_labels"].tolist() == [1, 2, 3]
+    everything = PertTFDataset(a, next_cell_pred="identity", pert_delimiter="+")
+    assert everything.max_n_pert == 3

@@ -121,9 +121,10 @@ class PertTFDataset(Dataset):
         resolved_pairing_config = dict(DEFAULT_PAIRING_CONFIG)
         if config is not None:
             resolved_pairing_config["pairing_seed"] = config.get("seed", None)
-            resolved_pairing_config["control_value"] = config.get(
-                "perturbation_control_value", resolved_pairing_config["control_value"]
-            )
+            # pairing_config.control_value first, then perturbation_control_value: the same control for
+            # pairing, canonicalisation and splitting, also for prediction-only datasets.
+            resolved_pairing_config["control_value"] = resolve_control_value(
+                config, default=resolved_pairing_config["control_value"])
             if not prediction_only:
                 resolved_pairing_config.update(dict(config.get("pairing_config", {}) or {}))
         if not prediction_only:
@@ -165,13 +166,9 @@ class PertTFDataset(Dataset):
             if "genotype_next" in self.adata.obs
             else None
         )
-        self.max_n_pert = 1
-        if self.pert_delimiter is not None:
-            self.max_n_pert = max(
-                max_set_size(self.genotype_values, self.pert_delimiter, self.control_value),
-                max_set_size(self.genotype_next_values, self.pert_delimiter, self.control_value)
-                if self.genotype_next_values is not None else 1,
-            )
+        # Largest set among the rows this dataset can draw (its own indices plus any pairing source/target
+        # rows), so a training dataset's width, recorded as the inference cap, never includes validation labels.
+        self.max_n_pert = self._compute_max_n_pert(indices, source_indices, target_indices)
         self._set_pairing(indices, source_indices, target_indices)
         self.expr_layer = expr_layer
         
@@ -231,6 +228,16 @@ class PertTFDataset(Dataset):
         assert 'genotype' in self.adata.obs.columns and 'celltype' in self.adata.obs.columns, 'no genotype or celltype column found in anndata'
         add_batch_info(self.adata)
 
+    def _compute_max_n_pert(self, *index_groups) -> int:
+        if self.pert_delimiter is None:
+            return 1
+        groups = [np.asarray(g, dtype=np.int64) for g in index_groups if g is not None]
+        rows = np.unique(np.concatenate(groups)) if groups else np.arange(self.adata.n_obs)
+        width = max_set_size(self.genotype_values[rows], self.pert_delimiter, self.control_value)
+        if self.genotype_next_values is not None:
+            width = max(width, max_set_size(self.genotype_next_values[rows], self.pert_delimiter, self.control_value))
+        return width
+
     def _set_pairing(self, indices, source_indices=None, target_indices=None):
         self.pairing = ContextAwarePairing(
             self.adata,
@@ -246,7 +253,9 @@ class PertTFDataset(Dataset):
         return self.pairing.pairs
 
     def set_new_indices(self, indices):
-        self._set_pairing(np.asarray(indices, dtype=np.int64))
+        indices = np.asarray(indices, dtype=np.int64)
+        self.max_n_pert = self._compute_max_n_pert(indices)
+        self._set_pairing(indices)
 
     def get_adata_subset(self, next_cell_pred = 'identity'):
         assert next_cell_pred in ['pert', 'identity', "lochness"], 'next_cell_pred can only be identity or pert or lochness'

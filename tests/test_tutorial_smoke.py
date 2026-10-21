@@ -677,3 +677,25 @@ def test_from_adata_run_train_multi(tmp_path):
     query.obs["genotype_next"] = "A+C"
     result = reloaded.predict_perturbations(query, prediction_mode="mean", device=DEVICE)
     assert result.obsm["mvc_next_expr"].shape == query.shape
+
+
+def test_lora_new_mode_uses_configured_control(pert_checkpoint, tmp_path):
+    """pert_mode="new" with a control other than WT: the new perturbation modules are built around the
+    configured control and the adapter records it for reloading (Codex review on PR 71)."""
+    pytest.importorskip("peft")
+    model = HFPerturbationTFModel.from_pretrained(str(pert_checkpoint["hf_dir"]))
+    model.training_config = OmegaConf.merge(model.training_config, {"perturbation_control_value": "ctrl"})
+    adata, singles = make_multi_adata("set")
+    adata.obs["genotype"] = adata.obs["genotype"].replace("WT", "ctrl")
+    is_t1 = (adata.obs["celltype"] == "T1").to_numpy()
+    adapter_dir = tmp_path / "ctrl_new_adapter"
+    model.run_lora_pert_train(
+        adata, np.where(~is_t1)[0], np.where(is_t1)[0], epochs=1, batch_size=32,
+        lora_config=model.build_lora_config(r=4, lora_alpha=8, lora_dropout=0.0),
+        save_dir=str(adapter_dir), seed=0, device=DEVICE, pert_delimiter="+", pert_mode="new", distribution=None,
+    )
+    heads = json.loads((adapter_dir / "lora_heads.json").read_text())
+    assert heads["pert_info"]["control_label"] == "ctrl"
+    assert set(heads["pert_info"]["genotype_to_index"]) == set(singles) | {"ctrl"}
+    loaded = HFPerturbationTFModel.load_lora_adapter(str(pert_checkpoint["hf_dir"]), str(adapter_dir))
+    assert loaded.get_base_model().pert_encoder.control_label == "ctrl"

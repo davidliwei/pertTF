@@ -103,11 +103,13 @@ def label_mappings(model, adata: AnnData, require_known, delimiter: Optional[str
     return mappings["celltype"], mappings["genotype"]
 
 
-def attach_new_pert_modules(model, genotype_to_index: Dict[str, int], pert_sources: dict, distribution: Optional[str]) -> None:
+def attach_new_pert_modules(model, genotype_to_index: Dict[str, int], pert_sources: dict, distribution: Optional[str],
+                            control_label: str = "WT") -> None:
     """
     run_lora_pert_train(pert_mode='new'): replace the perturbation encoder, the perturbed-cell encoder and the
     expression decoder with untrained modules for a new perturbation dictionary and expression distribution.
-    Used for training and again by load_lora_adapter, before the trained weights are loaded.
+    Used for training and again by load_lora_adapter, before the trained weights are loaded. control_label is the
+    configured control (pairing_config.control_value / perturbation_control_value), which the new encoder fixes to zero.
     """
     from omegaconf import OmegaConf
     from .modules import MVCDecoder, PertExpEncoder
@@ -115,7 +117,7 @@ def attach_new_pert_modules(model, genotype_to_index: Dict[str, int], pert_sourc
 
     pert_dim = model.d_model if model.pert_dim is None else model.pert_dim
     model.genotype_to_index = genotype_to_index
-    model.pert_encoder = UnifiedPertEncoder(pert_sources, genotype_to_index, pert_dim, control_label="WT")
+    model.pert_encoder = UnifiedPertEncoder(pert_sources, genotype_to_index, pert_dim, control_label=control_label)
     model.pert_exp_encoder = PertExpEncoder(model.d_model, model.pert_dim)
     model.mvc_decoder = MVCDecoder(
         model.d_model,
