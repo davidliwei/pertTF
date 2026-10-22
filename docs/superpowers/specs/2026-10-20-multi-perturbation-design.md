@@ -255,8 +255,11 @@ fallback mapping and `__getitem__`, `build_perturbation_mapping`, `lora.label_ma
   consistent within a dataset.
 - **[builder-check fix]** `virtual_screen_src2dest` filters candidates with
   `genotype_to_index.keys()`; it switches to `labels_in_mapping` so `"A+B"` candidates are
-  screened. `composition_change_analysis.py` and `generate_pert_embeddings` use single genes
-  and need no change.
+  screened. `generate_pert_embeddings` uses single genes and needs no change.
+  *(Correction, 2026-10-22:* `calculate_lonESS_score` in `composition_change_analysis.py` did
+  need a change: it matched whole labels, so at high MOI it returned ≈ −1 everywhere or raised
+  `KeyError`. It now takes `pert_delimiter` (membership matching) and has a per-perturbation
+  summary, `lochness_by_perturbation`.)
 
 ## 4. File-by-file change list
 

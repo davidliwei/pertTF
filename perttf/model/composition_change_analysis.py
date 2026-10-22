@@ -1,56 +1,172 @@
+import warnings
+
 import torch
 import scanpy as sc
 import numpy as np
 import pandas as pd
+from scipy import sparse
 from perttf.model.train_function import eval_testdata
+from perttf.utils.pert_labels import split_perturbation_label
+
+def _carrier_matrix(labels, pert_delimiter=None, control_value="WT"):
+    """Sparse cells x groups 0/1 membership. Groups are whole labels when ``pert_delimiter`` is None,
+    otherwise perturbation components (a cell labelled "A+B" carries both A and B)."""
+    labels = np.asarray(labels).astype(str)
+    uniq, inverse = np.unique(labels, return_inverse=True)
+    if pert_delimiter is None:
+        components = [(label,) for label in uniq]
+    else:
+        components = [split_perturbation_label(label, pert_delimiter, control_value) for label in uniq]
+    groups = sorted({c for comps in components for c in comps})
+    index = {g: j for j, g in enumerate(groups)}
+    rows = [i for i, comps in enumerate(components) for _ in comps]
+    cols = [index[c] for comps in components for c in comps]
+    label_to_group = sparse.csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(len(uniq), len(groups)))
+    return label_to_group[inverse.ravel()].tocsr(), groups
+
+
+def _neighbor_indicator(adata, nn_key):
+    """0/1 kNN adjacency from a distances matrix: nonzero entries are edges, self-edges are dropped
+    (whatever their stored value)."""
+    adjacency = sparse.csr_matrix(adata.obsp[nn_key], dtype=np.float64, copy=True)
+    adjacency.data = (adjacency.data != 0).astype(np.float64)
+    adjacency = (adjacency - sparse.diags(adjacency.diagonal())).tocsr()
+    adjacency.eliminate_zeros()
+    return adjacency
+
+
+def _carrier_neighbor_counts(adjacency, membership, chunk_size=4096):
+    """Per cell and group: number of the cell's neighbours carrying the group, restricted to the groups
+    the cell itself carries (rows chunked; at most n_neighbors x perturbations-per-cell entries per row)."""
+    out = []
+    for start in range(0, adjacency.shape[0], chunk_size):
+        rows = slice(start, start + chunk_size)
+        out.append((adjacency[rows] @ membership).multiply(membership[rows]))
+    return sparse.vstack(out).tocsr()
+
+
+def _group_fractions(groups, membership, overall_fraction_dict):
+    if overall_fraction_dict is None:
+        return np.asarray(membership.sum(axis=0)).ravel() / membership.shape[0]
+    missing = [g for g in groups if g not in overall_fraction_dict]
+    if missing:
+        raise ValueError(f"overall_fraction_dict has no entry for: {missing[:10]}")
+    fractions = np.array([overall_fraction_dict[g] for g in groups], dtype=np.float64)
+    fractions[fractions == 0] = 0.0001
+    return fractions
+
 
 def calculate_lonESS_score(adata, overall_fraction_dict=None,
                            recalculate_nn=False,
                            nn_name=None,
                            n_neighbors=30,
-                           target_genotype = None,
+                           target_genotype=None,
                            n_pcs=20,
-                           delta = 0.0001,
+                           delta=0.0001,
+                           pert_delimiter=None,
+                           control_value="WT",
+                           min_expected_neighbors=1.0,
                            ):
-  """
-  calculate the lochNESS score for a single cell
-  """
-  n_cells = adata.n_obs
-  # calculate the overall fraction
-  if overall_fraction_dict is None:
-    overall_fraction = adata.obs['genotype'].value_counts(normalize=True)
-    # convert overall_fraction into a dictionary structure
-    overall_fraction_dict = overall_fraction.to_dict()
+    """Per-cell lochNESS score: local enrichment of a perturbation among a cell's kNN neighbours.
 
-  if recalculate_nn:
-    sc.pp.neighbors(adata, n_neighbors=n_neighbors, n_pcs=n_pcs,key_added=nn_name)
-  nn_key='distances' if nn_name is None else f'{nn_name}_distances'
-  # iterate each cell
+    score = (neighbours carrying g) / n_neighbors / (overall fraction of cells carrying g) - 1, where g is
+    ``target_genotype`` for every cell, or each cell's own genotype when ``target_genotype`` is None.
+    Optional Gaussian noise of SD ``delta`` is added (ties breaker for training targets).
 
-  lowess_vec=[]
-  for cell_id in adata.obs_names:
-    cell_index = adata.obs_names.get_loc(cell_id)
+    Multi-perturbation labels: with ``pert_delimiter`` (e.g. "+"), "carrying g" means g is a component
+    of the cell's label, ``target_genotype`` must be a single component, and the own-genotype score of a
+    cell with several components is the mean of its per-component scores. Without ``pert_delimiter``
+    labels are matched whole (the original behaviour, identical results).
+
+    ``n_neighbors`` is the denominator as in the original score, although a graph from
+    ``sc.pp.neighbors(n_neighbors=k)`` holds k - 1 neighbours per cell once the cell itself is excluded, so
+    randomly placed labels score about -1/k rather than 0 (a constant shift; ``lochness_by_perturbation`` uses the
+    graph's actual neighbour counts).
+
+    Warns when the expected number of carrier neighbours (n_neighbors x carrier fraction) is below
+    ``min_expected_neighbors`` (None disables): the per-cell score is then dominated by counting noise,
+    as with genome-wide high-MOI screens (~0.1-0.2 expected carriers among 300 neighbours).
+
+    Returns a list with one score per cell (in ``adata.obs_names`` order).
+    """
+    if recalculate_nn:
+        sc.pp.neighbors(adata, n_neighbors=n_neighbors, n_pcs=n_pcs, key_added=nn_name)
+    nn_key = 'distances' if nn_name is None else f'{nn_name}_distances'
+    membership, groups = _carrier_matrix(adata.obs['genotype'].to_numpy(), pert_delimiter, control_value)
+    adjacency = _neighbor_indicator(adata, nn_key)
+
     if target_genotype is not None:
-      cell_genotype=target_genotype
+        target = str(target_genotype)
+        if pert_delimiter is not None and pert_delimiter in target:
+            raise ValueError(f"target_genotype must be a single perturbation with pert_delimiter set, got {target!r}")
+        if target in groups:
+            j = groups.index(target)
+            counts = np.asarray(adjacency @ membership[:, j].toarray()).ravel()
+            fraction = _group_fractions([target], membership[:, [j]], overall_fraction_dict)[0]
+        elif overall_fraction_dict is not None and target in overall_fraction_dict:
+            counts = np.zeros(adata.n_obs)
+            fraction = _group_fractions([target], None, overall_fraction_dict)[0]
+        else:
+            hint = "" if pert_delimiter is not None else " (multi-perturbation labels need pert_delimiter)"
+            raise ValueError(f"target_genotype {target!r} is not carried by any cell{hint}")
+        scores = counts / n_neighbors / fraction - 1
+        expected = n_neighbors * fraction
     else:
-      cell_genotype=adata.obs.loc[cell_id,'genotype']
-    neighboring_vec = adata.obsp[nn_key][cell_index, :]
-    indices = neighboring_vec.nonzero()[1]
-    neighboring_cells = adata.obs.index[indices]
-    neighboring_genotypes = sum(adata.obs.loc[neighboring_cells, 'genotype'] == cell_genotype)
-    lonESS_score = neighboring_genotypes / n_neighbors
-    overall_score = overall_fraction_dict[cell_genotype]
+        fractions = _group_fractions(groups, membership, overall_fraction_dict)
+        weighted = _carrier_neighbor_counts(adjacency, membership) @ (1.0 / fractions)
+        n_components = np.asarray(membership.sum(axis=1)).ravel()
+        scores = weighted / n_neighbors / n_components - 1
+        expected = float(np.median((membership @ (n_neighbors * fractions)) / n_components))
 
-    #loness_score_adjusted = lonESS_score - overall_score
-    if overall_score ==0:
-      overall_score = 0.0001
-    lonESS_score_adjusted = lonESS_score / overall_score -1
-    # generate a random noise and added to the score
+    if min_expected_neighbors is not None and expected < min_expected_neighbors:
+        warnings.warn(
+            f"lochNESS: expected carrier neighbours per cell = {expected:.3g} (< {min_expected_neighbors}); "
+            "the per-cell score is dominated by counting noise. Use more neighbours, pool perturbations, "
+            "or summarise per perturbation (lochness_by_perturbation).",
+            stacklevel=2,
+        )
     if delta > 0:
-      noise = np.random.normal(0, delta)
-      lonESS_score_adjusted += noise
-    lowess_vec.append(lonESS_score_adjusted)
-  return lowess_vec
+        scores = scores + np.random.normal(0, delta, size=scores.size)
+    return scores.tolist()
+
+
+def lochness_by_perturbation(adata, nn_name=None, pert_delimiter=None, control_value="WT", min_cells=1):
+    """Per-perturbation lochNESS summary: do the carriers of g sit next to each other?
+
+    For each perturbation g carried by >= ``min_cells`` cells (components when ``pert_delimiter`` is set):
+      n_carriers                  cells carrying g (m);
+      expected_neighbors_per_cell expected / m: carrier neighbours a carrier expects under random placement
+                                  (counting noise dominates the per-cell score when this is << 1);
+      observed                    total carriers of g among the neighbours of g's carriers;
+      expected                    E x m (m - 1) / (n (n - 1)), the same total under random placement of the labels,
+                                  with E the number of edges in the graph (self excluded). For k neighbours per cell
+                                  this is m x k x (m - 1) / (n - 1); note that ``sc.pp.neighbors(n_neighbors=k)``
+                                  stores k - 1 neighbours per cell;
+      enrichment                  observed / expected - 1 (0 under random placement; approximately the
+                                  carrier-mean of calculate_lonESS_score shifted by 1/k, see its docstring).
+    Pooling over carriers gives ~m x expected_neighbors_per_cell counts per perturbation, so the summary is
+    measurable where the per-cell score is not. Cells carrying more perturbations can co-localise (e.g. if
+    guide capture tracks cell state): compare small enrichments with size-matched random carrier sets.
+    Uses the kNN graph in ``adata.obsp`` (``nn_name``), self excluded. Returns a DataFrame indexed by g.
+    """
+    nn_key = 'distances' if nn_name is None else f'{nn_name}_distances'
+    membership, groups = _carrier_matrix(adata.obs['genotype'].to_numpy(), pert_delimiter, control_value)
+    adjacency = _neighbor_indicator(adata, nn_key)
+    n = adata.n_obs
+    m = np.asarray(membership.sum(axis=0)).ravel()
+    observed = np.asarray(_carrier_neighbor_counts(adjacency, membership).sum(axis=0)).ravel()
+    expected = adjacency.nnz * m * (m - 1) / max(n * (n - 1), 1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        enrichment = np.where(expected > 0, observed / expected - 1, np.nan)
+    table = pd.DataFrame({
+        "n_carriers": m.astype(int),
+        "expected_neighbors_per_cell": np.divide(expected, m, out=np.zeros_like(expected), where=m > 0),
+        "observed": observed,
+        "expected": expected,
+        "enrichment": enrichment,
+    }, index=pd.Index(groups, name="perturbation"))
+    return table[table.n_carriers >= min_cells]
+
 
 def generate_lochness_ranking( adata_wt, candidate_genes,
                              model, gene_ids, cell_type_to_index, genotype_to_index, vocab,
