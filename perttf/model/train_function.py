@@ -748,6 +748,8 @@ def eval_testdata(
     logger = create_logger() if logger is None else logger
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device)  # accept "cpu" / "cuda:0" strings; batching reads device.type
 
     adata_t = adata_t.copy()
     cell_type_to_index = train_data_dict["cell_type_to_index"]

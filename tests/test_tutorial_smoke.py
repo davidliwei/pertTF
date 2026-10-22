@@ -309,7 +309,8 @@ def test_lora_pert_tutorial(adata, pert_checkpoint, tmp_path):
 
 # --- virtual_pooled_screen.ipynb ------------------------------------------------------------
 
-def test_virtual_screen_tutorial(adata, pert_checkpoint):
+@pytest.mark.parametrize("device", [DEVICE, "cpu"], ids=["torch_device", "str_device"])
+def test_virtual_screen_tutorial(adata, pert_checkpoint, device):
     from perttf.utils.virtual_screen import virtual_screen_src2dest
 
     model, config = pert_checkpoint["model"], pert_checkpoint["config"]
@@ -322,7 +323,7 @@ def test_virtual_screen_tutorial(adata, pert_checkpoint):
         a.obs["genotype_next"] = a.obs["genotype"].astype("category")
     results = virtual_screen_src2dest(
         adata_src, adata_des, model, vocab, config, running_parameters,
-        screen_genes=["A", "B", "NOT_A_GENE"], device=DEVICE,
+        screen_genes=["A", "B", "NOT_A_GENE"], device=device,
         n_expands_per_epoch=1, n_epoch=1, wt_pred_next_label="A",
     )
     ranked = results["sim_ranked"]
