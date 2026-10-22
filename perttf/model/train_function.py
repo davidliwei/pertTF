@@ -26,6 +26,7 @@ from ..utils.logger import create_logger
 import matplotlib.pyplot as plt
 
 from ..utils.set_optimizer import create_optimizer_dict
+from .ontarget import ontarget_loss
 from ..custom_loss import (
     cce_loss, 
     criterion_neg_log_bernoulli, 
@@ -237,6 +238,17 @@ def train(model: nn.Module,
                 )
                 loss = loss + config.next_weight * loss_gepc_next
                 metrics_to_log.update({"train/mvc_next": loss_gepc_next.item()})
+                # on-target supervision: the perturbed gene's own position in the next-cell prediction
+                ot_weight = config.get('ontarget_weight', 0) if hasattr(config, 'get') else getattr(config, 'ontarget_weight', 0)
+                pert_gene_token = getattr(model, 'pert_gene_token', None)
+                if ot_weight and pert_gene_token is not None and perturbation_labels_next is not None:
+                    loss_ontarget, n_ontarget = ontarget_loss(
+                        output_dict["mvc_output_next"]["pred"], target_values_next,
+                        input_gene_ids, perturbation_labels_next, pert_gene_token,
+                    )
+                    if n_ontarget:
+                        loss = loss + ot_weight * loss_ontarget
+                        metrics_to_log.update({"train/ontarget": loss_ontarget.item(), "train/ontarget_n": n_ontarget})
                 
                 if config.explicit_zero_prob and config.distribution is None:
                     loss_gepc_zero_log_prob = criterion_neg_log_bernoulli(

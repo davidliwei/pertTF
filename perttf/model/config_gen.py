@@ -69,6 +69,8 @@ def generate_config(parameter_dict,
     parameter_dict['pert_pred_threshold'] = parameter_dict.get('pert_pred_threshold', 0.5)
     parameter_dict['pert_bce_pos_weight'] = parameter_dict.get('pert_bce_pos_weight', None)
     parameter_dict['max_perts_per_cell'] = parameter_dict.get('max_perts_per_cell', None)
+    # on-target supervision of the next-cell prediction (0 = off, the previous behaviour)
+    parameter_dict['ontarget_weight'] = parameter_dict.get('ontarget_weight', 0.0)
     if parameter_dict['next_cell_pred_type'] == 'identity':
       parameter_dict['next_weight'] = 0
     #mask_ratio = config.mask_ratio
