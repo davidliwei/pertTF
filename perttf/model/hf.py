@@ -73,6 +73,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         pert_pad_id: Optional[int] = None,
         pert_dim: Optional[int] = None,
         pert_aggregation: str = "sum",
+        cell_emb_norm: str = "none",
         distribution: Optional[str] = None,
         pert_sources: Optional[Dict] = None,
         control_label: str = "WT",
@@ -179,6 +180,7 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
             pert_pad_id=pert_pad_id,
             pert_dim=pert_dim,
             pert_aggregation=pert_aggregation,
+            cell_emb_norm=cell_emb_norm,
             pert_features=self.pert_features,
             # Note: We do NOT pass **kwargs here, so parent doesn't see extra params.
         )

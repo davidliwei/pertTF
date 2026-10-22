@@ -41,6 +41,8 @@ class PerturbationTFModel(BaseModel):
         # MLP instead of an independent lookup row, so novel (unseen-in-training)
         # conditions get a meaningful embedding -> enables zero-shot (regime-A) prediction.
         self.pert_features = kwargs.pop("pert_features", None)
+        # normalisation of the CELL side of the next-cell concatenation (see below); 'none' = previous behaviour
+        self.cell_emb_norm_kind = kwargs.pop("cell_emb_norm", "none")
         super().__init__(*args, **kwargs)
         # add perturbation encoder
         # variables are defined in super class
@@ -53,6 +55,25 @@ class PerturbationTFModel(BaseModel):
         else:
             self.pert_encoder = PertLabelEncoder(n_pert, pert_dim, padding_idx=self.pert_pad_id)
         self.pert_exp_encoder = PertExpEncoder(d_model, self.pert_dim) 
+        # The perturbation encoder ends in nn.LayerNorm(pert_dim), so the gene side of the concatenation reaches
+        # pert_exp_encoder at ~unit scale per dimension, while cell_emb enters raw (~0.05 per dimension across
+        # cells on the pancreatic models). Measurements on trained checkpoints show the next-cell prediction then
+        # varies 11-75x less across cells than across genes, i.e. the prediction is almost cell-independent.
+        # This optionally normalises the cell side before the concatenation:
+        #   'none'      raw cell_emb (the previous behaviour, and the default)
+        #   'layernorm' nn.LayerNorm(d_model) -- symmetric with the gene side, but cell_emb is the CLS output of
+        #               a post-LN transformer and is therefore already standardised per cell, so this is close to
+        #               a no-op (exactly one for an untrained transformer; see tests/test_cell_emb_norm.py)
+        #   'batchnorm' nn.BatchNorm1d(d_model) -- standardises each dimension ACROSS cells, i.e. it amplifies the
+        #               deviations from the batch mean, which is what the cell side is actually short of
+        if self.cell_emb_norm_kind in (None, "none"):
+            self.cell_emb_norm = nn.Identity()
+        elif self.cell_emb_norm_kind == "layernorm":
+            self.cell_emb_norm = nn.LayerNorm(d_model)
+        elif self.cell_emb_norm_kind == "batchnorm":
+            self.cell_emb_norm = nn.BatchNorm1d(d_model)
+        else:
+            raise ValueError(f"cell_emb_norm must be none/layernorm/batchnorm, got {self.cell_emb_norm_kind!r}")
         # the following is the perturbation decoder
         #n_pert = kwargs.get("n_perturb", 1) 
         #nlayers_pert = kwargs.get("nlayers_perturb", 3) 
@@ -307,7 +328,7 @@ class PerturbationTFModel(BaseModel):
                 raise ValueError("pert_embeddings_next must have shape (batch_size, pert_dim)")
             tf_concat=torch.cat(
                 [
-                    cell_emb_orig,
+                    self.cell_emb_norm(cell_emb_orig),
                     pert_emb_next,
                 ],
                 dim=1,
