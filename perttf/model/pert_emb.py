@@ -286,7 +286,8 @@ def generate_pert_embeddings(adata_src, adata_tg, candidate_genes,
                                                       "genotype_to_index":genotype_to_index,
                                                       "vocab":vocab,},
                                     config = config,
-                                    make_plots=False)
+                                    make_plots=False,
+                                    device=device)
         #
         a_eva=eval_results_0 #['adata']
         cell_emb_data=a_eva.obsm['X_scGPT_next'] #[:10000,:]

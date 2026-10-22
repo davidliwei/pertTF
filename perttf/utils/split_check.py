@@ -62,16 +62,34 @@ def check_train_valid_split(
         if missing_columns:
             raise ValueError(f"AnnData is missing split-check columns: {missing_columns}")
 
+        # With multi-perturbation labels in single-unit mode the model sees components, and whole
+        # set labels are ~unique per cell at high MOI: compare components, and only warn about
+        # validation-only ones (the pert-mode check reports them as unseen_perturbation).
+        by_component = pert_delimiter is not None and perturbation_unit == "single"
+
+        def _values(obs, column):
+            values = set(obs[column].dropna().unique())
+            if by_component and column == perturbation_col:
+                values = {
+                    component
+                    for label in values
+                    for component in split_perturbation_label(str(label), pert_delimiter, control_value)
+                }
+            return values
+
         column_coverage = {}
         for column in columns:
-            train_values = set(adata.obs.iloc[train_indices][column].dropna().unique())
-            valid_values = set(adata.obs.iloc[valid_indices][column].dropna().unique())
             if adata.obs.iloc[np.concatenate([train_indices, valid_indices])][column].isna().any():
                 raise ValueError(f"Split-check column {column!r} contains missing values")
+            train_values = _values(adata.obs.iloc[train_indices], column)
+            valid_values = _values(adata.obs.iloc[valid_indices], column)
             valid_only = sorted(valid_values - train_values, key=str)
             train_only = sorted(train_values - valid_values, key=str)
             if valid_only:
-                raise ValueError(f"Validation {column!r} values are absent from training: {valid_only}")
+                if by_component and column == perturbation_col:
+                    _warn_groups(f"Validation {column!r} components absent from training", valid_only)
+                else:
+                    raise ValueError(f"Validation {column!r} values are absent from training: {valid_only}")
             if train_only:
                 _warn_groups(f"Training {column!r} values absent from validation", train_only)
             column_coverage[column] = {

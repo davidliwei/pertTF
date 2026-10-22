@@ -113,21 +113,29 @@ class GroupMoments:
         if values.ndim != 2 or values.shape[0] != contexts.size or contexts.size != perturbations.size:
             raise ValueError("Expression rows, contexts, and perturbations must align")
 
-        keys = np.asarray(
-            [(str(context), str(perturbation)) for context, perturbation in zip(contexts, perturbations)],
-            dtype=object,
-        )
-        for key in sorted(set(map(tuple, keys)), key=str):
-            mask = np.fromiter((tuple(row) == key for row in keys), dtype=bool)
-            block = values[mask]
+        if values.shape[0] == 0:
+            return
+        # One pass over the rows: sort by group, then sum contiguous blocks. A per-group boolean
+        # mask is O(rows x groups), which stalls with perturbation_unit="single" at high MOI.
+        keys = np.stack([contexts.astype(str), perturbations.astype(str)], axis=1)
+        unique_keys, inverse = np.unique(keys, axis=0, return_inverse=True)
+        inverse = inverse.ravel()
+        order = np.argsort(inverse, kind="stable")
+        starts = np.flatnonzero(np.r_[True, np.diff(inverse[order]) != 0])
+        sorted_values = values[order]
+        counts = np.diff(np.r_[starts, order.size])
+        value_sums = np.add.reduceat(sorted_values, starts, axis=0)
+        square_sums = np.add.reduceat(np.square(sorted_values), starts, axis=0)
+        for j, (context, perturbation) in enumerate(unique_keys):
+            key = (str(context), str(perturbation))
             n, value_sum, square_sum = self._moments.get(
                 key,
                 (0, np.zeros(values.shape[1], dtype=np.float64), np.zeros(values.shape[1], dtype=np.float64)),
             )
             self._moments[key] = (
-                n + block.shape[0],
-                value_sum + block.sum(axis=0),
-                square_sum + np.square(block).sum(axis=0),
+                n + int(counts[j]),
+                value_sum + value_sums[j],
+                square_sum + square_sums[j],
             )
 
     def finalize(self) -> Dict[Tuple[str, str], GroupStats]:
