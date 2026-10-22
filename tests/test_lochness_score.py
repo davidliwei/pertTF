@@ -120,13 +120,39 @@ def test_low_count_warning():
 def test_lochness_by_perturbation_counts():
     a, nb = _multi_adata()
     labels = list(a.obs.genotype)
-    t = lochness_by_perturbation(a, n_neighbors=3, pert_delimiter="+")
+    t = lochness_by_perturbation(a, pert_delimiter="+")
     for g in ["A", "B", "C", "WT"]:
         car = [i for i, x in enumerate(labels) if _carries(x, g)]
         obs = sum(_carries(labels[j], g) for i in car for j in np.where(nb[i])[0])
         m = len(car)
         assert t.loc[g, "n_carriers"] == m and t.loc[g, "observed"] == obs
         assert t.loc[g, "expected"] == pytest.approx(m * 3 * (m - 1) / 7)
+        assert t.loc[g, "expected_neighbors_per_cell"] == pytest.approx(3 * (m - 1) / 7)
+
+
+def test_lochness_by_perturbation_expected_matches_permutation_mean():
+    rng = np.random.default_rng(5)
+    n = 12
+    labels = ["A", "A+B", "B", "WT", "A", "C", "B+C", "WT", "A+C", "WT", "B", "C"]
+    D = np.zeros((n, n))
+    for i in range(n):                                   # variable degree (1-6), self excluded
+        nb = rng.choice([j for j in range(n) if j != i], int(rng.integers(1, 7)), replace=False)
+        D[i, nb] = 1.0
+    t = lochness_by_perturbation(_labelled(labels, D), pert_delimiter="+")
+    perm_obs = []
+    for _ in range(3000):
+        perm = list(rng.permutation(labels))
+        perm_obs.append(lochness_by_perturbation(_labelled(perm, D), pert_delimiter="+").observed)
+    perm_mean = pd.concat(perm_obs, axis=1).mean(axis=1)
+    for g in ["A", "B", "C", "WT"]:
+        assert t.loc[g, "expected"] == pytest.approx(perm_mean[g], rel=0.05)
+
+
+def _labelled(labels, D):
+    a = ad.AnnData(X=np.zeros((len(labels), 2), dtype=np.float32),
+                   obs=pd.DataFrame({"genotype": labels}, index=[f"c{i}" for i in range(len(labels))]))
+    a.obsp["distances"] = sparse.csr_matrix(D)
+    return a
 
 
 def test_lochness_by_perturbation_null_centred():
@@ -134,6 +160,6 @@ def test_lochness_by_perturbation_null_centred():
     n = 3000
     labels = ["+".join(rng.choice([f"g{i}" for i in range(40)], 3, replace=False)) for _ in range(n)]
     a = ad.AnnData(X=rng.normal(size=(n, 8)).astype(np.float32), obs=pd.DataFrame({"genotype": labels}, index=[f"c{i}" for i in range(n)]))
-    sc.pp.neighbors(a, n_neighbors=30, use_rep="X")
-    t = lochness_by_perturbation(a, n_neighbors=30, pert_delimiter="+")
-    assert abs(t.enrichment.mean()) < 0.05              # random labels: no co-localisation
+    sc.pp.neighbors(a, n_neighbors=15, use_rep="X")     # stores 14 neighbours per cell
+    t = lochness_by_perturbation(a, pert_delimiter="+")
+    assert abs(t.enrichment.mean()) < 0.03              # random labels: no co-localisation (k-based expectation: -1/15)

@@ -124,12 +124,12 @@ from perttf.model.composition_change_analysis import calculate_lonESS_score, loc
 sc.pp.neighbors(adata, n_neighbors=300, key_added="nn_300")
 adata.obs["lonESS_score_A"] = calculate_lonESS_score(
     adata, nn_name="nn_300", n_neighbors=300, target_genotype="A", pert_delimiter="+")
-summary = lochness_by_perturbation(adata, nn_name="nn_300", n_neighbors=300, pert_delimiter="+", min_cells=20)
+summary = lochness_by_perturbation(adata, nn_name="nn_300", pert_delimiter="+", min_cells=20)
 ```
 
 - `target_genotype` must be a single component; without `target_genotype`, a cell's score is the mean of its per-component scores.
 - **Check the counts before using per-cell scores.** A cell expects `n_neighbors × (fraction of cells carrying g)` carriers among its neighbours. In a genome-wide high-MOI screen that is ~0.1–0.2 even with 300 neighbours, so most per-cell scores sit at −1 and one carrier neighbour moves a cell to ≈ +9. The function warns when the expected count is below `min_expected_neighbors` (default 1). This count depends on the MOI and the number of targets, not on how many cells you have.
-- `lochness_by_perturbation` pools the counts over all carriers of each perturbation (observed vs expected under random placement, `enrichment = observed / expected − 1`). Pooling gives far more counts per perturbation than any single cell has, so prefer it at high MOI. Check it against random carrier sets of the same size before reading small enrichments.
+- `lochness_by_perturbation` pools the counts over all carriers of each perturbation (observed vs expected under random placement, `enrichment = observed / expected − 1`; the expectation uses the graph's actual neighbour counts, k − 1 per cell for `sc.pp.neighbors(n_neighbors=k)`). Pooling gives far more counts per perturbation than any single cell has, so prefer it at high MOI. Check it against random carrier sets of the same size before reading small enrichments.
 
 ### What raises
 - A malformed label (empty or whitespace-padded component): `ValueError` listing the labels.

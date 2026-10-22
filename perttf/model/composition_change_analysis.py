@@ -76,6 +76,11 @@ def calculate_lonESS_score(adata, overall_fraction_dict=None,
     cell with several components is the mean of its per-component scores. Without ``pert_delimiter``
     labels are matched whole (the original behaviour, identical results).
 
+    ``n_neighbors`` is the denominator as in the original score, although a graph from
+    ``sc.pp.neighbors(n_neighbors=k)`` holds k - 1 neighbours per cell once the cell itself is excluded, so
+    randomly placed labels score about -1/k rather than 0 (a constant shift; ``lochness_by_perturbation`` uses the
+    graph's actual neighbour counts).
+
     Warns when the expected number of carrier neighbours (n_neighbors x carrier fraction) is below
     ``min_expected_neighbors`` (None disables): the per-cell score is then dominated by counting noise,
     as with genome-wide high-MOI screens (~0.1-0.2 expected carriers among 300 neighbours).
@@ -123,18 +128,20 @@ def calculate_lonESS_score(adata, overall_fraction_dict=None,
     return scores.tolist()
 
 
-def lochness_by_perturbation(adata, nn_name=None, n_neighbors=30, pert_delimiter=None, control_value="WT",
-                             min_cells=1):
+def lochness_by_perturbation(adata, nn_name=None, pert_delimiter=None, control_value="WT", min_cells=1):
     """Per-perturbation lochNESS summary: do the carriers of g sit next to each other?
 
     For each perturbation g carried by >= ``min_cells`` cells (components when ``pert_delimiter`` is set):
       n_carriers                  cells carrying g (m);
-      expected_neighbors_per_cell n_neighbors x m / n: carrier neighbours a cell expects under random placement
+      expected_neighbors_per_cell expected / m: carrier neighbours a carrier expects under random placement
                                   (counting noise dominates the per-cell score when this is << 1);
       observed                    total carriers of g among the neighbours of g's carriers;
-      expected                    m x n_neighbors x (m - 1) / (n - 1), the same total under random placement;
+      expected                    E x m (m - 1) / (n (n - 1)), the same total under random placement of the labels,
+                                  with E the number of edges in the graph (self excluded). For k neighbours per cell
+                                  this is m x k x (m - 1) / (n - 1); note that ``sc.pp.neighbors(n_neighbors=k)``
+                                  stores k - 1 neighbours per cell;
       enrichment                  observed / expected - 1 (0 under random placement; approximately the
-                                  carrier-mean of calculate_lonESS_score, which uses m / n instead).
+                                  carrier-mean of calculate_lonESS_score shifted by 1/k, see its docstring).
     Pooling over carriers gives ~m x expected_neighbors_per_cell counts per perturbation, so the summary is
     measurable where the per-cell score is not. Cells carrying more perturbations can co-localise (e.g. if
     guide capture tracks cell state): compare small enrichments with size-matched random carrier sets.
@@ -146,12 +153,12 @@ def lochness_by_perturbation(adata, nn_name=None, n_neighbors=30, pert_delimiter
     n = adata.n_obs
     m = np.asarray(membership.sum(axis=0)).ravel()
     observed = np.asarray(_carrier_neighbor_counts(adjacency, membership).sum(axis=0)).ravel()
-    expected = m * n_neighbors * (m - 1) / max(n - 1, 1)
+    expected = adjacency.nnz * m * (m - 1) / max(n * (n - 1), 1)
     with np.errstate(divide="ignore", invalid="ignore"):
         enrichment = np.where(expected > 0, observed / expected - 1, np.nan)
     table = pd.DataFrame({
         "n_carriers": m.astype(int),
-        "expected_neighbors_per_cell": n_neighbors * m / n,
+        "expected_neighbors_per_cell": np.divide(expected, m, out=np.zeros_like(expected), where=m > 0),
         "observed": observed,
         "expected": expected,
         "enrichment": enrichment,
