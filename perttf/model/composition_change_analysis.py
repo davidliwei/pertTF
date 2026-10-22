@@ -26,9 +26,11 @@ def _carrier_matrix(labels, pert_delimiter=None, control_value="WT"):
 
 
 def _neighbor_indicator(adata, nn_key):
-    """0/1 kNN adjacency from a distances matrix; zero distances (the cell itself) are dropped."""
+    """0/1 kNN adjacency from a distances matrix: nonzero entries are edges, self-edges are dropped
+    (whatever their stored value)."""
     adjacency = sparse.csr_matrix(adata.obsp[nn_key], dtype=np.float64, copy=True)
     adjacency.data = (adjacency.data != 0).astype(np.float64)
+    adjacency = (adjacency - sparse.diags(adjacency.diagonal())).tocsr()
     adjacency.eliminate_zeros()
     return adjacency
 

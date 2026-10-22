@@ -163,3 +163,17 @@ def test_lochness_by_perturbation_null_centred():
     sc.pp.neighbors(a, n_neighbors=15, use_rep="X")     # stores 14 neighbours per cell
     t = lochness_by_perturbation(a, pert_delimiter="+")
     assert abs(t.enrichment.mean()) < 0.03              # random labels: no co-localisation (k-based expectation: -1/15)
+
+
+def test_nonzero_self_edges_are_ignored():
+    a, nb = _multi_adata()
+    D = nb * 1.0
+    with_self = _labelled(list(a.obs.genotype), D + 0.7 * np.eye(len(D)))   # self stored with a nonzero distance
+    without = _labelled(list(a.obs.genotype), D)
+    pd.testing.assert_frame_equal(lochness_by_perturbation(with_self, pert_delimiter="+"),
+                                  lochness_by_perturbation(without, pert_delimiter="+"))
+    for target in [None, "A"]:
+        np.testing.assert_allclose(
+            calculate_lonESS_score(with_self, n_neighbors=3, target_genotype=target, delta=0, pert_delimiter="+"),
+            calculate_lonESS_score(without, n_neighbors=3, target_genotype=target, delta=0, pert_delimiter="+"),
+            rtol=0, atol=1e-12)
