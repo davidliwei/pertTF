@@ -10,8 +10,11 @@ use the loader directly to inspect batches or to pair cells differently.
 ## Requirements
 
 - `load_corpus(corpus_root)` must succeed (scorpus >= 0.4.0).
-- The metadata must contain the columns in `label_fields`, `dataset_index` and
-  `size_factor`, with no missing labels in the loader's rows.
+- The metadata must contain the columns in `label_fields` and `dataset_index`,
+  with no missing labels in the loader's rows.
+- Every dataset's obs must have `scorpus_total_counts` (written by scorpus
+  conversion). A cell's size factor is its total over the median of its
+  dataset's positive totals (1 for a cell without counts).
 
 ## Basic Usage
 
@@ -134,8 +137,10 @@ uniformly within each group:
   `k` expressed genes drawn
 - `"hvg"`: `non_hvg_size` of the dataset's other genes, and its HVGs in the
   remaining `seq_len - non_hvg_size` places (a uniform subset if it has more).
-  HVGs are the dataset's default ones, or its `hvg_top_k` highest ranked (from
-  `hvg.parquet`). pertTF's config sets `max_seq_len` to
+  HVGs are the dataset's default ones, or its `hvg_top_k` highest ranked: the
+  `highly_variable` genes, ranked by `highly_variable_rank`, of the var loaded
+  with `load_corpus(root, ex_var=True)` (scanpy's HVG columns saved with
+  `save_ex_var`). pertTF's config sets `max_seq_len` to
   `n_hvg + non_hvg_size + 1` in this mode; `non_hvg_size` larger than `seq_len`
   is an error.
 
@@ -200,4 +205,5 @@ for epoch in range(10):
 - No valid control rows: make sure `control_labels` matches the `perturb_label` values.
 - Perturbed groups without a control (validation): relax `context_columns` or include those contexts' controls in `rows`.
 - Missing labels: filter those rows out of `rows`.
-- No HVGs for a dataset: `"hvg"` then gives its cells only `non_hvg_size` other genes; run `recalc-hvg` for rankings.
+- No HVGs for a dataset: `"hvg"` then gives its cells only `non_hvg_size` other genes; compute HVGs (e.g. scanpy on `to_anndata_lazy`), save them with `save_ex_var` and load with `ex_var=True`.
+- Missing `scorpus_total_counts`: migrate the corpus with current scorpus.

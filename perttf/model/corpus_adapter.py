@@ -31,6 +31,19 @@ __all__ = [
 
 SPECIAL_TOKENS = ("<pad>", "<cls>", "<unk>", "<eos>")
 SAMPLING_MODES = ("uniform", "expressed", "hvg")
+TOTAL_COUNTS = "scorpus_total_counts"  # per-cell sum of stored counts, an obs column written by scorpus conversion
+
+
+def _dataset_size_factors(corpus: Corpus, dataset_id: str) -> np.ndarray:
+    """Size factors of all cells of one dataset: total counts over the median of the dataset's
+    positive totals; cells without counts get 1."""
+    obs = corpus.obs_frames[dataset_id]
+    if TOTAL_COUNTS not in obs:
+        raise ValueError(f"{dataset_id!r} has no {TOTAL_COUNTS!r} obs column; re-convert or migrate it with current scorpus")
+    totals = obs[TOTAL_COUNTS].to_numpy(dtype=np.float64)
+    positive = totals[totals > 0]
+    median = np.median(positive) if len(positive) else 1.0
+    return np.where(totals > 0, totals / median, 1.0)
 
 
 @dataclass(frozen=True)
@@ -506,7 +519,10 @@ class PertTFPairedBatchLoader:
             self.label_to_index_by_name[name] = mapping
             self._label_ids[name] = values.replace_strict(mapping, return_dtype=pl.Int32).to_numpy()
         self._dataset_index = metadata["dataset_index"].to_numpy()
-        self._size_factor = metadata["size_factor"].to_numpy().astype(np.float32)
+        # Each dataset's factors are over all its cells, not only those in rows. Datasets follow each
+        # other in corpus row order, so their concatenated factors are indexed by corpus row.
+        size_factor = np.concatenate([_dataset_size_factors(corpus, name) for name in corpus.dataset_ids])
+        self._size_factor = size_factor[self.rows].astype(np.float32)
 
         registry = corpus.feature_registry
         on_device = self._on_device
@@ -631,7 +647,7 @@ class PertTFPairedBatchLoader:
             "values": self._mask(values, seed + 1),
             "target_values": values,
             "target_values_next": _with_cls(values_next, config.cls_value),
-            # pertTF's sf is the normalization multiplier; the corpus stores the size factor.
+            # pertTF's sf is the normalization multiplier, the inverse of the size factor.
             "sf": size_factor.reshape(-1, 1).reciprocal() * config.normalization_scale,
             "sf_next": size_factor_next.reshape(-1, 1).reciprocal() * config.normalization_scale,
             "index": on_device(self.rows[source]),

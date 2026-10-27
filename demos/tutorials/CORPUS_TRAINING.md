@@ -30,7 +30,7 @@ from perttf.model.corpus_data import produce_corpus_datasets
 # config is the same training configuration used by wrapper_train.
 # Required: next_cell_pred_type='pert', GEPC=True,
 # input_emb_style='continuous', ps_weight=0, sampling_mode='uniform' (or
-# 'expressed'; 'hvg' requires rankings already available in the corpus).
+# 'expressed'; 'hvg' requires HVGs in the loaded var, e.g. load_corpus(root, ex_var=True)).
 # Genes are drawn with pertTF's quotas: nonzero_prop, fix_nonzero_prop and
 # non_hvg_size are read from config, as in pertTF's collator.
 # max_seq_len includes CLS, matching pertTF's existing convention.
@@ -96,6 +96,8 @@ Create `save_dir` before calling the wrapper. The model must be on `device`.
 ## Expression and evaluation semantics
 
 - Input/target values are `log1p(count / size_factor * normalization_scale)`.
+  `size_factor` is a cell's `scorpus_total_counts` over the median of its
+  dataset's positive totals (1 for a cell without counts).
 - `sf` is the normalization multiplier, `normalization_scale / size_factor`,
   as expected by pertTF's count-distribution losses.
 - Explicitly stored non-count corpora are rejected by this counts-based route.

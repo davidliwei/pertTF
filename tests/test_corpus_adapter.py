@@ -1,14 +1,14 @@
 from pathlib import Path
 
-import lance
+import anndata as ad
 import numpy as np
+import pandas as pd
 import polars as pl
-import pyarrow as pa
 import pytest
 import torch
-import yaml
+from scipy import sparse
 
-from scorpus.loaders import load_corpus
+from scorpus import concat, from_h5ad, load_corpus
 from scorpus.pairing import Sampler, cross, make_groups
 from perttf.model.corpus_adapter import GeneTokens, PertTFAdapterConfig, PertTFPairedBatchLoader, default_pair_sampler
 from perttf.utils.custom_tokenizer import weighted_sample
@@ -17,59 +17,55 @@ LABELS = {"perturb_label": "perturbation", "cell_context": "celltype", "batch_id
 GENES = ["GENE_A", "GENE_B", "GENE_C", "GENE_D"]
 
 
+def _standalone(tmp_path: Path, dataset: dict):
+    """One dataset converted from a small h5ad (which gives each cell its scorpus_total_counts).
+    Cells are (perturbation, expressed local genes, counts). With "hvg" = (highly_variable,
+    highly_variable_rank), scanpy's HVG columns are saved as ex_var and the corpus reloaded with them."""
+    name, genes, cells = dataset["name"], dataset["genes"], dataset["cells"]
+    counts = np.zeros((len(cells), len(genes)), dtype=np.int32)
+    for row, (_, expressed, values) in enumerate(cells):
+        counts[row, expressed] = values
+    # Categorical labels: anndata stores a string column as categorical only when it repeats values,
+    # and concat cannot stack one member's strings onto another's categoricals.
+    obs = pd.DataFrame({
+        "cell_context": pd.Categorical(["T_cell"] * len(cells)),
+        "perturb_label": pd.Categorical([cell[0] for cell in cells]),
+        "batch_id": pd.Categorical(dataset.get("batch", [f"{name}_batch"] * len(cells))),
+    }, index=[f"{name}_{i}" for i in range(len(cells))])
+    source = tmp_path / f"{name}.h5ad"
+    ad.AnnData(sparse.csr_matrix(counts), obs=obs, var=pd.DataFrame(index=genes)).write_h5ad(source)
+    corpus = from_h5ad(source, tmp_path / name)
+    if "hvg" not in dataset:
+        return corpus
+    corpus.var["highly_variable"], corpus.var["highly_variable_rank"] = dataset["hvg"]
+    corpus.save_ex_var()
+    return load_corpus(tmp_path / name, ex_var=True)
+
+
 def _corpus(tmp_path: Path, datasets: list[dict]):
-    """A small aggregate Lance corpus. Each dataset: genes, cells as (perturbation, size factor,
-    expressed local genes, counts), and optional HVG ranks (the 2 highest are the default HVGs)."""
-    root = tmp_path / "corpus"
-    entries, rows, start = [], [], 0
-    for index, dataset in enumerate(datasets):
-        name, genes, cells = dataset["name"], dataset["genes"], dataset["cells"]
-        entries.append({
-            "dataset_id": name, "join_mode": "create_new" if index == 0 else "append_routed",
-            "dataset_index": index, "cell_count": len(cells), "global_start": start, "global_end": start + len(cells),
-        })
-        start += len(cells)
-        meta = root / "meta" / name
-        (meta / "canonical_meta").mkdir(parents=True)
-        pl.DataFrame({
-            "cell_id": [f"{name}_{i}" for i in range(len(cells))],
-            "dataset_id": [name] * len(cells),
-            "size_factor": [cell[1] for cell in cells],
-            "cell_context": ["T_cell"] * len(cells),
-            "perturb_label": [cell[0] for cell in cells],
-            "batch_id": dataset.get("batch", [f"{name}_batch"] * len(cells)),
-        }).write_parquet(meta / "canonical_meta" / "canonical-obs.parquet")
-        pl.DataFrame({
-            "origin_index": np.arange(len(genes), dtype=np.int32), "gene_id": genes,
-            "canonical_gene_id": genes, "global_id": np.arange(len(genes), dtype=np.int32),
-        }).write_parquet(meta / "canonical_meta" / "canonical-var.parquet")
-        ranks = np.asarray(dataset.get("hvg_ranks", range(1, len(genes) + 1)), dtype=np.int32)
-        pl.DataFrame({"origin_index": np.arange(len(genes), dtype=np.int32), "hvg_rank": ranks,
-                      "selected_at_default_n_hvg": ranks <= 2}).write_parquet(meta / "hvg.parquet")
-        rows += [(cell[2], cell[3]) for cell in cells]
-    with open(root / "corpus-index.yaml", "w") as handle:
-        yaml.safe_dump({"kind": "corpus-index", "contract_version": "0.3.0", "corpus_id": "test",
-                        "global_metadata": {"backend": "lance", "topology": "aggregate"}, "datasets": entries}, handle)
-    (root / "matrix").mkdir()
-    lance.write_dataset(pa.table({
-        "expressed_gene_indices": pa.array([genes for genes, _ in rows], type=pa.list_(pa.int32())),
-        "expression_counts": pa.array([counts for _, counts in rows], type=pa.list_(pa.int32())),
-    }), str(root / "matrix" / "aggregated-cells.lance"))
-    return load_corpus(str(root))
+    """One standalone corpus, or a concat view of several with genes matched by name."""
+    members = {dataset["name"]: _standalone(tmp_path, dataset) for dataset in datasets}
+    if len(members) == 1:
+        return members[datasets[0]["name"]]
+    return concat(
+        members, obs_columns={column: {name: column for name in members} for column in LABELS},
+        feature_key={name: "index" for name in members},
+    )
 
 
 def _small(tmp_path):
-    """Rows 0: WT, 1: KO_TP53, 2: KO_STAT1 of one dataset with genes A-D."""
+    """Rows 0: WT, 1: KO_TP53, 2: KO_STAT1 of one dataset with genes A-D; totals 6, 5, 10."""
     return _corpus(tmp_path, [{"name": "ds0", "genes": GENES, "cells": [
-        ("WT", 1.0, [0, 2], [5, 1]), ("KO_TP53", 1.2, [1, 3], [3, 2]), ("KO_STAT1", 1.1, [0, 1], [4, 6]),
+        ("WT", [0, 2], [5, 1]), ("KO_TP53", [1, 3], [3, 2]), ("KO_STAT1", [0, 1], [4, 6]),
     ]}])
 
 
 def _mixed(tmp_path):
-    """Two datasets with different panels: ds0 (genes A, B) rows 0-1, ds1 (genes B, C) rows 2-3."""
+    """Two datasets with different panels: ds0 (genes A, B) rows 0-1, totals 5, 4; ds1 (genes B, C)
+    rows 2-3, totals 2, 8."""
     return _corpus(tmp_path, [
-        {"name": "ds0", "genes": ["GENE_A", "GENE_B"], "cells": [("WT", 1.0, [0], [5]), ("KO_TP53", 1.2, [1], [4])]},
-        {"name": "ds1", "genes": ["GENE_B", "GENE_C"], "cells": [("WT", 0.9, [0], [2]), ("KO_STAT1", 1.1, [1], [7])]},
+        {"name": "ds0", "genes": ["GENE_A", "GENE_B"], "cells": [("WT", [0], [5]), ("KO_TP53", [1], [4])]},
+        {"name": "ds1", "genes": ["GENE_B", "GENE_C"], "cells": [("WT", [0], [2]), ("KO_STAT1", [1], [8])]},
     ])
 
 
@@ -113,7 +109,7 @@ def test_values_are_log1p_counts_at_the_source_genes(tmp_path, in_workers):
     batch = loader.build_batch(np.array([0, 1]), np.array([1, 1]), seed=5)
 
     dense = np.array([[5, 0, 1, 0], [0, 3, 0, 2]], dtype=np.float32)
-    size_factor = np.array([1.0, 1.2], dtype=np.float32)
+    size_factor = (np.array([6.0, 5.0]) / 6).astype(np.float32)             # totals over the median total 6
     expected = np.log1p(dense / size_factor[:, None] * 1.5)
     assert torch.equal(batch["gene_ids"], batch["next_gene_ids"])
     assert (batch["gene_ids"][:, 0] == 1).all() and (batch["target_values"][:, 0] == -3).all()
@@ -122,8 +118,8 @@ def test_values_are_log1p_counts_at_the_source_genes(tmp_path, in_workers):
     for row, target_row in ((0, 1), (1, 1)):
         np.testing.assert_allclose(batch["target_values"][row, 1:], expected[row, genes[row]], rtol=1e-6)
         np.testing.assert_allclose(batch["target_values_next"][row, 1:], expected[target_row, genes[row]], rtol=1e-6)
-    torch.testing.assert_close(batch["sf"], torch.tensor([[1.5], [1.5 / 1.2]]))
-    torch.testing.assert_close(batch["sf_next"], torch.tensor([[1.5 / 1.2], [1.5 / 1.2]]))
+    torch.testing.assert_close(batch["sf"], torch.tensor([[1.5], [1.5 * 6 / 5]]))
+    torch.testing.assert_close(batch["sf_next"], torch.tensor([[1.5 * 6 / 5], [1.5 * 6 / 5]]))
     assert torch.equal(batch["values"], batch["target_values"])            # mask_ratio 0
     assert batch["index"].tolist() == [0, 1] and batch["next_index"].tolist() == [1, 1]
     assert batch["perturbation_labels"].tolist() == [0, 1] and batch["perturbation_labels_next"].tolist() == [1, 1]
@@ -163,10 +159,11 @@ def test_full_expression_on_mixed_panels(tmp_path, in_workers):
             out[column[gene]] = float(np.float32(value))
         return out
 
-    np.testing.assert_allclose(batch["full_expr"][0], row({"GENE_A": np.log1p(5 / 1.0)}), rtol=1e-6)
-    np.testing.assert_allclose(batch["full_expr_next"][0], row({"GENE_B": np.log1p(4 / 1.2)}), rtol=1e-6)
-    np.testing.assert_allclose(batch["full_expr"][1], row({"GENE_B": np.log1p(2 / 0.9)}), rtol=1e-6)
-    np.testing.assert_allclose(batch["full_expr_next"][1], row({"GENE_C": np.log1p(7 / 1.1)}), rtol=1e-6)
+    # Size factors are over each dataset's own median total: ds0 4.5, ds1 5.
+    np.testing.assert_allclose(batch["full_expr"][0], row({"GENE_A": np.log1p(5 / (5 / 4.5))}), rtol=1e-6)
+    np.testing.assert_allclose(batch["full_expr_next"][0], row({"GENE_B": np.log1p(4 / (4 / 4.5))}), rtol=1e-6)
+    np.testing.assert_allclose(batch["full_expr"][1], row({"GENE_B": np.log1p(2 / (2 / 5))}), rtol=1e-6)
+    np.testing.assert_allclose(batch["full_expr_next"][1], row({"GENE_C": np.log1p(8 / (8 / 5))}), rtol=1e-6)
     measured = {0: {"GENE_A", "GENE_B"}, 1: {"GENE_B", "GENE_C"}}
     for i, dataset in enumerate((0, 1)):
         expected_mask = [True] + [False] * 3
@@ -178,12 +175,13 @@ def test_full_expression_on_mixed_panels(tmp_path, in_workers):
 
 @BUILDS
 def test_sampling_modes(tmp_path, in_workers):
-    """Two datasets with genes A-D and opposite HVG ranks: default HVGs ds0 A, B; ds1 C, D."""
+    """Two datasets with genes A-D and saved scanpy HVGs: ds0 A, B (A ranked first); ds1 C, D (D first)."""
+    no = np.nan
     corpus = _corpus(tmp_path, [
-        {"name": "ds0", "genes": GENES, "hvg_ranks": [1, 2, 3, 4],
-         "cells": [("WT", 1.0, [0, 2], [5, 1]), ("KO", 1.1, [1, 3], [3, 2])]},
-        {"name": "ds1", "genes": GENES, "hvg_ranks": [4, 3, 2, 1],
-         "cells": [("WT", 1.0, [0, 1], [2, 4]), ("KO", 1.1, [2, 3], [6, 7])]},
+        {"name": "ds0", "genes": GENES, "hvg": ([True, True, False, False], [0.0, 1.0, no, no]),
+         "cells": [("WT", [0, 2], [5, 1]), ("KO", [1, 3], [3, 2])]},
+        {"name": "ds1", "genes": GENES, "hvg": ([False, False, True, True], [no, no, 1.0, 0.0]),
+         "cells": [("WT", [0, 1], [2, 4]), ("KO", [2, 3], [6, 7])]},
     ])
 
     def drawn(seq_len, **config):
@@ -221,15 +219,17 @@ def test_quotas_match_pertTF(tmp_path, in_workers, config):
     cells = []
     for i in range(30):
         expressed = np.sort(rng.choice(n_genes, rng.integers(0, 9), replace=False))
-        cells.append(("WT" if i % 3 == 0 else "KO", 1.0, expressed.tolist(), (expressed + 1).tolist()))
+        cells.append(("WT" if i % 3 == 0 else "KO", expressed.tolist(), (expressed + 1).tolist()))
     ranks = rng.permutation(n_genes) + 1
-    corpus = _corpus(tmp_path, [{"name": "ds0", "genes": [f"G{i}" for i in range(n_genes)], "hvg_ranks": ranks,
+    # 8 saved HVGs (scanpy ranks from 0), of which hvg_top_k takes the 6 highest ranked.
+    hvg = (ranks <= 8, np.where(ranks <= 8, ranks - 1.0, np.nan))
+    corpus = _corpus(tmp_path, [{"name": "ds0", "genes": [f"G{i}" for i in range(n_genes)], "hvg": hvg,
                                  "cells": cells}])
     loader = _loader(corpus, seq_len=seq_len, build_in_workers=in_workers, **config)
     rows = np.arange(len(cells))
     drawn = loader.build_batch(rows, rows, seed=3)["gene_ids"][:, 1:].numpy()
     mode = config["sampling_mode"]
-    for row, (_, _, expressed, counts) in enumerate(cells):
+    for row, (_, expressed, counts) in enumerate(cells):
         values = np.zeros(n_genes)
         values[expressed] = counts
         group = values > 0 if mode == "expressed" else ranks <= 6 if mode == "hvg" else np.ones(n_genes, dtype=bool)
@@ -287,8 +287,31 @@ def test_labels(tmp_path, in_workers):
 
 def test_missing_label_raises(tmp_path):
     corpus = _corpus(tmp_path, [{"name": "ds0", "genes": GENES, "batch": ["b0", None],
-                                 "cells": [("WT", 1.0, [0], [1]), ("KO", 1.0, [1], [2])]}])
+                                 "cells": [("WT", [0], [1]), ("KO", [1], [2])]}])
     with pytest.raises(ValueError, match="batch_id"):
+        _loader(corpus)
+
+
+@BUILDS
+def test_size_factors_from_stored_totals(tmp_path, in_workers):
+    """A cell's size factor is its scorpus_total_counts over the median positive total of its dataset,
+    over all the dataset's cells, not only the loader's rows; a cell without counts gets 1."""
+    corpus = _corpus(tmp_path, [
+        {"name": "ds0", "genes": GENES,                                     # totals 6, 0, 2, 12: median 6
+         "cells": [("WT", [0, 1], [2, 4]), ("KO", [], []), ("KO", [2], [2]), ("WT", [3], [12])]},
+        {"name": "ds1", "genes": GENES, "cells": [("WT", [0], [3]), ("KO", [1], [5])]},  # median 4
+    ])
+    loader = _loader(corpus, rows=[0, 1, 2, 4, 5], build_in_workers=in_workers)   # leaves out the cell with 12
+    cells = np.arange(5)
+    batch = loader.build_batch(cells, cells, seed=0)
+    size_factor = np.array([6 / 6, 1.0, 2 / 6, 3 / 4, 5 / 4], dtype=np.float32)
+    torch.testing.assert_close(batch["sf"], torch.from_numpy(1 / size_factor).reshape(-1, 1))
+
+
+def test_corpus_without_total_counts_raises(tmp_path):
+    corpus = _small(tmp_path)
+    corpus.obs.drop(columns="scorpus_total_counts", inplace=True)          # as converted before scorpus stored totals
+    with pytest.raises(ValueError, match="scorpus_total_counts"):
         _loader(corpus)
 
 
