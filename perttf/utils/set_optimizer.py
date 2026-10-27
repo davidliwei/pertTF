@@ -4,6 +4,26 @@ from typing import Optional
 import torch
 from ..model.modules import AdversarialDiscriminator
 
+def _embedding_parameter_ids(model):
+    """ids of the parameters owned directly by an nn.Embedding / nn.EmbeddingBag (names are not reliable)."""
+    return {
+        id(parameter)
+        for module in model.modules()
+        if isinstance(module, (torch.nn.Embedding, torch.nn.EmbeddingBag))
+        for parameter in module.parameters(recurse=False)
+    }
+
+
+def _split_embedding_parameters(model):
+    """(embedding parameters, everything else) over the parameters that require a gradient."""
+    embedding_ids = _embedding_parameter_ids(model)
+    embedding, other = [], []
+    for parameter in model.parameters():
+        if parameter.requires_grad:
+            (embedding if id(parameter) in embedding_ids else other).append(parameter)
+    return embedding, other
+
+
 def create_optimizer_dict(model, device, config, num_batch_types = -1, *, steps_per_epoch: Optional[int] = None):
     scaler = torch.amp.GradScaler("cuda", enabled=config.amp)
     DAB_separate_optim = True if config.dab_weight >0 else False
@@ -20,24 +40,27 @@ def create_optimizer_dict(model, device, config, num_batch_types = -1, *, steps_
 
     optimizer_name = config.get('optimizer', 'adam').lower()
     eps = 1e-4 if config.amp else 1e-8
+    # Embeddings are updated from sparse gradients: a row only gets one when its index is in the batch, and its
+    # elements are routinely far below the amp eps of 1e-4. With a shared eps the step lr * m / (sqrt(v) + eps)
+    # is then ~0, so the table is frozen in all but name (and weight decay still shrinks it). Give the embeddings
+    # their own, smaller eps.
+    embedding_eps = config.get('embedding_eps', 1e-8)
     optimizer_config = {'optimizer': optimizer_name, 'lr': config.lr}
-    if optimizer_name == 'adam':
-        optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, eps=eps)
-    elif optimizer_name == 'adamw':
-        weight_decay = config.get('weight_decay', 0.01)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, eps=eps,
-                                      weight_decay=weight_decay)
-        optimizer_config['weight_decay'] = weight_decay
+    if optimizer_name in ('adam', 'adamw'):
+        adam_class = torch.optim.Adam if optimizer_name == 'adam' else torch.optim.AdamW
+        kwargs = {} if optimizer_name == 'adam' else {'weight_decay': config.get('weight_decay', 0.01)}
+        embedding_params, other_params = _split_embedding_parameters(model)
+        param_groups = [{'params': other_params}]
+        if embedding_params:
+            param_groups.append({'params': embedding_params, 'eps': embedding_eps})
+        optimizer = adam_class(param_groups, lr=config.lr, eps=eps, **kwargs)
+        optimizer_config.update(kwargs)
+        if embedding_params:
+            optimizer_config['embedding_eps'] = embedding_eps
     elif optimizer_name == 'muon':
         from muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
 
-        # Embedding names are not reliable (e.g. encoder.embedding vs encoder.table).
-        embedding_ids = {
-            id(parameter)
-            for module in model.modules()
-            if isinstance(module, (torch.nn.Embedding, torch.nn.EmbeddingBag))
-            for parameter in module.parameters(recurse=False)
-        }
+        embedding_ids = _embedding_parameter_ids(model)
         muon_params, adam_params = [], []
         for parameter in model.parameters():
             if not parameter.requires_grad:
