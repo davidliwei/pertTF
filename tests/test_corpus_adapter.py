@@ -11,6 +11,7 @@ import yaml
 from scorpus.loaders import load_corpus
 from scorpus.pairing import Sampler, cross, make_groups
 from perttf.model.corpus_adapter import GeneTokens, PertTFAdapterConfig, PertTFPairedBatchLoader, default_pair_sampler
+from perttf.utils.custom_tokenizer import weighted_sample
 
 LABELS = {"perturb_label": "perturbation", "cell_context": "celltype", "batch_id": "batch"}
 GENES = ["GENE_A", "GENE_B", "GENE_C", "GENE_D"]
@@ -74,7 +75,7 @@ def _mixed(tmp_path):
 
 def _loader(corpus, rows=None, *, sampler=None, cover="source", perturbed_to_self=True, context_columns=(),
             tokens=None, labels=None, seq_len=4, batch_size=8, seed=0, num_workers=0, multiprocessing_context=None,
-            label_fields=LABELS, device="cpu", **config):
+            label_fields=LABELS, device="cpu", build_in_workers=False, batches_per_read=1, **config):
     rows = np.arange(len(corpus.metadata_index)) if rows is None else np.asarray(rows)
     sampler = sampler or default_pair_sampler(
         corpus.metadata_index.df[rows], context_columns=context_columns, perturbation_column="perturb_label",
@@ -84,8 +85,12 @@ def _loader(corpus, rows=None, *, sampler=None, cover="source", perturbed_to_sel
         corpus, sampler=sampler, rows=rows, config=PertTFAdapterConfig(label_fields=label_fields, **{"mask_ratio": 0.0, **config}),
         tokens=tokens or GeneTokens.from_corpus(corpus), seq_len=seq_len, batch_size=batch_size, cover=cover,
         labels=labels, seed=seed, num_workers=num_workers, multiprocessing_context=multiprocessing_context,
-        device=device,
+        device=device, build_in_workers=build_in_workers, batches_per_read=batches_per_read,
     )
+
+
+# Batches built in the main process (on the loader's device) and on the CPU in the workers.
+BUILDS = pytest.mark.parametrize("in_workers", [False, True], ids=["device_build", "worker_build"])
 
 
 def test_gene_tokens(tmp_path):
@@ -101,9 +106,10 @@ def test_gene_tokens(tmp_path):
     assert pretrained.tokenizable.tolist() == [True, False, True, False]
 
 
-def test_values_are_log1p_counts_at_the_source_genes(tmp_path):
+@BUILDS
+def test_values_are_log1p_counts_at_the_source_genes(tmp_path, in_workers):
     corpus = _small(tmp_path)
-    loader = _loader(corpus, normalization_scale=1.5)
+    loader = _loader(corpus, normalization_scale=1.5, build_in_workers=in_workers)
     batch = loader.build_batch(np.array([0, 1]), np.array([1, 1]), seed=5)
 
     dense = np.array([[5, 0, 1, 0], [0, 3, 0, 2]], dtype=np.float32)
@@ -124,25 +130,28 @@ def test_values_are_log1p_counts_at_the_source_genes(tmp_path):
     assert torch.count_nonzero(batch["ps"]) == 0 and batch["ps"].shape == (2, 1)
 
 
-def test_masking_spares_cls_and_targets(tmp_path):
-    loader = _loader(_small(tmp_path), mask_ratio=1.0)
+@BUILDS
+def test_masking_spares_cls_and_targets(tmp_path, in_workers):
+    loader = _loader(_small(tmp_path), mask_ratio=1.0, build_in_workers=in_workers)
     batch = loader.build_batch(np.array([0]), np.array([1]), seed=3)
     assert batch["values"][0].tolist() == [-3, -1, -1, -1, -1]
     assert -1 not in batch["target_values"][0, 1:].tolist()
 
 
-def test_genes_without_a_token_are_never_sampled(tmp_path):
+@BUILDS
+def test_genes_without_a_token_are_never_sampled(tmp_path, in_workers):
     corpus = _small(tmp_path)
     tokens = GeneTokens.from_corpus(corpus, {"<pad>": 0, "<cls>": 1, "GENE_A": 17, "GENE_B": 23})
-    loader = _loader(corpus, tokens=tokens, seq_len=2)
+    loader = _loader(corpus, tokens=tokens, seq_len=2, build_in_workers=in_workers)
     for seed in range(20):
         batch = loader.build_batch(np.array([0, 1]), np.array([0, 1]), seed)
         assert set(batch["gene_ids"][:, 1:].flatten().tolist()) <= {17, 23}
 
 
-def test_full_expression_on_mixed_panels(tmp_path):
+@BUILDS
+def test_full_expression_on_mixed_panels(tmp_path, in_workers):
     corpus = _mixed(tmp_path)
-    loader = _loader(corpus, seq_len=2)
+    loader = _loader(corpus, seq_len=2, build_in_workers=in_workers)
     batch = loader.build_batch(np.array([0, 2]), np.array([1, 3]), seed=29)
 
     column = {gene: 1 + corpus.feature_registry.global_feature_ids.index(gene) for gene in ("GENE_A", "GENE_B", "GENE_C")}
@@ -167,8 +176,9 @@ def test_full_expression_on_mixed_panels(tmp_path):
         assert batch["full_expr_next_mask"][i].tolist() == expected_mask
 
 
-def test_sampling_modes(tmp_path):
-    """Two datasets with genes A-D, opposite HVG ranks; one gene drawn per cell."""
+@BUILDS
+def test_sampling_modes(tmp_path, in_workers):
+    """Two datasets with genes A-D and opposite HVG ranks: default HVGs ds0 A, B; ds1 C, D."""
     corpus = _corpus(tmp_path, [
         {"name": "ds0", "genes": GENES, "hvg_ranks": [1, 2, 3, 4],
          "cells": [("WT", 1.0, [0, 2], [5, 1]), ("KO", 1.1, [1, 3], [3, 2])]},
@@ -176,25 +186,98 @@ def test_sampling_modes(tmp_path):
          "cells": [("WT", 1.0, [0, 1], [2, 4]), ("KO", 1.1, [2, 3], [6, 7])]},
     ])
 
-    def drawn(**config):
-        loader = _loader(corpus, seq_len=1, **config)
+    def drawn(seq_len, **config):
+        loader = _loader(corpus, seq_len=seq_len, build_in_workers=in_workers, **config)
         cells = np.array([0, 2])                                            # ds0 WT, ds1 WT
-        return np.array([loader.build_batch(cells, cells, seed)["gene_ids"][:, 1].tolist() for seed in range(100)]) - 4
+        return [(loader.build_batch(cells, cells, seed)["gene_ids"][:, 1:] - 4).numpy() for seed in range(50)]
 
-    top1 = drawn(sampling_mode="hvg", hvg_weight=1000.0, hvg_top_k=1)
-    assert (top1[:, 0] == 0).mean() > 0.95 and (top1[:, 1] == 3).mean() > 0.95
-    default_hvg = drawn(sampling_mode="hvg", hvg_weight=1000.0)            # each dataset's 2 default HVGs
-    assert np.isin(default_hvg[:, 0], [0, 1]).mean() > 0.95 and np.isin(default_hvg[:, 1], [2, 3]).mean() > 0.95
-    expressed = drawn(sampling_mode="expressed", expressed_weight=1000.0)
-    assert np.isin(expressed[:, 0], [0, 2]).mean() > 0.95 and np.isin(expressed[:, 1], [0, 1]).mean() > 0.95
-    assert set(drawn(sampling_mode="uniform")[:, 0].tolist()) == {0, 1, 2, 3}
+    # hvg: non_hvg_size other genes, then the HVGs in the remaining places.
+    for genes in drawn(2, sampling_mode="hvg", non_hvg_size=1):
+        assert np.isin(genes[0], [0, 1]).sum() == 1 and np.isin(genes[1], [2, 3]).sum() == 1
+    for genes in drawn(2, sampling_mode="hvg", non_hvg_size=1, hvg_top_k=1):
+        assert 0 in genes[0] and 3 in genes[1]
+    # expressed: round(0.5 * 2) = 1 expressed gene (ds0 WT: A, C; ds1 WT: A, B), then 1 unexpressed.
+    for genes in drawn(2, sampling_mode="expressed", nonzero_prop=0.5):
+        assert np.isin(genes[0], [0, 2]).sum() == 1 and np.isin(genes[1], [0, 1]).sum() == 1
+    assert set(np.concatenate([genes[0] for genes in drawn(1, sampling_mode="uniform")]).tolist()) == {0, 1, 2, 3}
     with pytest.raises(ValueError, match="sampling_mode"):
         _loader(corpus, sampling_mode="HVG")
+    with pytest.raises(ValueError, match="non_hvg_size"):
+        _loader(corpus, sampling_mode="hvg", seq_len=2)                  # default non_hvg_size 1000
 
 
-def test_labels(tmp_path):
+@BUILDS
+@pytest.mark.parametrize("config", [
+    {"sampling_mode": "uniform"},
+    {"sampling_mode": "expressed"},
+    {"sampling_mode": "expressed", "nonzero_prop": 0.5, "fix_nonzero_prop": True},
+    {"sampling_mode": "hvg", "non_hvg_size": 3, "hvg_top_k": 6},
+], ids=["uniform", "expressed", "expressed_fixed", "hvg"])
+def test_quotas_match_pertTF(tmp_path, in_workers, config):
+    """Per cell, as many genes from each group as pertTF's weighted_sample takes for the same cell."""
+    rng = np.random.default_rng(0)
+    n_genes, seq_len = 12, 8
+    # At most 8 expressed genes: with more, weighted_sample raises for lack of unexpressed genes.
+    cells = []
+    for i in range(30):
+        expressed = np.sort(rng.choice(n_genes, rng.integers(0, 9), replace=False))
+        cells.append(("WT" if i % 3 == 0 else "KO", 1.0, expressed.tolist(), (expressed + 1).tolist()))
+    ranks = rng.permutation(n_genes) + 1
+    corpus = _corpus(tmp_path, [{"name": "ds0", "genes": [f"G{i}" for i in range(n_genes)], "hvg_ranks": ranks,
+                                 "cells": cells}])
+    loader = _loader(corpus, seq_len=seq_len, build_in_workers=in_workers, **config)
+    rows = np.arange(len(cells))
+    drawn = loader.build_batch(rows, rows, seed=3)["gene_ids"][:, 1:].numpy()
+    mode = config["sampling_mode"]
+    for row, (_, _, expressed, counts) in enumerate(cells):
+        values = np.zeros(n_genes)
+        values[expressed] = counts
+        group = values > 0 if mode == "expressed" else ranks <= 6 if mode == "hvg" else np.ones(n_genes, dtype=bool)
+        genes = drawn[row][drawn[row] != 0] - 4                             # pad token 0; gene g is token 4 + g
+        assert len(set(genes.tolist())) == len(genes)
+        index = weighted_sample(values, seq_len, rng=rng, mode={"uniform": "simple"}.get(mode, mode),
+                                non_zero_proportion=config.get("nonzero_prop", 0.7),
+                                fixed_ratio=config.get("fix_nonzero_prop", False),
+                                hvg_nonhvg=(np.flatnonzero(group), np.flatnonzero(~group)),
+                                non_hvg_size=config.get("non_hvg_size", 1000))
+        assert (group[genes].sum(), (~group[genes]).sum()) == (group[index].sum(), (~group[index]).sum())
+
+
+def test_device_and_worker_builds_agree(tmp_path):
+    """Everything but the random draws is the same; pairs across panels read the target where measured."""
     corpus = _mixed(tmp_path)
-    loader = _loader(corpus, seq_len=1, label_fields={**LABELS, "dataset_id": "dataset"},
+    cells, partners = np.array([0, 1, 2, 3]), np.array([3, 2, 1, 0])
+    device = _loader(corpus, seq_len=2, mask_ratio=0.5).build_batch(cells, partners, seed=4)
+    workers = _loader(corpus, seq_len=2, mask_ratio=0.5, build_in_workers=True).build_batch(cells, partners, seed=4)
+    assert device.keys() == workers.keys()
+    for key in ("index", "next_index", "sf", "sf_next", "ps", "ps_next", "full_gene_ids", "full_expr", "full_expr_next",
+                "full_expr_mask", "full_expr_next_mask", "perturbation_labels", "perturbation_labels_next",
+                "batch_labels", "celltype_labels_next"):
+        torch.testing.assert_close(workers[key], device[key])
+    for batch in (device, workers):
+        column = batch["gene_ids"][:, 1:] - 3                               # token 4 + gene -> full_expr column 1 + gene
+        assert column.shape == (4, 2)                                       # each cell's whole 2-gene pool
+        torch.testing.assert_close(batch["target_values"][:, 1:], batch["full_expr"].gather(1, column))
+        measured_next = batch["full_expr_next_mask"].gather(1, column)
+        expected_next = torch.where(measured_next, batch["full_expr_next"].gather(1, column), torch.tensor(-2.0))
+        torch.testing.assert_close(batch["target_values_next"][:, 1:], expected_next)
+        assert ((batch["values"] == -1).sum(dim=1) == 1).all()             # int(2 * 0.5) per row
+
+
+@BUILDS
+def test_masking_replaces_a_fixed_number_per_row(tmp_path, in_workers):
+    loader = _loader(_small(tmp_path), mask_ratio=0.5, build_in_workers=in_workers)
+    for seed in range(10):
+        batch = loader.build_batch(np.array([0, 1, 2]), np.array([0, 1, 2]), seed)
+        assert ((batch["values"] == -1).sum(dim=1) == 2).all()             # int(4 * 0.5)
+        kept = batch["values"] != -1
+        assert torch.equal(batch["values"][kept], batch["target_values"][kept])
+
+
+@BUILDS
+def test_labels(tmp_path, in_workers):
+    corpus = _mixed(tmp_path)
+    loader = _loader(corpus, seq_len=1, build_in_workers=in_workers, label_fields={**LABELS, "dataset_id": "dataset"},
                      labels={"perturbation": {"KO_STAT1": 0, "KO_TP53": 1, "WT": 2}})
     batch = loader.build_batch(np.array([0]), np.array([3]), seed=1)
     assert batch["dataset_labels"].tolist() == [0] and batch["dataset_labels_next"].tolist() == [1]
@@ -209,10 +292,11 @@ def test_missing_label_raises(tmp_path):
         _loader(corpus)
 
 
-def test_default_training_pairs(tmp_path):
+@BUILDS
+def test_default_training_pairs(tmp_path, in_workers):
     """Every cell once as a source; controls go to a perturbed cell of their dataset, perturbed cells to themselves."""
     corpus = _mixed(tmp_path)
-    loader = _loader(corpus, batch_size=4, seq_len=1, context_columns=("dataset_id",))
+    loader = _loader(corpus, batch_size=4, seq_len=1, context_columns=("dataset_id",), build_in_workers=in_workers)
     for epoch in range(5):
         loader.set_epoch(epoch)
         (batch,) = list(loader)
@@ -256,13 +340,17 @@ def test_epochs_repeat_and_reorder(tmp_path):
     assert len(loader) == 4 and len(loader.dataset) == 4
 
 
-def test_spawn_workers_give_the_same_batches(tmp_path):
+@BUILDS
+def test_spawn_workers_and_several_batches_per_read_give_the_same_batches(tmp_path, in_workers):
     corpus = _mixed(tmp_path)
-    single = list(_loader(corpus, batch_size=2, seq_len=1, mask_ratio=0.5))
-    spawned = list(_loader(corpus, batch_size=2, seq_len=1, mask_ratio=0.5, num_workers=2, multiprocessing_context="spawn"))
-    assert len(single) == len(spawned) == 2
-    for a, b in zip(single, spawned):
-        assert a.keys() == b.keys() and all(torch.equal(a[key], b[key]) for key in a)
+    options = dict(batch_size=1, seq_len=2, mask_ratio=0.5, build_in_workers=in_workers)
+    single = list(_loader(corpus, **options))
+    grouped = list(_loader(corpus, batches_per_read=3, **options))
+    spawned = list(_loader(corpus, batches_per_read=2, num_workers=2, multiprocessing_context="spawn", **options))
+    assert len(single) == len(grouped) == len(spawned) == 4
+    for a, b, c in zip(single, grouped, spawned):
+        assert a.keys() == b.keys() == c.keys()
+        assert all(torch.equal(a[key], b[key]) and torch.equal(a[key], c[key]) for key in a)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -270,12 +358,13 @@ def test_gpu_batches(tmp_path):
     corpus = _mixed(tmp_path)
     cells, partners = np.array([0, 2]), np.array([1, 3])
     cpu = _loader(corpus, seq_len=1).build_batch(cells, partners, seed=4)
-    gpu = _loader(corpus, seq_len=1, device="cuda").build_batch(cells, partners, seed=4)
-    assert gpu.keys() == cpu.keys() and all(value.device.type == "cuda" for value in gpu.values())
-    for key in ("index", "next_index", "sf", "sf_next", "full_gene_ids", "full_expr", "full_expr_next",
-                "full_expr_mask", "full_expr_next_mask", "perturbation_labels", "perturbation_labels_next"):
-        torch.testing.assert_close(gpu[key].cpu(), cpu[key])
-    # GPU random numbers may pick other genes; the values must be those of the picked genes.
-    column = gpu["gene_ids"][:, 1:] - 3                                     # token 4 + gene -> full_expr column 1 + gene
-    torch.testing.assert_close(gpu["target_values"][:, 1:], gpu["full_expr"].gather(1, column))
-    torch.testing.assert_close(gpu["target_values_next"][:, 1:], gpu["full_expr_next"].gather(1, column))
+    for in_workers in (False, True):
+        gpu = _loader(corpus, seq_len=1, device="cuda", build_in_workers=in_workers).build_batch(cells, partners, seed=4)
+        assert gpu.keys() == cpu.keys() and all(value.device.type == "cuda" for value in gpu.values())
+        for key in ("index", "next_index", "sf", "sf_next", "full_gene_ids", "full_expr", "full_expr_next",
+                    "full_expr_mask", "full_expr_next_mask", "perturbation_labels", "perturbation_labels_next"):
+            torch.testing.assert_close(gpu[key].cpu(), cpu[key])
+        # GPU random numbers may pick other genes; the values must be those of the picked genes.
+        column = gpu["gene_ids"][:, 1:] - 3                                 # token 4 + gene -> full_expr column 1 + gene
+        torch.testing.assert_close(gpu["target_values"][:, 1:], gpu["full_expr"].gather(1, column))
+        torch.testing.assert_close(gpu["target_values_next"][:, 1:], gpu["full_expr_next"].gather(1, column))

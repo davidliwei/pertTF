@@ -33,6 +33,7 @@ config = PertTFAdapterConfig(
     normalization_scale=1.0,
     sampling_mode="hvg",
     hvg_top_k=2000,
+    non_hvg_size=1000,
 )
 sampler = default_pair_sampler(
     corpus.metadata_index.df[rows],
@@ -47,10 +48,10 @@ loader = PertTFPairedBatchLoader(
     rows=rows,
     config=config,
     tokens=GeneTokens.from_corpus(corpus),
-    seq_len=1024,
+    seq_len=3000,                                  # hvg: n_hvg + non_hvg_size, as pertTF's config sets
     batch_size=8,
     cover="source",
-    device="cuda",                                 # where batches are built
+    device="cuda",                                 # where batches are built (or finished, see below)
 )
 
 batch = next(iter(loader))
@@ -121,19 +122,33 @@ cell, so set-level samples must have equal numbers of cells on both sides.
 
 ## Sampling and Tensor Shape
 
-`seq_len` genes are drawn per source cell, without replacement, from the genes
-its dataset measured that have a token; the target cell is read at the same
-genes. `sampling_mode` sets the weights:
+Genes are drawn per source cell from its pool: the genes its dataset measured
+that have a token. The target cell is read at the same genes. `sampling_mode`
+uses the quotas of pertTF's collator (`custom_tokenizer.weighted_sample`),
+uniformly within each group:
 
-- `"uniform"`: every gene the same
-- `"expressed"`: expressed genes get `1 + expressed_weight`
-- `"hvg"`: HVGs get `1 + hvg_weight`; the dataset's default HVGs, or its
-  `hvg_top_k` highest ranked (from `hvg.parquet`)
+- `"uniform"`: `seq_len` genes
+- `"expressed"`: `round(nonzero_prop * seq_len)` of the cell's expressed genes
+  (all if fewer), the rest from its unexpressed genes; with `fix_nonzero_prop`,
+  at most `round(k * (1 - nonzero_prop) / nonzero_prop)` unexpressed genes for
+  `k` expressed genes drawn
+- `"hvg"`: `non_hvg_size` of the dataset's other genes, and its HVGs in the
+  remaining `seq_len - non_hvg_size` places (a uniform subset if it has more).
+  HVGs are the dataset's default ones, or its `hvg_top_k` highest ranked (from
+  `hvg.parquet`). pertTF's config sets `max_seq_len` to
+  `n_hvg + non_hvg_size + 1` in this mode; `non_hvg_size` larger than `seq_len`
+  is an error.
+
+A cell whose pool fits in `seq_len` gets its whole pool. Rows shorter than the
+longest in the batch end in padding, and the batch is only as wide as its
+longest row. A cell with too few unexpressed genes for its quota gets all of
+them (pertTF's collator raises there).
 
 Batch keys:
 
 - `gene_ids`, `next_gene_ids`: CLS, then the sampled genes' token IDs
-- `values`: source values with a `mask_ratio` share replaced by `mask_value`
+- `values`: source values with exactly `int(n * mask_ratio)` of a row's `n`
+  genes replaced by `mask_value`, as pertTF's `random_mask_value` does
 - `target_values`: unmasked source values
 - `target_values_next`: target values at the source's genes
 - expression values are `log1p(count / size_factor * normalization_scale)`;
@@ -147,11 +162,28 @@ Batch keys:
 
 ## Workers and Epochs
 
-With `num_workers > 0`, worker processes only read source and target
-expression; pairing and the tensors stay in the main process and are built on
-`device`. Build on the GPU: gene sampling and full expression are much slower
-on the CPU. `persistent_workers=True` keeps the workers between epochs. For
-Lance-backed corpora, `multiprocessing_context="spawn"` is usually safest.
+With `num_workers > 0`, worker processes read expression; pairing stays in the
+main process. Each read covers `batches_per_read` consecutive batches and reads
+every distinct cell once, so a self pair is one read. Small batches are limited
+by the fixed cost of each read on network storage: on beacon's NFS, 64-pair
+reads gave under 1k pairs/s with 8 workers, 1,024-pair reads 6-10k. Choose
+`batches_per_read` so a read covers about 1,000 pairs; batches are the same for
+any value.
+
+The tensors are built in one of two places:
+
+- default: in the main process, on `device` (a GPU is much faster than the CPU
+  for this). Highest throughput, but it takes GPU time from every training step
+  (~37 ms per 1,024 pairs on an RTX 6000 Ada).
+- `build_in_workers=True`: on the CPU in the workers; the main process only
+  fills the full gene axis on `device` (~12 ms per 1,024 pairs). Each worker
+  needs ~0.75-0.95 s of CPU per 1,024 pairs, so throughput scales with workers.
+
+Both draw with the same quotas, but different random numbers pick different
+genes for the same seed. `persistent_workers=True` keeps the workers between
+epochs. For Lance-backed corpora, `multiprocessing_context="spawn"` is usually
+safest. Workers of a concatenated corpus get a reader that holds only table
+paths and row ranges, not the member corpora.
 
 Use `set_epoch(epoch)` for deterministic reshuffling between epochs:
 
@@ -168,4 +200,4 @@ for epoch in range(10):
 - No valid control rows: make sure `control_labels` matches the `perturb_label` values.
 - Perturbed groups without a control (validation): relax `context_columns` or include those contexts' controls in `rows`.
 - Missing labels: filter those rows out of `rows`.
-- No HVG rankings: `"hvg"` then samples uniformly; run `recalc-hvg` for rankings.
+- No HVGs for a dataset: `"hvg"` then gives its cells only `non_hvg_size` other genes; run `recalc-hvg` for rankings.

@@ -395,7 +395,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=64, help="Sampled sequence length.")
     parser.add_argument("--batch-size", type=int, default=4, help="Number of paired rows to validate.")
     parser.add_argument("--hvg-top-k", type=int, default=2000, help="Runtime HVG top-k threshold.")
-    parser.add_argument("--hvg-weight", type=float, default=4.0, help="Runtime HVG bonus weight.")
+    parser.add_argument("--non-hvg-size", type=int, default=16, help="Non-HVG genes per cell (pertTF's non_hvg_size).")
     parser.add_argument("--seed", type=int, default=13, help="Deterministic RNG seed.")
     parser.add_argument(
         "--num-workers",
@@ -443,7 +443,7 @@ def main() -> None:
         "seq_len": int(args.seq_len),
         "batch_size": int(args.batch_size),
         "hvg_top_k": int(args.hvg_top_k),
-        "hvg_weight": float(args.hvg_weight),
+        "non_hvg_size": int(args.non_hvg_size),
         "seed": int(args.seed),
         "num_workers": int(args.num_workers),
         "multiprocessing_context": (
@@ -497,7 +497,7 @@ def main() -> None:
         },
         mask_ratio=0.0,
         sampling_mode="hvg",
-        hvg_weight=float(args.hvg_weight),
+        non_hvg_size=int(args.non_hvg_size),
         hvg_top_k=int(args.hvg_top_k),
     )
     # pertTF's default training pairs within the same dataset and cell context.
@@ -586,7 +586,7 @@ def main() -> None:
         },
         "batch": {
             "hvg_top_k": int(args.hvg_top_k),
-            "hvg_weight": float(args.hvg_weight),
+            "non_hvg_size": int(args.non_hvg_size),
             "seq_len": int(args.seq_len),
             "paired_rows_sampled": int(len(observed.source_indices)),
             "mixed_dataset_batch": mixed_dataset,

@@ -54,6 +54,8 @@ def produce_corpus_datasets(
     normalization_scale: float = 1.0,
     num_workers: int = 0,
     device="cpu",
+    build_in_workers: bool = False,
+    batches_per_read: int = 1,
 ):
     """Return the data_gen dictionary consumed by wrapper_train.
 
@@ -70,8 +72,11 @@ def produce_corpus_datasets(
     Perturbation metrics use the tokenizable intersection of the validation
     datasets' feature panels. Full-expression losses use availability masks.
 
-    Workers read expression; batches are built on ``device``. Pass the training GPU:
-    gene sampling and full expression are much slower on the CPU.
+    Genes are drawn with pertTF's quotas (``sampling_mode``, ``nonzero_prop``,
+    ``fix_nonzero_prop``, ``non_hvg_size`` from config). Workers read expression,
+    ``batches_per_read`` batches at a time. Batches are built on ``device`` (pass the training
+    GPU), or with ``build_in_workers`` on the CPU in the workers, which leaves only the full gene
+    axis to the device.
     """
     if config.get("next_cell_pred_type", "pert") != "pert" or not config.get("GEPC", False):
         raise ValueError("Corpus perturbation training requires next_cell_pred_type='pert' and GEPC=True")
@@ -109,6 +114,9 @@ def produce_corpus_datasets(
         pad_value=config.get("pad_value", -2), mask_value=config.get("mask_value", -1),
         cls_value=config.get("cls_value", -3),
         sampling_mode=config.get("sampling_mode", "uniform"),
+        nonzero_prop=config.get("nonzero_prop", 0.7),
+        fix_nonzero_prop=config.get("fix_nonzero_prop", False),
+        non_hvg_size=config.get("non_hvg_size", 1000),
     )
     # Both loaders share one ID per label; labels not supplied are numbered over the selected rows.
     selected_frame = frame.iloc[selected_rows]
@@ -130,6 +138,7 @@ def produce_corpus_datasets(
         seq_len=config.get("max_seq_len", 1024) - 1, seed=config.get("seed", 0),
         num_workers=num_workers, multiprocessing_context="spawn" if num_workers else None,
         persistent_workers=num_workers > 0, device=device,
+        build_in_workers=build_in_workers, batches_per_read=batches_per_read,
     )
     metadata = corpus.metadata_index.df
     pairing = dict(context_columns=context_columns, perturbation_column=perturbation_column, control_labels=(control_label,))

@@ -31,6 +31,8 @@ from perttf.model.corpus_data import produce_corpus_datasets
 # Required: next_cell_pred_type='pert', GEPC=True,
 # input_emb_style='continuous', ps_weight=0, sampling_mode='uniform' (or
 # 'expressed'; 'hvg' requires rankings already available in the corpus).
+# Genes are drawn with pertTF's quotas: nonzero_prop, fix_nonzero_prop and
+# non_hvg_size are read from config, as in pertTF's collator.
 # max_seq_len includes CLS, matching pertTF's existing convention.
 data_gen = produce_corpus_datasets(
     corpus,
@@ -45,7 +47,9 @@ data_gen = produce_corpus_datasets(
     # pairing_columns=("donor",),  # if a collective donor column is available
     normalization_scale=1.0,
     num_workers=4,                  # expression is read in worker processes
+    batches_per_read=8,             # one read per ~1,000 pairs (here batch_size 128)
     device=device,                  # batches are built on the training GPU
+    # build_in_workers=True,        # or on the CPU in the workers (frees the GPU)
 )
 ```
 
