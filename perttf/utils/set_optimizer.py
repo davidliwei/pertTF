@@ -14,14 +14,29 @@ def _embedding_parameter_ids(model):
     }
 
 
-def _split_embedding_parameters(model):
-    """(embedding parameters, everything else) over the parameters that require a gradient."""
-    embedding_ids = _embedding_parameter_ids(model)
-    embedding, other = [], []
+def _sparse_parameter_ids(model):
+    """ids of the parameters flagged ``sparse_parameter_updates`` by the module that owns them.
+
+    These are the tables with one row per perturbation: a row is only updated in the batches that happen to
+    contain it. Modules opt in explicitly instead of being detected by type, because most embeddings here
+    (gene tokens, value bins, batch labels) are indexed by every sample and so ARE updated densely.
+    """
+    return {
+        id(parameter)
+        for module in model.modules()
+        if getattr(module, "sparse_parameter_updates", False)
+        for parameter in module.parameters(recurse=False)
+    }
+
+
+def _split_sparse_parameters(model):
+    """(sparsely updated parameters, everything else) over the parameters that require a gradient."""
+    sparse_ids = _sparse_parameter_ids(model)
+    sparse, other = [], []
     for parameter in model.parameters():
         if parameter.requires_grad:
-            (embedding if id(parameter) in embedding_ids else other).append(parameter)
-    return embedding, other
+            (sparse if id(parameter) in sparse_ids else other).append(parameter)
+    return sparse, other
 
 
 def create_optimizer_dict(model, device, config, num_batch_types = -1, *, steps_per_epoch: Optional[int] = None):
@@ -40,23 +55,24 @@ def create_optimizer_dict(model, device, config, num_batch_types = -1, *, steps_
 
     optimizer_name = config.get('optimizer', 'adam').lower()
     eps = 1e-4 if config.amp else 1e-8
-    # Embeddings are updated from sparse gradients: a row only gets one when its index is in the batch, and its
-    # elements are routinely far below the amp eps of 1e-4. With a shared eps the step lr * m / (sqrt(v) + eps)
-    # is then ~0, so the table is frozen in all but name (and weight decay still shrinks it). Give the embeddings
-    # their own, smaller eps.
-    embedding_eps = config.get('embedding_eps', 1e-8)
+    # A perturbation embedding row is only updated in the batches that contain its perturbation, and its gradient
+    # elements are routinely far below the amp eps of 1e-4. Adam's running moments decay between two updates of the
+    # same row, so its step lr * m / (sqrt(v) + eps) is dominated by eps and comes out ~0: the table is frozen in all
+    # but name, while weight decay keeps shrinking it. Give those tables their own, smaller eps. Densely updated
+    # parameters -- the gene-token, value-bin and batch-label embeddings included -- keep the amp eps.
+    sparse_embedding_eps = config.get('sparse_embedding_eps', 1e-8)
     optimizer_config = {'optimizer': optimizer_name, 'lr': config.lr}
     if optimizer_name in ('adam', 'adamw'):
         adam_class = torch.optim.Adam if optimizer_name == 'adam' else torch.optim.AdamW
         kwargs = {} if optimizer_name == 'adam' else {'weight_decay': config.get('weight_decay', 0.01)}
-        embedding_params, other_params = _split_embedding_parameters(model)
+        sparse_params, other_params = _split_sparse_parameters(model)
         param_groups = [{'params': other_params}]
-        if embedding_params:
-            param_groups.append({'params': embedding_params, 'eps': embedding_eps})
+        if sparse_params:
+            param_groups.append({'params': sparse_params, 'eps': sparse_embedding_eps})
         optimizer = adam_class(param_groups, lr=config.lr, eps=eps, **kwargs)
         optimizer_config.update(kwargs)
-        if embedding_params:
-            optimizer_config['embedding_eps'] = embedding_eps
+        if sparse_params:
+            optimizer_config['sparse_embedding_eps'] = sparse_embedding_eps
     elif optimizer_name == 'muon':
         from muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
 

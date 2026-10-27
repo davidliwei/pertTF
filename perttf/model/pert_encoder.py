@@ -95,6 +95,8 @@ class UnifiedPertEncoder(nn.Module):
         fallback_indices[~covered] = torch.arange(int((~covered).sum()))
         self.register_buffer("fallback_indices", fallback_indices)
         self.fallback = nn.Embedding(int((~covered).sum()), embedding_dim)
+        # One row per perturbation with no feature source -> sparse updates (see PertLabelEncoder).
+        self.fallback.sparse_parameter_updates = True
         self.enc_norm = nn.LayerNorm(embedding_dim)
 
     def forward(self, indices: Tensor) -> Tensor:

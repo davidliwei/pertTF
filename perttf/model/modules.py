@@ -676,6 +676,9 @@ class PertLabelEncoder(nn.Module):
         self.embedding = nn.Embedding(
             num_embeddings, embedding_dim, padding_idx=padding_idx
         )
+        # One row per perturbation, so a row is only updated in the batches that contain it.
+        # perttf.utils.set_optimizer gives such tables their own, smaller Adam eps.
+        self.embedding.sparse_parameter_updates = True
         self.enc_norm = nn.LayerNorm(embedding_dim)
 
     def forward(self, x: Tensor) -> Tensor:
