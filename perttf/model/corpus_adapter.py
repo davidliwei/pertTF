@@ -168,25 +168,23 @@ def _csr_rows(csr, positions: np.ndarray):
 
 
 def _read_batches(reader, items: list[dict], builder) -> list[tuple]:
-    """Read every distinct cell of ``items`` (batches) once; then per batch (index, source expression,
-    target expression), or (index, the batch built on the CPU by ``builder``)."""
+    """One read for the cells of ``items`` (batches; the reader reads each distinct cell once and
+    returns the rows in the given order); then per batch (index, source expression, target
+    expression), or (index, the batch built on the CPU by ``builder``)."""
     rows = np.concatenate([np.concatenate([item["source_rows"], item["target_rows"]]) for item in items])
-    unique, inverse = np.unique(rows, return_inverse=True)
-    read = reader.read_expression_flat(unique)
+    read = reader.read_expression_flat(rows)
     csr = (read.row_offsets, read.expressed_gene_indices, read.expression_counts)
     out, start = [], 0
     for item in items:
         n = len(item["source_rows"])
-        positions = inverse[start:start + 2 * n]
+        source, target = np.arange(start, start + n), np.arange(start + n, start + 2 * n)
         start += 2 * n
         if builder is None:
-            out.append((item["index"], *(
-                ExpressionBatch(n, item[key], *_csr_rows(csr, side))
-                for key, side in (("source_rows", positions[:n]), ("target_rows", positions[n:]))
-            )))
+            out.append((item["index"], ExpressionBatch(n, item["source_rows"], *_csr_rows(csr, source)),
+                        ExpressionBatch(n, item["target_rows"], *_csr_rows(csr, target))))
         else:
-            cells, local = np.unique(positions, return_inverse=True)
-            out.append((item["index"], builder.build(item, _csr_rows(csr, cells), local[:n], local[n:])))
+            cells = _csr_rows(csr, np.concatenate([source, target]))
+            out.append((item["index"], builder.build(item, cells, np.arange(n), np.arange(n, 2 * n))))
     return out
 
 
