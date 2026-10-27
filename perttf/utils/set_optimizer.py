@@ -4,6 +4,41 @@ from typing import Optional
 import torch
 from ..model.modules import AdversarialDiscriminator
 
+def _embedding_parameter_ids(model):
+    """ids of the parameters owned directly by an nn.Embedding / nn.EmbeddingBag (names are not reliable)."""
+    return {
+        id(parameter)
+        for module in model.modules()
+        if isinstance(module, (torch.nn.Embedding, torch.nn.EmbeddingBag))
+        for parameter in module.parameters(recurse=False)
+    }
+
+
+def _sparse_parameter_ids(model):
+    """ids of the parameters flagged ``sparse_parameter_updates`` by the module that owns them.
+
+    These are the tables with one row per perturbation: a row is only updated in the batches that happen to
+    contain it. Modules opt in explicitly instead of being detected by type, because most embeddings here
+    (gene tokens, value bins, batch labels) are indexed by every sample and so ARE updated densely.
+    """
+    return {
+        id(parameter)
+        for module in model.modules()
+        if getattr(module, "sparse_parameter_updates", False)
+        for parameter in module.parameters(recurse=False)
+    }
+
+
+def _split_sparse_parameters(model):
+    """(sparsely updated parameters, everything else) over the parameters that require a gradient."""
+    sparse_ids = _sparse_parameter_ids(model)
+    sparse, other = [], []
+    for parameter in model.parameters():
+        if parameter.requires_grad:
+            (sparse if id(parameter) in sparse_ids else other).append(parameter)
+    return sparse, other
+
+
 def create_optimizer_dict(model, device, config, num_batch_types = -1, *, steps_per_epoch: Optional[int] = None):
     scaler = torch.amp.GradScaler("cuda", enabled=config.amp)
     DAB_separate_optim = True if config.dab_weight >0 else False
@@ -20,24 +55,28 @@ def create_optimizer_dict(model, device, config, num_batch_types = -1, *, steps_
 
     optimizer_name = config.get('optimizer', 'adam').lower()
     eps = 1e-4 if config.amp else 1e-8
+    # A perturbation embedding row is only updated in the batches that contain its perturbation, and its gradient
+    # elements are routinely far below the amp eps of 1e-4. Adam's running moments decay between two updates of the
+    # same row, so its step lr * m / (sqrt(v) + eps) is dominated by eps and comes out ~0: the table is frozen in all
+    # but name, while weight decay keeps shrinking it. Give those tables their own, smaller eps. Densely updated
+    # parameters -- the gene-token, value-bin and batch-label embeddings included -- keep the amp eps.
+    sparse_embedding_eps = config.get('sparse_embedding_eps', 1e-8)
     optimizer_config = {'optimizer': optimizer_name, 'lr': config.lr}
-    if optimizer_name == 'adam':
-        optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, eps=eps)
-    elif optimizer_name == 'adamw':
-        weight_decay = config.get('weight_decay', 0.01)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, eps=eps,
-                                      weight_decay=weight_decay)
-        optimizer_config['weight_decay'] = weight_decay
+    if optimizer_name in ('adam', 'adamw'):
+        adam_class = torch.optim.Adam if optimizer_name == 'adam' else torch.optim.AdamW
+        kwargs = {} if optimizer_name == 'adam' else {'weight_decay': config.get('weight_decay', 0.01)}
+        sparse_params, other_params = _split_sparse_parameters(model)
+        param_groups = [{'params': other_params}]
+        if sparse_params:
+            param_groups.append({'params': sparse_params, 'eps': sparse_embedding_eps})
+        optimizer = adam_class(param_groups, lr=config.lr, eps=eps, **kwargs)
+        optimizer_config.update(kwargs)
+        if sparse_params:
+            optimizer_config['sparse_embedding_eps'] = sparse_embedding_eps
     elif optimizer_name == 'muon':
         from muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
 
-        # Embedding names are not reliable (e.g. encoder.embedding vs encoder.table).
-        embedding_ids = {
-            id(parameter)
-            for module in model.modules()
-            if isinstance(module, (torch.nn.Embedding, torch.nn.EmbeddingBag))
-            for parameter in module.parameters(recurse=False)
-        }
+        embedding_ids = _embedding_parameter_ids(model)
         muon_params, adam_params = [], []
         for parameter in model.parameters():
             if not parameter.requires_grad:
