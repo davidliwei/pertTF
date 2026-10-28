@@ -26,6 +26,14 @@ tutorials/pretrain_finetune_tutorial
 
 ```{toctree}
 :maxdepth: 1
+:caption: Training from On-Disk Corpora
+
+tutorials/CORPUS_TRAINING
+tutorials/CORPUS_PAIRED_LOADER
+```
+
+```{toctree}
+:maxdepth: 1
 :caption: Virtual Screens and Composition Change
 
 tutorials/virtual_pooled_screen

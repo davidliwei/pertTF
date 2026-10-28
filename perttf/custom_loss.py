@@ -668,7 +668,7 @@ class GenerativeExpressionLoss(torch.nn.Module):
         # 1. Handle Mask Defaults
         if mask is None or not mask.any():
             mask = torch.ones_like(outputs['pred'], dtype=torch.bool)
-        
+
         
         # 2. Check Distribution Type
         dist_type = outputs.get('distribution', None)
@@ -729,4 +729,3 @@ class GenerativeExpressionLoss(torch.nn.Module):
         # --- REDUCTION ---
         # Since we already filtered by mask, we just take the mean.
         return loss_elementwise.mean()
-

@@ -1,0 +1,222 @@
+"""Prepare pertTF training and validation directly from sparse on-disk corpora."""
+
+from __future__ import annotations
+
+from dataclasses import asdict
+
+import anndata as ad
+import numpy as np
+
+from scorpus.loaders import dense_counts
+
+from .corpus_adapter import GeneTokens, PertTFAdapterConfig, PertTFPairedBatchLoader, default_pair_sampler
+from .pert_emb import build_perturbation_mapping
+from .train_data_gen import _record_config_value
+from ..utils.custom_tokenizer import SimpleVocab
+from ..utils.split_check import check_train_valid_split
+from ..utils.pert_labels import canonical_label, max_set_size, resolve_control_value, validate_perturbation_labels
+from ..utils.pert_metrics import GroupMoments, expand_perturbation_rows, normalize_expression
+
+
+def corpus_reference_groups(corpus, rows, *, context_column, perturbation_column, gene_mask, target_sum=10000.0,
+                            pert_delimiter=None, perturbation_unit="set", control_label="WT", chunk_rows=1024):
+    """Stream reference moments over the same common gene axis used in evaluation, with sets split into
+    their components for perturbation_unit="single" as evaluation splits the predictions."""
+    selected_genes = np.flatnonzero(gene_mask)
+    moments = GroupMoments()
+    rows = np.asarray(rows, dtype=np.int64)
+    for start in range(0, len(rows), chunk_rows):
+        selected = rows[start:start + chunk_rows]
+        batch = corpus.expression_reader.read_expression_flat(selected.tolist())
+        metadata = corpus.take_metadata(selected, columns=[context_column, perturbation_column])
+        counts, _ = dense_counts(corpus, batch, genes=selected_genes)
+        expression = counts.astype(np.float64)
+        moments.update(*expand_perturbation_rows(
+            normalize_expression(expression, target_sum=target_sum, input_scale="counts"),
+            metadata[context_column], metadata[perturbation_column],
+            pert_delimiter, perturbation_unit, control_label,
+        ))
+    return moments.finalize()
+
+
+def produce_corpus_datasets(
+    corpus,
+    config,
+    *,
+    train_indices,
+    valid_indices,
+    perturbation_column: str,
+    celltype_column: str,
+    batch_column: str,
+    control_label: str,
+    pert_sources: dict | None = None,
+    genotype_to_index: dict | None = None,
+    cell_type_to_index: dict | None = None,
+    batch_to_index: dict | None = None,
+    tokenizer_stoi: dict | None = None,
+    feature_id_to_token: dict | None = None,
+    pairing_columns: tuple[str, ...] = (),
+    target_sum: float | None = 10000.0,
+    num_workers: int = 0,
+    device="cpu",
+    build_in_workers: bool = False,
+    batches_per_read: int = 1,
+):
+    """Return the data_gen dictionary consumed by wrapper_train.
+
+    This counts-based route uses continuous log1p expression, each cell scaled to
+    ``target_sum`` counts (None: the median total of its dataset's cells in each
+    loader's rows, so training and validation compute it separately), and pertTF's default
+    pairs (``default_pair_sampler``) within the same dataset and celltype: training
+    uses every training cell once as a source, validation every validation cell
+    once as a target. Additional pairing columns can constrain donor/condition.
+    Train and valid indices each include their available controls; only controls
+    may overlap.
+    The one expanded perturbation mapping is shared by both loaders and must be
+    passed unchanged to the model/UnifiedPertEncoder. Supply tokenizer_stoi when
+    using a pretrained expression vocabulary.
+
+    Perturbation metrics use the tokenizable intersection of the validation
+    datasets' feature panels. Full-expression losses use availability masks.
+
+    With ``pert_delimiter`` in config, labels such as "A+B" are perturbation sets as in the
+    AnnData route: the mapping holds single perturbations, each cell's IDs are a padded set, and
+    ``perturbation_unit`` decides whether metrics group by set or by component. Set labels must
+    already be canonical (components sorted, e.g. "A+B", not "B+A").
+
+    Genes are drawn with pertTF's quotas (``sampling_mode``, ``nonzero_prop``,
+    ``fix_nonzero_prop``, ``non_hvg_size`` from config). Workers read expression,
+    ``batches_per_read`` batches at a time. Batches are built on ``device`` (pass the training
+    GPU), or with ``build_in_workers`` on the CPU in the workers, which leaves only the full gene
+    axis to the device.
+    """
+    if config.get("next_cell_pred_type", "pert") != "pert" or not config.get("GEPC", False):
+        raise ValueError("Corpus perturbation training requires next_cell_pred_type='pert' and GEPC=True")
+    if config.get("input_emb_style", "continuous") != "continuous":
+        raise ValueError("Corpus log1p expression requires input_emb_style='continuous'")
+    if config.get("ps_weight", 0) != 0 or config.get("pred_lochness_next", 0):
+        raise ValueError("Corpus training does not supply perturbation-score targets; disable PS objectives")
+    if not corpus.features_aligned:
+        raise ValueError("Align corpus features explicitly with concat(feature_key=...) before training")
+    if any(kind == "non_count" for kind in corpus.expression_kinds.values()):
+        raise ValueError("This training route requires counts; a no_count corpus needs explicit preprocessing first")
+    # Inference reads the control from the saved config (resolve_control_value), so control_label is
+    # recorded there; a config naming another control would split and predict sets with the wrong one.
+    configured_control = resolve_control_value(config, default=None)
+    if configured_control not in (None, control_label):
+        raise ValueError(f"control_label={control_label!r} contradicts the config's control {configured_control!r}")
+    _record_config_value(config, "perturbation_control_value", control_label)
+    label_fields = {perturbation_column: "perturbation", celltype_column: "celltype", batch_column: "batch"}
+    if len(label_fields) != 3:
+        raise ValueError("Perturbation, celltype, and batch columns must be distinct")
+    context_columns = list(dict.fromkeys(("dataset_id", celltype_column, *pairing_columns)))
+    frame = corpus.metadata_index.df.select(list(dict.fromkeys(["dataset_index", *label_fields, *context_columns]))).to_pandas()
+    selected_rows = np.union1d(train_indices, valid_indices)
+    if frame.iloc[selected_rows][list(dict.fromkeys([*label_fields, *context_columns]))].isna().any().any():
+        raise ValueError("Selected training/validation metadata contains missing labels")
+    delimiter = config.get("pert_delimiter", None)
+    perturbation_unit = config.get("perturbation_unit", "set")
+    observed = frame.iloc[selected_rows][perturbation_column].astype(str).unique()
+    validate_perturbation_labels(observed, delimiter, control_label, existing_mapping=genotype_to_index,
+                                 max_perts_per_cell=config.get("max_perts_per_cell", None))
+    # Pairing, the split check and the metric groups compare label strings, so a set has one spelling.
+    respelled = [label for label in observed if canonical_label(label, delimiter, control_label) != label]
+    if respelled:
+        raise ValueError(
+            f"Perturbation sets must be spelled canonically (components sorted, no control or repeats), "
+            f"e.g. {[(label, canonical_label(label, delimiter, control_label)) for label in respelled[:3]]}"
+        )
+    split_report = check_train_valid_split(
+        ad.AnnData(obs=frame), train_indices, valid_indices, "pert",
+        control_value=control_label, context_col=celltype_column,
+        perturbation_col=perturbation_column, min_cells=config.get("perturbation_metric_min_cells", 30),
+        perturbation_unit=perturbation_unit, pert_delimiter=delimiter,
+    )
+    sources = pert_sources or {}
+    mapping = genotype_to_index if genotype_to_index is not None else build_perturbation_mapping(
+        frame.iloc[selected_rows][perturbation_column].tolist(), sources, control_label=control_label,
+        delimiter=delimiter,
+    )
+    source_ids = {gene for genes, _ in sources.values() for gene in genes}
+    if source_ids.difference(mapping):
+        raise ValueError("genotype_to_index must include external source IDs")
+    adapter_config = PertTFAdapterConfig(
+        label_fields=label_fields, target_sum=target_sum,
+        mask_ratio=config.get("mask_ratio", 0.15),
+        pad_value=config.get("pad_value", -2), mask_value=config.get("mask_value", -1),
+        cls_value=config.get("cls_value", -3),
+        sampling_mode=config.get("sampling_mode", "simple"),
+        nonzero_prop=config.get("nonzero_prop", 0.7),
+        fix_nonzero_prop=config.get("fix_nonzero_prop", False),
+        non_hvg_size=config.get("non_hvg_size", 1000),
+        pert_delimiter=delimiter, control_label=control_label,
+    )
+    # Both loaders share one ID per label; labels not supplied are numbered over the selected rows.
+    selected_frame = frame.iloc[selected_rows]
+    labels = {
+        "perturbation": mapping,
+        "celltype": cell_type_to_index or {label: i for i, label in enumerate(dict.fromkeys(selected_frame[celltype_column]))},
+        "batch": batch_to_index or {label: i for i, label in enumerate(dict.fromkeys(selected_frame[batch_column]))},
+    }
+    # A pretrained vocabulary need not have every corpus gene; genes without a token are left out.
+    tokens = GeneTokens.from_corpus(
+        corpus, tokenizer_stoi, feature_id_to_token, pad_token=config.get("pad_token", "<pad>"),
+        cls_token=config.get("cls_token", "<cls>"),
+    )
+    used_datasets = selected_frame["dataset_index"].unique()
+    coverage = corpus.feature_registry.dataset_has_gene[used_datasets] & tokens.tokenizable
+    if not coverage.any(axis=1).all():
+        raise ValueError("Every selected dataset must have at least one tokenizable gene")
+    options = dict(
+        config=adapter_config, tokens=tokens, labels=labels, batch_size=config.get("batch_size", 32),
+        seq_len=config.get("max_seq_len", 1024) - 1, seed=config.get("seed", 0),
+        num_workers=num_workers, multiprocessing_context="spawn" if num_workers else None,
+        persistent_workers=num_workers > 0, device=device,
+        build_in_workers=build_in_workers, batches_per_read=batches_per_read,
+    )
+    metadata = corpus.metadata_index.df
+    pairing = dict(context_columns=context_columns, perturbation_column=perturbation_column, control_labels=(control_label,))
+    train_rows = np.asarray(train_indices, dtype=np.int64)
+    train_loader = PertTFPairedBatchLoader(
+        corpus, rows=train_rows, cover="source",
+        sampler=default_pair_sampler(metadata[train_rows], perturbed_to_self=True, **pairing), **options,
+    )
+    valid_rows = np.asarray(valid_indices, dtype=np.int64)
+    valid_loader = PertTFPairedBatchLoader(
+        corpus, rows=valid_rows, cover="target",
+        sampler=default_pair_sampler(metadata[valid_rows], perturbed_to_self=False, **pairing), **options,
+    )
+    datasets = frame.iloc[valid_rows]["dataset_index"].unique()
+    metric_gene_mask = corpus.feature_registry.dataset_has_gene[datasets].all(axis=0)
+    metric_gene_mask &= tokens.tokenizable
+    if not metric_gene_mask.any():
+        raise ValueError("Validation datasets have no shared tokenizable genes")
+    valid_loader.metric_gene_mask = metric_gene_mask
+    reference_groups = corpus_reference_groups(
+        corpus, valid_rows, context_column=celltype_column,
+        perturbation_column=perturbation_column, gene_mask=metric_gene_mask,
+        target_sum=config.get("perturbation_metric_target_sum", 10000.0),
+        pert_delimiter=delimiter, perturbation_unit=perturbation_unit, control_label=control_label,
+    )
+    # Largest training set, as the AnnData route records it: it caps predicted sets at inference.
+    max_n_pert = max_set_size(frame.iloc[train_rows][perturbation_column], delimiter, control_label)
+    if delimiter is not None:
+        _record_config_value(config, "max_n_pert", max_n_pert)
+    genes = np.asarray(corpus.feature_registry.global_feature_ids)
+    return {
+        "train_loader": train_loader, "valid_loader": valid_loader,
+        "vocab": SimpleVocab.from_dict(tokens.stoi),
+        "genes": genes, "gene_ids": tokens.token_of_gene,
+        "genotype_to_index": dict(mapping), "cell_type_to_index": labels["celltype"],
+        "num_batch_types": len(labels["batch"]), "ps_names": [],
+        "perturbation_validation": True, "control_label": control_label, "max_n_pert": max_n_pert,
+        "perturbation_reference_groups": reference_groups,
+        "metric_gene_ids": genes[metric_gene_mask],
+        "split_report": split_report,
+        "corpus_config": {
+            "adapter": asdict(adapter_config),
+            "batch_to_index": labels["batch"],
+            "expression_kinds": dict(corpus.expression_kinds),
+            "metric_gene_ids": genes[metric_gene_mask].tolist(),
+        },
+    }
