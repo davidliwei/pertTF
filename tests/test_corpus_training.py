@@ -1,9 +1,12 @@
 """Two independent on-disk datasets through the actual training/evaluation loop."""
 
+import pytest
+
+pytest.importorskip("scorpus")  # the optional corpus extra
+
 import anndata as ad
 import numpy as np
 import pandas as pd
-import pytest
 import torch
 import wandb
 from scipy import sparse

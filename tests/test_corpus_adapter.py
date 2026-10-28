@@ -1,10 +1,13 @@
 from pathlib import Path
 
+import pytest
+
+pytest.importorskip("scorpus")  # the optional corpus extra
+
 import anndata as ad
 import numpy as np
 import pandas as pd
 import polars as pl
-import pytest
 import torch
 from scipy import sparse
 
