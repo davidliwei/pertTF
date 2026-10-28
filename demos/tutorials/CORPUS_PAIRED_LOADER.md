@@ -9,7 +9,7 @@ use the loader directly to inspect batches or to pair cells differently.
 
 ## Requirements
 
-- `load_corpus(corpus_root)` must succeed (scorpus >= 0.4.0).
+- `load_corpus(corpus_root)` must succeed (scorpus >= 0.6.0).
 - The metadata must contain the columns in `label_fields` and `dataset_index`,
   with no missing labels in the loader's rows.
 - Every dataset's obs must have `scorpus_total_counts` (written by scorpus
@@ -34,8 +34,7 @@ rows = np.arange(len(corpus.metadata_index))      # or the training rows
 config = PertTFAdapterConfig(
     label_fields={"perturb_label": "perturbation", "cell_context": "celltype", "batch_id": "batch"},
     normalization_scale=1.0,
-    sampling_mode="hvg",
-    hvg_top_k=2000,
+    sampling_mode="hvg",                           # each dataset's highly_variable genes (2,000 here)
     non_hvg_size=1000,
 )
 sampler = default_pair_sampler(
@@ -137,10 +136,12 @@ uniformly within each group:
   `k` expressed genes drawn
 - `"hvg"`: `non_hvg_size` of the dataset's other genes, and its HVGs in the
   remaining `seq_len - non_hvg_size` places (a uniform subset if it has more).
-  HVGs are the dataset's default ones, or its `hvg_top_k` highest ranked: the
-  `highly_variable` genes, ranked by `highly_variable_rank`, of the var loaded
-  with `load_corpus(root, ex_var=True)` (scanpy's HVG columns saved with
-  `save_ex_var`). pertTF's config sets `max_seq_len` to
+  HVGs are the genes of the dataset's var column `highly_variable`, whichever
+  way it was set (any scanpy flavor, another method, a hand-made list): set
+  `corpus.var["highly_variable"]`, save it with `save_ex_var` (or
+  `save_ex_var(name)` to keep several HVG sets) and load with
+  `load_corpus(root, ex_var=True)` (or `ex_var=name`). No rank is used; the
+  number of HVGs is the number of `True` genes. pertTF's config sets `max_seq_len` to
   `n_hvg + non_hvg_size + 1` in this mode; `non_hvg_size` larger than `seq_len`
   is an error.
 

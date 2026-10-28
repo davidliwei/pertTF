@@ -16,7 +16,7 @@ import polars as pl
 import torch
 from torch.utils.data import DataLoader
 
-from scorpus.loaders import ExpressionBatch, FederatedLanceReader, LanceDatasetEntry
+from scorpus.loaders import ExpressionBatch
 from scorpus.pairing import Sampler, combine, cross, make_groups
 
 if TYPE_CHECKING:
@@ -101,13 +101,12 @@ class PertTFAdapterConfig:
     #                round(k * (1 - p) / p) of those, for k expressed genes drawn.
     #   "hvg":       non_hvg_size of the dataset's other genes, and its HVGs in the remaining
     #                seq_len - non_hvg_size places (a uniform subset if it has more). HVGs are the
-    #                dataset's default ones, or its hvg_top_k highest ranked. pertTF's config sets
+    #                genes of the dataset's var column highly_variable. pertTF's config sets
     #                max_seq_len to n_hvg + non_hvg_size + 1 for this mode.
     sampling_mode: str = "uniform"
     nonzero_prop: float = 0.7
     fix_nonzero_prop: bool = False
     non_hvg_size: int = 1000
-    hvg_top_k: int | None = None
 
 
 def default_pair_sampler(
@@ -154,20 +153,6 @@ def default_pair_sampler(
         self_pairs.with_columns(link=pl.lit("self")),
     )
     return Sampler(groups, pairs, links="link")
-
-
-def _worker_reader(corpus: Corpus):
-    """The reader given to worker processes. A concatenated corpus's own reader holds every member
-    corpus, obs included, which each spawned worker would unpickle; this one holds table paths and
-    row ranges only."""
-    if not corpus.members:
-        return corpus.expression_reader
-    entries = []
-    for entry in corpus.dataset_entries:
-        table = corpus.members[entry.dataset_id].dataset_entries[0]
-        entries.append(LanceDatasetEntry(entry.dataset_id, entry.global_start, entry.global_end, table.lance_path,
-                                         table.expression_layout, table.counts_dtype))
-    return FederatedLanceReader(entries)
 
 
 def _csr_rows(csr, positions: np.ndarray):
@@ -533,18 +518,14 @@ class PertTFPairedBatchLoader:
         # Genes without a token are never sampled.
         pool = registry.dataset_has_gene & tokens.tokenizable
         self._sampling_pool = on_device(pool)
-        if config.hvg_top_k is None:
-            hvg = registry.hvg_mask
-        else:
-            ranks = registry.hvg_rank_matrix
-            hvg = (ranks > 0) & (ranks <= config.hvg_top_k)
+        hvg = registry.hvg_mask
         self._hvg = on_device(hvg)
         self._token_of_gene = on_device(tokens.token_of_gene)
 
         self._builder = _CpuBatchBuilder(
             registry.local_to_global_map, pool, hvg, tokens.token_of_gene, tokens.pad_id, tokens.cls_id, config, seq_len,
         ) if build_in_workers else None
-        self.dataset = _PairReads(_worker_reader(corpus), len(self.rows), self._builder)
+        self.dataset = _PairReads(corpus.expression_reader, len(self.rows), self._builder)
         # One DataLoader for all epochs, so persistent workers are reused; its sampler follows set_epoch.
         self._data_loader = DataLoader(
             self.dataset, sampler=_EpochReads(self, batches_per_read), batch_size=None, collate_fn=_unchanged,

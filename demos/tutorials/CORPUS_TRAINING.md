@@ -4,11 +4,11 @@ pertTF owns the corpus adapter. scorpus owns conversion, sparse reads,
 original metadata, and temporary dataset composition. Installing/importing the
 ordinary pertTF model does not require the optional corpus package.
 
-The corpus route needs scorpus >= 0.4.0, which is not on PyPI. Install it from
+The corpus route needs scorpus >= 0.6.0, which is not on PyPI. Install it from
 GitHub, or put a checkout on PYTHONPATH:
 
 ```bash
-pip install git+https://github.com/weili-lab/scorpus.git
+pip install "scorpus @ git+https://github.com/weili-lab/scorpus.git@v0.6.0"
 # or
 export PYTHONPATH=/path/to/perttf_corpus_data_adapter:/path/to/scorpus/src
 ```
@@ -30,7 +30,8 @@ from perttf.model.corpus_data import produce_corpus_datasets
 # config is the same training configuration used by wrapper_train.
 # Required: next_cell_pred_type='pert', GEPC=True,
 # input_emb_style='continuous', ps_weight=0, sampling_mode='uniform' (or
-# 'expressed'; 'hvg' requires HVGs in the loaded var, e.g. load_corpus(root, ex_var=True)).
+# 'expressed'; 'hvg' uses each dataset's var column highly_variable, e.g. from
+# load_corpus(root, ex_var=True)).
 # Genes are drawn with pertTF's quotas: nonzero_prop, fix_nonzero_prop and
 # non_hvg_size are read from config, as in pertTF's collator.
 # max_seq_len includes CLS, matching pertTF's existing convention.

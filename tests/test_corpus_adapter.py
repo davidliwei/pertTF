@@ -19,8 +19,8 @@ GENES = ["GENE_A", "GENE_B", "GENE_C", "GENE_D"]
 
 def _standalone(tmp_path: Path, dataset: dict):
     """One dataset converted from a small h5ad (which gives each cell its scorpus_total_counts).
-    Cells are (perturbation, expressed local genes, counts). With "hvg" = (highly_variable,
-    highly_variable_rank), scanpy's HVG columns are saved as ex_var and the corpus reloaded with them."""
+    Cells are (perturbation, expressed local genes, counts). With "hvg" (one bool per gene), the var
+    column highly_variable is saved as ex_var and the corpus reloaded with it."""
     name, genes, cells = dataset["name"], dataset["genes"], dataset["cells"]
     counts = np.zeros((len(cells), len(genes)), dtype=np.int32)
     for row, (_, expressed, values) in enumerate(cells):
@@ -37,7 +37,7 @@ def _standalone(tmp_path: Path, dataset: dict):
     corpus = from_h5ad(source, tmp_path / name)
     if "hvg" not in dataset:
         return corpus
-    corpus.var["highly_variable"], corpus.var["highly_variable_rank"] = dataset["hvg"]
+    corpus.var["highly_variable"] = dataset["hvg"]
     corpus.save_ex_var()
     return load_corpus(tmp_path / name, ex_var=True)
 
@@ -175,12 +175,11 @@ def test_full_expression_on_mixed_panels(tmp_path, in_workers):
 
 @BUILDS
 def test_sampling_modes(tmp_path, in_workers):
-    """Two datasets with genes A-D and saved scanpy HVGs: ds0 A, B (A ranked first); ds1 C, D (D first)."""
-    no = np.nan
+    """Two datasets with genes A-D and saved HVGs: ds0 A, B; ds1 C, D."""
     corpus = _corpus(tmp_path, [
-        {"name": "ds0", "genes": GENES, "hvg": ([True, True, False, False], [0.0, 1.0, no, no]),
+        {"name": "ds0", "genes": GENES, "hvg": [True, True, False, False],
          "cells": [("WT", [0, 2], [5, 1]), ("KO", [1, 3], [3, 2])]},
-        {"name": "ds1", "genes": GENES, "hvg": ([False, False, True, True], [no, no, 1.0, 0.0]),
+        {"name": "ds1", "genes": GENES, "hvg": [False, False, True, True],
          "cells": [("WT", [0, 1], [2, 4]), ("KO", [2, 3], [6, 7])]},
     ])
 
@@ -192,8 +191,6 @@ def test_sampling_modes(tmp_path, in_workers):
     # hvg: non_hvg_size other genes, then the HVGs in the remaining places.
     for genes in drawn(2, sampling_mode="hvg", non_hvg_size=1):
         assert np.isin(genes[0], [0, 1]).sum() == 1 and np.isin(genes[1], [2, 3]).sum() == 1
-    for genes in drawn(2, sampling_mode="hvg", non_hvg_size=1, hvg_top_k=1):
-        assert 0 in genes[0] and 3 in genes[1]
     # expressed: round(0.5 * 2) = 1 expressed gene (ds0 WT: A, C; ds1 WT: A, B), then 1 unexpressed.
     for genes in drawn(2, sampling_mode="expressed", nonzero_prop=0.5):
         assert np.isin(genes[0], [0, 2]).sum() == 1 and np.isin(genes[1], [0, 1]).sum() == 1
@@ -209,7 +206,7 @@ def test_sampling_modes(tmp_path, in_workers):
     {"sampling_mode": "uniform"},
     {"sampling_mode": "expressed"},
     {"sampling_mode": "expressed", "nonzero_prop": 0.5, "fix_nonzero_prop": True},
-    {"sampling_mode": "hvg", "non_hvg_size": 3, "hvg_top_k": 6},
+    {"sampling_mode": "hvg", "non_hvg_size": 3},
 ], ids=["uniform", "expressed", "expressed_fixed", "hvg"])
 def test_quotas_match_pertTF(tmp_path, in_workers, config):
     """Per cell, as many genes from each group as pertTF's weighted_sample takes for the same cell."""
@@ -220,10 +217,8 @@ def test_quotas_match_pertTF(tmp_path, in_workers, config):
     for i in range(30):
         expressed = np.sort(rng.choice(n_genes, rng.integers(0, 9), replace=False))
         cells.append(("WT" if i % 3 == 0 else "KO", expressed.tolist(), (expressed + 1).tolist()))
-    ranks = rng.permutation(n_genes) + 1
-    # 8 saved HVGs (scanpy ranks from 0), of which hvg_top_k takes the 6 highest ranked.
-    hvg = (ranks <= 8, np.where(ranks <= 8, ranks - 1.0, np.nan))
-    corpus = _corpus(tmp_path, [{"name": "ds0", "genes": [f"G{i}" for i in range(n_genes)], "hvg": hvg,
+    is_hvg = rng.permutation(n_genes) < 6                                   # 6 saved HVGs
+    corpus = _corpus(tmp_path, [{"name": "ds0", "genes": [f"G{i}" for i in range(n_genes)], "hvg": is_hvg,
                                  "cells": cells}])
     loader = _loader(corpus, seq_len=seq_len, build_in_workers=in_workers, **config)
     rows = np.arange(len(cells))
@@ -232,7 +227,7 @@ def test_quotas_match_pertTF(tmp_path, in_workers, config):
     for row, (_, expressed, counts) in enumerate(cells):
         values = np.zeros(n_genes)
         values[expressed] = counts
-        group = values > 0 if mode == "expressed" else ranks <= 6 if mode == "hvg" else np.ones(n_genes, dtype=bool)
+        group = values > 0 if mode == "expressed" else is_hvg if mode == "hvg" else np.ones(n_genes, dtype=bool)
         genes = drawn[row][drawn[row] != 0] - 4                             # pad token 0; gene g is token 4 + g
         assert len(set(genes.tolist())) == len(genes)
         index = weighted_sample(values, seq_len, rng=rng, mode={"uniform": "simple"}.get(mode, mode),
