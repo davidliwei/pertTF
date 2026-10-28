@@ -98,6 +98,8 @@ def test_gene_tokens(tmp_path):
     assert list(new.stoi) == ["<pad>", "<cls>", "<unk>", "<eos>", *GENES]
     assert new.token_of_gene.tolist() == [4, 5, 6, 7] and new.tokenizable.all()
     assert (new.pad_id, new.cls_id) == (0, 1)
+    renamed = GeneTokens.from_corpus(corpus, pad_token="[PAD]", cls_token="[CLS]")
+    assert list(renamed.stoi)[:2] == ["[PAD]", "[CLS]"] and (renamed.pad_id, renamed.cls_id) == (0, 1)
 
     pretrained = GeneTokens.from_corpus(corpus, {"<pad>": 0, "<cls>": 1, "GENE_A": 17, "C_alias": 23},
                                         feature_id_to_token={"GENE_A": "GENE_A", "GENE_C": "C_alias"})
@@ -307,6 +309,8 @@ def test_size_factors_from_stored_totals(tmp_path, in_workers):
         batch = loader.build_batch(cells, cells, seed=0)
         size_factor = np.where(totals > 0, totals / target, 1.0).astype(np.float32)
         torch.testing.assert_close(batch["sf"], torch.from_numpy(1 / size_factor).reshape(-1, 1))
+        only_zero_cell = loader.build_batch(np.array([1]), np.array([1]), seed=0)  # a read with no stored counts
+        assert not (only_zero_cell["target_values"][:, 1:] > 0).any()
 
 
 def test_corpus_without_total_counts_raises(tmp_path):

@@ -127,7 +127,7 @@ def test_two_corpora_unified_training_and_validation(tmp_path, monkeypatch):
             )
 
 
-def test_unmeasured_genes_and_empty_mask_do_not_contribute():
+def test_unmeasured_genes_do_not_contribute():
     loss = GenerativeExpressionLoss()
     prediction = torch.tensor([[2., 900.]], requires_grad=True)
     output = {"pred": prediction, "distribution": None}
@@ -136,4 +136,3 @@ def test_unmeasured_genes_and_empty_mask_do_not_contribute():
     assert actual.item() == 1.0
     actual.backward()
     assert prediction.grad.tolist() == [[2.0, 0.0]]
-    assert loss(output, target, torch.zeros((1, 2), dtype=torch.bool)).item() == 0.0

@@ -79,7 +79,8 @@ class GeneTokens:
         existing tokenizer such as a pretrained checkpoint's; genes it lacks get no token."""
         genes = corpus.feature_registry.global_feature_ids
         if tokenizer_stoi is None:
-            stoi = {token: token_id for token_id, token in enumerate((*SPECIAL_TOKENS, *genes))}
+            specials = dict.fromkeys((pad_token, cls_token, *SPECIAL_TOKENS))  # the requested names first
+            stoi = {token: token_id for token_id, token in enumerate((*specials, *genes))}
         else:
             stoi = {token: int(token_id) for token, token_id in tokenizer_stoi.items()}
         names = genes if feature_id_to_token is None else [feature_id_to_token.get(gene) for gene in genes]
@@ -422,6 +423,8 @@ class _CpuBatchBuilder:
     def _lookup(self, csr, rows, local_genes):
         """Counts of CSR rows ``rows`` at dataset-local genes (B x L); 0 where not stored or the gene is -1."""
         offsets, genes, counts = csr
+        if len(genes) == 0:  # every cell in the read has zero counts
+            return np.zeros(local_genes.shape, dtype=counts.dtype)
         key = np.repeat(np.arange(len(offsets) - 1), np.diff(offsets)) * self.n_local + genes
         if not (np.diff(key) > 0).all():  # genes within a row not sorted in the table
             order = np.argsort(key, kind="stable")

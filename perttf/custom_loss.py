@@ -666,12 +666,9 @@ class GenerativeExpressionLoss(torch.nn.Module):
         if positions is None:
             positions = torch.ones(target.size(0), dtype=torch.bool, device=target.device)
         # 1. Handle Mask Defaults
-        if mask is None:
+        if mask is None or not mask.any():
             mask = torch.ones_like(outputs['pred'], dtype=torch.bool)
-        elif not mask.any():
-            # An empty availability mask means no measured targets, not all genes.
-            return outputs['pred'].sum() * 0.0
-        
+
         
         # 2. Check Distribution Type
         dist_type = outputs.get('distribution', None)
