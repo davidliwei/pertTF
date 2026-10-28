@@ -167,7 +167,8 @@ parameters = dict(
     epochs=1, lr=1e-4, schedule_ratio=0.9, amp=True, seed=0, log_interval=50, do_train=True,
     dab_weight=0.0, ADV=False, use_batch_label=False, perturbation_input=False,
     next_weight=1.0, this_weight=1.0, ecs_thres=0.0, CCE=False,
-    explicit_zero_prob=False, distribution=None, mvc_masked_train=False,
+    explicit_zero_prob=False, mvc_masked_train=False,
+    distribution="nb",              # negative binomial expression decoder (also passed to the model)
     cell_type_classifier=True, genotype_classifier=True,
     cell_type_classifier_weight=0.1, perturbation_classifier_weight=0.1,
     # Validation metrics
@@ -230,7 +231,7 @@ model = HFPerturbationTFModel(
     use_fast_transformer=False, pre_norm=False,
     n_cls=len(data_gen["cell_type_to_index"]), nlayers_cls=2, input_emb_style="continuous",
     genotype_to_index=data_gen["genotype_to_index"], cell_type_to_index=data_gen["cell_type_to_index"],
-    control_label=CONTROL,
+    control_label=CONTROL, distribution=run.config["distribution"],
     # pert_sources=sources,
 ).to(device)
 save_dir = Path("runs/screen_and_context")   # a Path
@@ -274,8 +275,10 @@ pertTF model (see the training options guide).
   `target_sum=None`, over the median positive total of its dataset's cells in
   that loader's rows (training and validation then each use their own median);
   1 for a cell without counts.
-- `sf` is the normalization multiplier, `1 / size_factor`. Count-distribution
-  losses use it to turn values back into the cell's counts.
+- `sf` is the normalization multiplier, `1 / size_factor`. With a count
+  distribution (`distribution="nb"` above), the decoder divides its prediction by
+  `sf` to get the cell's expected counts, and the loss turns the target values
+  back into the cell's counts with `expm1(value) / sf`.
 - Corpora stored without counts are rejected by this route.
 - Original and recovered counts are recorded separately by the corpus. Recovery
   passing integer checks does not prove original absolute molecular counts.
