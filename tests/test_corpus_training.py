@@ -16,16 +16,21 @@ from perttf.custom_loss import GenerativeExpressionLoss
 from perttf.model.corpus_data import produce_corpus_datasets
 from perttf.model.hf import HFPerturbationTFModel
 from perttf.model.train_function import evaluate, wrapper_train
+from perttf.utils.pert_metrics import group_moments_from_anndata
 
 
-def build_corpus(tmp_path):
+COUNTS = np.array([[1, 2, 0], [2, 4, 1], [3, 1, 2], [1, 3, 1], [2, 5, 2], [3, 2, 1]], dtype=np.int32)
+G1_G3 = {"a": [0, 2], "b": [1, 0]}  # columns of the shared genes g1, g3 in each dataset's panel
+
+
+def build_corpus(tmp_path, labels=("ctrl", "P1", "P1", "ctrl", "P1", "P1")):
     members = {}
     for name, genes, perturb_col in (("a", ["g1", "g2", "g3"], "target"), ("b", ["g3", "g1", "g4"], "genotype")):
         obs = pd.DataFrame({
-            perturb_col: ["ctrl", "P1", "P1", "ctrl", "P1", "P1"],
+            perturb_col: list(labels),
             "celltype": ["T"] * 6, "batch": [name] * 6,
         }, index=[f"cell{i}" for i in range(6)])
-        counts = np.array([[1, 2, 0], [2, 4, 1], [3, 1, 2], [1, 3, 1], [2, 5, 2], [3, 2, 1]], dtype=np.int32)
+        counts = COUNTS
         data = ad.AnnData(sparse.csr_matrix(counts), obs=obs, var=pd.DataFrame(index=genes))
         source = tmp_path / f"{name}.h5ad"
         data.write_h5ad(source)
@@ -124,6 +129,100 @@ def test_two_corpora_unified_training_and_validation(tmp_path, monkeypatch):
                 corpus, run.config, train_indices=[0, 1, 2], valid_indices=[0, 1, 4],
                 perturbation_column="perturbation", celltype_column="celltype", batch_column="batch",
                 control_label="ctrl", pert_sources=sources,
+            )
+
+
+def test_multi_perturbation_sets(tmp_path, monkeypatch):
+    """With pert_delimiter, "A+B" is the set {A, B} through the loaders, the metric groups, training, and
+    a saved model's prediction of a combination it never saw."""
+    torch.set_num_threads(2)
+    monkeypatch.setenv("WANDB_DIR", str(tmp_path))
+    labels = ["ctrl", "A", "B+C", "ctrl", "A+B", "C"]  # rows 0-2 of each dataset train, 3-5 validate
+    parameters = dict(
+        next_cell_pred_type="pert", GEPC=True, input_emb_style="continuous",
+        batch_size=6, max_seq_len=4, mask_ratio=0.5, sampling_mode="simple",
+        seed=4, ps_weight=0.0, pad_token="<pad>", pad_value=-2, mask_value=-1,
+        amp=False, dab_weight=0.0, ADV=False, lr=1e-3, schedule_ratio=0.9,
+        log_interval=100, use_batch_label=False, perturbation_input=False,
+        next_weight=1.0, this_weight=1.0, ecs_thres=0.0, CCE=False,
+        explicit_zero_prob=False, distribution=None, mvc_masked_train=False,
+        cell_type_classifier=True, genotype_classifier=True,
+        cell_type_classifier_weight=0.1, perturbation_classifier_weight=0.1,
+        perturbation_metric_min_cells=1, perturbation_metric_mode="mean",
+        perturbation_metric_target_sum=10000.0, epochs=1, do_train=True,
+        dataset_name="synthetic_multi_corpus", pert_delimiter="+", perturbation_unit="single",
+    )
+    with wandb.init(mode="disabled", config=parameters) as run:
+        corpus = build_corpus(tmp_path, labels)
+        options = dict(
+            perturbation_column="perturbation", celltype_column="celltype", batch_column="batch",
+            control_label="ctrl",
+        )
+        data_gen = produce_corpus_datasets(
+            corpus, run.config, train_indices=[0, 1, 2, 6, 7, 8], valid_indices=[3, 4, 5, 9, 10, 11], **options,
+        )
+        mapping = data_gen["genotype_to_index"]
+        assert set(mapping) == {"ctrl", "A", "B", "C"}
+        assert data_gen["max_n_pert"] == 2 and run.config["max_n_pert"] == 2
+        batch = next(iter(data_gen["valid_loader"]))
+        for ids, name in zip(batch["perturbation_labels_next"].tolist(), batch["pert_name_next"]):
+            assert sorted(i for i in ids if i >= 0) == sorted(mapping[part] for part in name.split("+"))
+
+        # Each component's reference group holds every validation cell carrying it, as in the AnnData route.
+        valid = [(name, row) for name in ("a", "b") for row in (3, 4, 5)]
+        reference = ad.AnnData(
+            np.array([COUNTS[row, G1_G3[name]] for name, row in valid], dtype=np.float32),
+            obs=pd.DataFrame({"celltype": "T", "genotype": [labels[row] for _, row in valid]},
+                             index=[f"{name}{row}" for name, row in valid]),
+        )
+        expected = group_moments_from_anndata(
+            reference, np.arange(len(valid)), input_scale="counts", perturbation_unit="single",
+            pert_delimiter="+", control_value="ctrl",
+        ).finalize()
+        assert set(data_gen["perturbation_reference_groups"]) == set(expected) == {("T", p) for p in mapping}
+        for key, group in expected.items():
+            np.testing.assert_allclose(data_gen["perturbation_reference_groups"][key].mean, group.mean)
+
+        model = HFPerturbationTFModel(
+            n_pert=len(mapping), nlayers_pert=2, n_ps=0, d_model=16, nhead=2, d_hid=32, nlayers=1,
+            vocab=data_gen["vocab"], dropout=0.0, pad_token="<pad>", pad_value=-2,
+            do_mvc=True, do_dab=False, use_batch_labels=False, num_batch_labels=2,
+            domain_spec_batchnorm=False, n_bins=0, ecs_threshold=0.0,
+            explicit_zero_prob=False, use_fast_transformer=False, pre_norm=False,
+            n_cls=1, nlayers_cls=2, input_emb_style="continuous",
+            genotype_to_index=mapping, cell_type_to_index=data_gen["cell_type_to_index"], control_label="ctrl",
+            training_config=run.config.as_dict(),
+        )
+        save_dir = tmp_path / "training"
+        save_dir.mkdir()
+        best = wrapper_train(model, run.config, data_gen, save_dir=save_dir, device=torch.device("cpu"))
+        result = evaluate(
+            best, data_gen["valid_loader"], run.config, data_gen["vocab"], device=torch.device("cpu"),
+            cell_type_to_index=data_gen["cell_type_to_index"], genotype_to_index=mapping,
+            expr_prediction_mode="mean",
+        )
+        assert all(np.isfinite(v) for v in result["losses"].values())
+        assert set(result["predicted_groups"]) == set(expected)
+
+        # Saved and reloaded, the model predicts the unseen set "A+C" from control cells exported as AnnData,
+        # with the delimiter and set-size cap from its training config.
+        best.save_pretrained(str(save_dir / "model"))
+        reloaded = HFPerturbationTFModel.from_pretrained(str(save_dir / "model"))
+        assert reloaded.training_config["pert_delimiter"] == "+" and reloaded.training_config["max_n_pert"] == 2
+        query = corpus.to_anndata(global_row_indices=[0, 3])                # the controls of dataset a
+        counts = query.X.toarray()
+        query.layers["lognorm"] = np.log1p(counts / counts.sum(axis=1, keepdims=True) * 10000)
+        query.obs["genotype"], query.obs["genotype_next"] = "ctrl", "A+C"
+        predicted = reloaded.predict_perturbations(query, input_layer="lognorm", prediction_mode="mean", device="cpu")
+        assert predicted.uns["perttf_prediction"]["pert_delimiter"] == "+"
+        assert predicted.obsm["mvc_next_expr"].shape == (2, 3) and np.isfinite(predicted.obsm["mvc_next_expr"]).all()
+        assert all(len(label.split("+")) <= 2 for label in predicted.obs["predicted_genotype"])
+
+        (tmp_path / "respelled").mkdir()
+        respelled = build_corpus(tmp_path / "respelled",["ctrl", "A", "B+A", "ctrl", "A+B", "B"])
+        with pytest.raises(ValueError, match="canonical"):
+            produce_corpus_datasets(
+                respelled, run.config, train_indices=[0, 1, 2, 6, 7, 8], valid_indices=[3, 4, 5, 9, 10, 11], **options,
             )
 
 

@@ -285,6 +285,24 @@ def test_labels(tmp_path, in_workers):
     assert loader.label_to_index_by_name["batch"] == {"ds0_batch": 0, "ds1_batch": 1}
 
 
+@BUILDS
+def test_perturbation_sets(tmp_path, in_workers):
+    """With pert_delimiter a label's IDs are its components, padded with -1 to the batch's widest
+    set; the control is dropped from combinations. Validation reads the target's label from pert_name_next."""
+    corpus = _corpus(tmp_path, [{"name": "ds0", "genes": GENES, "cells": [
+        ("WT", [0], [1]), ("A", [1], [2]), ("A+B", [2], [3]), ("WT+B", [3], [4]),
+    ]}])
+    loader = _loader(corpus, build_in_workers=in_workers, pert_delimiter="+")
+    assert loader.label_to_index_by_name["perturbation"] == {"WT": 0, "A": 1, "B": 2}
+    batch = loader.build_batch(np.arange(4), np.array([1, 2, 3, 0]), seed=0)
+    assert batch["perturbation_labels"].tolist() == [[0, -1], [1, -1], [1, 2], [2, -1]]
+    assert batch["perturbation_labels_next"].tolist() == [[1, -1], [1, 2], [2, -1], [0, -1]]
+    assert batch["pert_name_next"].tolist() == ["A", "A+B", "WT+B", "WT"]
+    singles = loader.build_batch(np.array([0, 1]), np.array([1, 3]), seed=0)          # no set in this batch
+    assert singles["perturbation_labels"].tolist() == [[0], [1]]
+    assert singles["perturbation_labels_next"].tolist() == [[1], [2]]
+
+
 def test_missing_label_raises(tmp_path):
     corpus = _corpus(tmp_path, [{"name": "ds0", "genes": GENES, "batch": ["b0", None],
                                  "cells": [("WT", [0], [1]), ("KO", [1], [2])]}])

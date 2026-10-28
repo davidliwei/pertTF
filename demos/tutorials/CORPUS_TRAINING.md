@@ -204,6 +204,13 @@ data_gen = produce_corpus_datasets(
   validation cell once as a target: a perturbed target gets a random control of
   its context, a control is paired with itself. Split and missing-control
   checks run here.
+- Multi-perturbation cells: with `pert_delimiter="+"` in the configuration, a
+  label such as `"A+B"` is the set {A, B}, as in the AnnData route
+  ([MULTI_PERTURBATION.md](MULTI_PERTURBATION.md)): the mapping holds single
+  perturbations, the model combines their embeddings (`pert_aggregation`), and
+  `perturbation_unit="single"` scores each set under each of its components.
+  Labels must already be canonical (`"A+B"`, not `"B+A"`); the corpus is not
+  rewritten.
 - Workers: each read covers `batches_per_read` batches; on network storage a
   read of about 1,000 pairs is efficient. With `num_workers > 0` the workers are
   started with `spawn`, which imports your script again in each worker: put the
@@ -233,6 +240,8 @@ model = HFPerturbationTFModel(
     genotype_to_index=data_gen["genotype_to_index"], cell_type_to_index=data_gen["cell_type_to_index"],
     control_label=CONTROL, distribution=run.config["distribution"],
     # pert_sources=sources,
+    # The run's settings, including those produce_corpus_datasets recorded (max_n_pert), saved with the model.
+    training_config=run.config.as_dict(),
 ).to(device)
 save_dir = Path("runs/screen_and_context")   # a Path
 save_dir.mkdir(parents=True, exist_ok=True)
@@ -263,9 +272,30 @@ pertTF model (see the training options guide).
   result["losses"], result["predicted_groups"]
   ```
 
+- To keep the model for inference, save it in its own directory (`save_dir`
+  already has `wrapper_train`'s `config.json`) and load it with `from_pretrained`.
+  Its training config is the run's, so settings such as `pert_delimiter` and
+  `max_n_pert` come with it:
+
+  ```python
+  best_model.save_pretrained(save_dir / "model")
+  model = HFPerturbationTFModel.from_pretrained(save_dir / "model")
+  ```
+
 - `predict_perturbations` and `run_lora_train` are AnnData-based. Cells of one
   dataset can be exported with `corpus.to_anndata(global_row_indices=rows)`;
-  the model was trained on `log1p(count / total × target_sum)` values.
+  the model was trained on `log1p(count / total × target_sum)` values, so put
+  those in the input layer:
+
+  ```python
+  query = corpus.to_anndata(global_row_indices=control_rows)   # rows of one dataset
+  counts = query.X.toarray()
+  query.layers["lognorm"] = np.log1p(counts / counts.sum(axis=1, keepdims=True) * 10000)
+  query.obs["celltype"] = query.obs["cell_type"]
+  query.obs["genotype"] = CONTROL
+  query.obs["genotype_next"] = "GENE_A"   # with pert_delimiter, also a set of known genes, e.g. "GENE_A+GENE_B"
+  predicted = model.predict_perturbations(query, input_layer="lognorm", prediction_mode="mean")
+  ```
 
 ## How values are normalized
 

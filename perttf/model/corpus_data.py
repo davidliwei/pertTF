@@ -11,13 +11,17 @@ from scorpus.loaders import dense_counts
 
 from .corpus_adapter import GeneTokens, PertTFAdapterConfig, PertTFPairedBatchLoader, default_pair_sampler
 from .pert_emb import build_perturbation_mapping
+from .train_data_gen import _record_config_value
 from ..utils.custom_tokenizer import SimpleVocab
 from ..utils.split_check import check_train_valid_split
-from ..utils.pert_metrics import GroupMoments, normalize_expression
+from ..utils.pert_labels import canonical_label, max_set_size, validate_perturbation_labels
+from ..utils.pert_metrics import GroupMoments, expand_perturbation_rows, normalize_expression
 
 
-def corpus_reference_groups(corpus, rows, *, context_column, perturbation_column, gene_mask, target_sum=10000.0, chunk_rows=1024):
-    """Stream reference moments over the same common gene axis used in evaluation."""
+def corpus_reference_groups(corpus, rows, *, context_column, perturbation_column, gene_mask, target_sum=10000.0,
+                            pert_delimiter=None, perturbation_unit="set", control_label="WT", chunk_rows=1024):
+    """Stream reference moments over the same common gene axis used in evaluation, with sets split into
+    their components for perturbation_unit="single" as evaluation splits the predictions."""
     selected_genes = np.flatnonzero(gene_mask)
     moments = GroupMoments()
     rows = np.asarray(rows, dtype=np.int64)
@@ -27,10 +31,11 @@ def corpus_reference_groups(corpus, rows, *, context_column, perturbation_column
         metadata = corpus.take_metadata(selected, columns=[context_column, perturbation_column])
         counts, _ = dense_counts(corpus, batch, genes=selected_genes)
         expression = counts.astype(np.float64)
-        moments.update(
+        moments.update(*expand_perturbation_rows(
             normalize_expression(expression, target_sum=target_sum, input_scale="counts"),
             metadata[context_column], metadata[perturbation_column],
-        )
+            pert_delimiter, perturbation_unit, control_label,
+        ))
     return moments.finalize()
 
 
@@ -74,6 +79,11 @@ def produce_corpus_datasets(
     Perturbation metrics use the tokenizable intersection of the validation
     datasets' feature panels. Full-expression losses use availability masks.
 
+    With ``pert_delimiter`` in config, labels such as "A+B" are perturbation sets as in the
+    AnnData route: the mapping holds single perturbations, each cell's IDs are a padded set, and
+    ``perturbation_unit`` decides whether metrics group by set or by component. Set labels must
+    already be canonical (components sorted, e.g. "A+B", not "B+A").
+
     Genes are drawn with pertTF's quotas (``sampling_mode``, ``nonzero_prop``,
     ``fix_nonzero_prop``, ``non_hvg_size`` from config). Workers read expression,
     ``batches_per_read`` batches at a time. Batches are built on ``device`` (pass the training
@@ -98,14 +108,28 @@ def produce_corpus_datasets(
     selected_rows = np.union1d(train_indices, valid_indices)
     if frame.iloc[selected_rows][list(dict.fromkeys([*label_fields, *context_columns]))].isna().any().any():
         raise ValueError("Selected training/validation metadata contains missing labels")
+    delimiter = config.get("pert_delimiter", None)
+    perturbation_unit = config.get("perturbation_unit", "set")
+    observed = frame.iloc[selected_rows][perturbation_column].astype(str).unique()
+    validate_perturbation_labels(observed, delimiter, control_label, existing_mapping=genotype_to_index,
+                                 max_perts_per_cell=config.get("max_perts_per_cell", None))
+    # Pairing, the split check and the metric groups compare label strings, so a set has one spelling.
+    respelled = [label for label in observed if canonical_label(label, delimiter, control_label) != label]
+    if respelled:
+        raise ValueError(
+            f"Perturbation sets must be spelled canonically (components sorted, no control or repeats), "
+            f"e.g. {[(label, canonical_label(label, delimiter, control_label)) for label in respelled[:3]]}"
+        )
     split_report = check_train_valid_split(
         ad.AnnData(obs=frame), train_indices, valid_indices, "pert",
         control_value=control_label, context_col=celltype_column,
         perturbation_col=perturbation_column, min_cells=config.get("perturbation_metric_min_cells", 30),
+        perturbation_unit=perturbation_unit, pert_delimiter=delimiter,
     )
     sources = pert_sources or {}
     mapping = genotype_to_index if genotype_to_index is not None else build_perturbation_mapping(
         frame.iloc[selected_rows][perturbation_column].tolist(), sources, control_label=control_label,
+        delimiter=delimiter,
     )
     source_ids = {gene for genes, _ in sources.values() for gene in genes}
     if source_ids.difference(mapping):
@@ -119,6 +143,7 @@ def produce_corpus_datasets(
         nonzero_prop=config.get("nonzero_prop", 0.7),
         fix_nonzero_prop=config.get("fix_nonzero_prop", False),
         non_hvg_size=config.get("non_hvg_size", 1000),
+        pert_delimiter=delimiter, control_label=control_label,
     )
     # Both loaders share one ID per label; labels not supplied are numbered over the selected rows.
     selected_frame = frame.iloc[selected_rows]
@@ -165,7 +190,12 @@ def produce_corpus_datasets(
         corpus, valid_rows, context_column=celltype_column,
         perturbation_column=perturbation_column, gene_mask=metric_gene_mask,
         target_sum=config.get("perturbation_metric_target_sum", 10000.0),
+        pert_delimiter=delimiter, perturbation_unit=perturbation_unit, control_label=control_label,
     )
+    # Largest training set, as the AnnData route records it: it caps predicted sets at inference.
+    max_n_pert = max_set_size(frame.iloc[train_rows][perturbation_column], delimiter, control_label)
+    if delimiter is not None:
+        _record_config_value(config, "max_n_pert", max_n_pert)
     genes = np.asarray(corpus.feature_registry.global_feature_ids)
     return {
         "train_loader": train_loader, "valid_loader": valid_loader,
@@ -173,7 +203,7 @@ def produce_corpus_datasets(
         "genes": genes, "gene_ids": tokens.token_of_gene,
         "genotype_to_index": dict(mapping), "cell_type_to_index": labels["celltype"],
         "num_batch_types": len(labels["batch"]), "ps_names": [],
-        "perturbation_validation": True, "control_label": control_label,
+        "perturbation_validation": True, "control_label": control_label, "max_n_pert": max_n_pert,
         "perturbation_reference_groups": reference_groups,
         "metric_gene_ids": genes[metric_gene_mask],
         "split_report": split_report,

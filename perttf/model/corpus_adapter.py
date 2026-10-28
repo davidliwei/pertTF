@@ -19,6 +19,8 @@ from torch.utils.data import DataLoader
 from scorpus.loaders import ExpressionBatch
 from scorpus.pairing import Sampler, combine, cross, make_groups
 
+from ..utils.pert_labels import labels_to_padded_array, max_set_size, unique_perturbations
+
 if TYPE_CHECKING:
     from scorpus import Corpus
 
@@ -120,6 +122,11 @@ class PertTFAdapterConfig:
     nonzero_prop: float = 0.7
     fix_nonzero_prop: bool = False
     non_hvg_size: int = 1000
+    # With pert_delimiter, a perturbation label such as "A+B" is the set of its components, as in
+    # pertTF's AnnData route: its IDs are a row [A, B, -1, ...] padded to the batch's largest set,
+    # and control_label is dropped from combinations ("WT+A" is A).
+    pert_delimiter: str | None = None
+    control_label: str = "WT"
 
 
 def default_pair_sampler(
@@ -466,8 +473,8 @@ class PertTFPairedBatchLoader:
     seed they draw different genes.
 
     ``labels`` gives {label: ID} for some or all label names of ``config.label_fields``; the
-    others are numbered in order of first appearance in ``rows``. The target's labels are the
-    target cell's own.
+    others are numbered in order of first appearance in ``rows`` (with ``pert_delimiter``, the
+    perturbation's components). The target's labels are the target cell's own.
     """
 
     def __init__(
@@ -508,16 +515,21 @@ class PertTFPairedBatchLoader:
         metadata = corpus.metadata_index.df[self.rows]
         self.label_to_index_by_name: dict[str, dict[str, int]] = {}
         self._label_ids: dict[str, np.ndarray] = {}
+        self._perturbation_names = None
         for column, name in config.label_fields.items():
             values = metadata[column]
             # A missing label would become a wrong class ID without any error.
             if values.null_count():
                 raise ValueError(f"{values.null_count()} rows have no {column!r}; leave them out of rows")
-            mapping = dict((labels or {}).get(name) or {
-                label: index for index, label in enumerate(values.unique(maintain_order=True).to_list())
-            })
+            unique = values.unique(maintain_order=True).to_list()
+            as_sets = name == "perturbation" and config.pert_delimiter is not None
+            names = unique_perturbations(unique, config.pert_delimiter, config.control_label) if as_sets else unique
+            mapping = dict((labels or {}).get(name) or {label: index for index, label in enumerate(names)})
             self.label_to_index_by_name[name] = mapping
-            self._label_ids[name] = values.replace_strict(mapping, return_dtype=pl.Int32).to_numpy()
+            if as_sets:
+                self._perturbation_names = values.cast(pl.String)  # split into IDs per batch (see _labels)
+            else:
+                self._label_ids[name] = values.replace_strict(mapping, return_dtype=pl.Int32).to_numpy()
         self._dataset_index = metadata["dataset_index"].to_numpy()
         self._size_factor = _size_factors(corpus, self.rows, self._dataset_index, config.target_sum).astype(np.float32)
 
@@ -564,29 +576,48 @@ class PertTFPairedBatchLoader:
         batches = self._epoch_batches()
         for read in self._data_loader:
             for i, *expression in read:
-                if self._builder is None:
-                    yield self._build(*batches[i], *expression, self._batch_seed(i))
-                else:
-                    yield self._finish(*expression)
+                yield self._batch(*batches[i], expression, self._batch_seed(i))
 
     def build_batch(self, source: np.ndarray, target: np.ndarray, seed: int) -> dict[str, torch.Tensor]:
         """One batch for the cells at positions ``source`` and ``target`` of ``rows``."""
         ((_, *expression),) = _read_batches(
             self.corpus.expression_reader, [self._item(-1, source, target, seed)], self._builder,
         )
-        return self._build(source, target, *expression, seed) if self._builder is None else self._finish(*expression)
+        return self._batch(source, target, expression, seed)
+
+    def _batch(self, source, target, expression, seed: int) -> dict:
+        batch = self._build(source, target, *expression, seed) if self._builder is None else self._finish(*expression)
+        if self._perturbation_names is not None:
+            # Multi-perturbation validation groups predictions by the target's label, not its ID set.
+            batch["pert_name_next"] = self._perturbation_names.gather(target).to_numpy()
+        return batch
+
+    def _labels(self, source, target) -> tuple[dict, dict]:
+        """Each label's IDs for the source and target cells. With pert_delimiter a perturbation label
+        is split into its components' IDs, padded with -1 to the widest set among the batch's source
+        and target cells (they share a width: CCE stacks them)."""
+        labels = {name: ids[source] for name, ids in self._label_ids.items()}
+        labels_next = {name: ids[target] for name, ids in self._label_ids.items()}
+        if self._perturbation_names is not None:
+            delimiter, control = self.config.pert_delimiter, self.config.control_label
+            mapping = self.label_to_index_by_name["perturbation"]
+            names = self._perturbation_names.gather(np.concatenate([source, target])).to_list()
+            width = max_set_size(names, delimiter, control)
+            ids = np.stack([labels_to_padded_array(name, mapping, delimiter, width, control) for name in names])
+            labels["perturbation"], labels_next["perturbation"] = ids[:len(source)], ids[len(source):]
+        return labels, labels_next
 
     def _batch_seed(self, batch_index: int) -> int:
         return int(np.random.SeedSequence([self.seed, self.epoch, batch_index, 1]).generate_state(1, dtype=np.uint64)[0])
 
     def _item(self, index: int, source: np.ndarray, target: np.ndarray, seed: int) -> dict:
         """What a worker needs for one batch: its cells' corpus rows and, to build it, their metadata."""
+        labels, labels_next = self._labels(source, target)
         return {
             "index": index, "seed": seed, "source_rows": self.rows[source], "target_rows": self.rows[target],
             "dataset": self._dataset_index[source], "dataset_next": self._dataset_index[target],
             "size_factor": self._size_factor[source], "size_factor_next": self._size_factor[target],
-            "labels": {name: ids[source] for name, ids in self._label_ids.items()},
-            "labels_next": {name: ids[target] for name, ids in self._label_ids.items()},
+            "labels": labels, "labels_next": labels_next,
         }
 
     def _finish(self, built: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -607,7 +638,7 @@ class PertTFPairedBatchLoader:
             dense[cell, cpu[f"{side}_genes"]] = cpu[f"{side}_values"]
             batch[key] = _with_cls(dense, config.cls_value)
             batch[f"{key}_mask"] = _with_cls(self._has_gene[cpu[dataset_key]] & self._tokenizable, True)
-        for name in self._label_ids:
+        for name in self.label_to_index_by_name:
             batch[f"{name}_labels"] = cpu[f"{name}_labels"].long()
             batch[f"{name}_labels_next"] = cpu[f"{name}_labels_next"].long()
         return batch
@@ -654,9 +685,10 @@ class PertTFPairedBatchLoader:
             "full_expr_mask": _with_cls(measured & self._tokenizable, True),
             "full_expr_next_mask": _with_cls(measured_next & self._tokenizable, True),
         }
-        for name, ids in self._label_ids.items():
-            batch[f"{name}_labels"] = torch.as_tensor(ids[source], dtype=torch.long, device=self.device)
-            batch[f"{name}_labels_next"] = torch.as_tensor(ids[target], dtype=torch.long, device=self.device)
+        labels, labels_next = self._labels(source, target)
+        for name in labels:
+            batch[f"{name}_labels"] = torch.as_tensor(labels[name], dtype=torch.long, device=self.device)
+            batch[f"{name}_labels_next"] = torch.as_tensor(labels_next[name], dtype=torch.long, device=self.device)
         return batch
 
     def _dense_counts(self, expr: ExpressionBatch, dataset: torch.Tensor) -> torch.Tensor:
