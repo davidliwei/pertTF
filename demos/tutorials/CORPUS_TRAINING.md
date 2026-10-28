@@ -191,7 +191,7 @@ data_gen = produce_corpus_datasets(
 )
 ```
 
-- `sampling_mode`: `"uniform"`, `"expressed"` (`nonzero_prop`,
+- `sampling_mode`: `"simple"`, `"expressed"` (`nonzero_prop`,
   `fix_nonzero_prop`) or `"hvg"` (`non_hvg_size`), with the quotas of pertTF's
   collator. In `"hvg"` mode a cell gets at most `max_seq_len - 1 - non_hvg_size`
   of its dataset's HVGs (a random subset if it has more), so datasets with

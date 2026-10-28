@@ -199,7 +199,7 @@ def test_sampling_modes(tmp_path, in_workers):
     # expressed: round(0.5 * 2) = 1 expressed gene (ds0 WT: A, C; ds1 WT: A, B), then 1 unexpressed.
     for genes in drawn(2, sampling_mode="expressed", nonzero_prop=0.5):
         assert np.isin(genes[0], [0, 2]).sum() == 1 and np.isin(genes[1], [0, 1]).sum() == 1
-    assert set(np.concatenate([genes[0] for genes in drawn(1, sampling_mode="uniform")]).tolist()) == {0, 1, 2, 3}
+    assert set(np.concatenate([genes[0] for genes in drawn(1, sampling_mode="simple")]).tolist()) == {0, 1, 2, 3}
     with pytest.raises(ValueError, match="sampling_mode"):
         _loader(corpus, sampling_mode="HVG")
     with pytest.raises(ValueError, match="non_hvg_size"):
@@ -208,11 +208,11 @@ def test_sampling_modes(tmp_path, in_workers):
 
 @BUILDS
 @pytest.mark.parametrize("config", [
-    {"sampling_mode": "uniform"},
+    {"sampling_mode": "simple"},
     {"sampling_mode": "expressed"},
     {"sampling_mode": "expressed", "nonzero_prop": 0.5, "fix_nonzero_prop": True},
     {"sampling_mode": "hvg", "non_hvg_size": 3},
-], ids=["uniform", "expressed", "expressed_fixed", "hvg"])
+], ids=["simple", "expressed", "expressed_fixed", "hvg"])
 def test_quotas_match_pertTF(tmp_path, in_workers, config):
     """Per cell, as many genes from each group as pertTF's weighted_sample takes for the same cell."""
     rng = np.random.default_rng(0)
@@ -235,7 +235,7 @@ def test_quotas_match_pertTF(tmp_path, in_workers, config):
         group = values > 0 if mode == "expressed" else is_hvg if mode == "hvg" else np.ones(n_genes, dtype=bool)
         genes = drawn[row][drawn[row] != 0] - 4                             # pad token 0; gene g is token 4 + g
         assert len(set(genes.tolist())) == len(genes)
-        index = weighted_sample(values, seq_len, rng=rng, mode={"uniform": "simple"}.get(mode, mode),
+        index = weighted_sample(values, seq_len, rng=rng, mode=mode,
                                 non_zero_proportion=config.get("nonzero_prop", 0.7),
                                 fixed_ratio=config.get("fix_nonzero_prop", False),
                                 hvg_nonhvg=(np.flatnonzero(group), np.flatnonzero(~group)),

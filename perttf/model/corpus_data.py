@@ -115,7 +115,7 @@ def produce_corpus_datasets(
         mask_ratio=config.get("mask_ratio", 0.15),
         pad_value=config.get("pad_value", -2), mask_value=config.get("mask_value", -1),
         cls_value=config.get("cls_value", -3),
-        sampling_mode=config.get("sampling_mode", "uniform"),
+        sampling_mode=config.get("sampling_mode", "simple"),
         nonzero_prop=config.get("nonzero_prop", 0.7),
         fix_nonzero_prop=config.get("fix_nonzero_prop", False),
         non_hvg_size=config.get("non_hvg_size", 1000),
@@ -130,6 +130,7 @@ def produce_corpus_datasets(
     # A pretrained vocabulary need not have every corpus gene; genes without a token are left out.
     tokens = GeneTokens.from_corpus(
         corpus, tokenizer_stoi, feature_id_to_token, pad_token=config.get("pad_token", "<pad>"),
+        cls_token=config.get("cls_token", "<cls>"),
     )
     used_datasets = selected_frame["dataset_index"].unique()
     coverage = corpus.feature_registry.dataset_has_gene[used_datasets] & tokens.tokenizable

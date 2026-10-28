@@ -46,7 +46,7 @@ def test_two_corpora_unified_training_and_validation(tmp_path, monkeypatch):
     monkeypatch.setenv("WANDB_DIR", str(tmp_path))
     parameters = dict(
         next_cell_pred_type="pert", GEPC=True, input_emb_style="continuous",
-        batch_size=6, max_seq_len=4, mask_ratio=1.0, sampling_mode="uniform",
+        batch_size=6, max_seq_len=4, mask_ratio=1.0, sampling_mode="simple",
         seed=4, ps_weight=0.0, pad_token="<pad>", pad_value=-2, mask_value=-1,
         amp=False, dab_weight=0.0, ADV=False, lr=1e-3, schedule_ratio=0.9,
         log_interval=100, use_batch_label=False, perturbation_input=False,

@@ -130,7 +130,7 @@ that have a token. The target cell is read at the same genes. `sampling_mode`
 uses the quotas of pertTF's collator (`custom_tokenizer.weighted_sample`),
 uniformly within each group:
 
-- `"uniform"`: `seq_len` genes
+- `"simple"`: `seq_len` genes
 - `"expressed"`: `round(nonzero_prop * seq_len)` of the cell's expressed genes
   (all if fewer), the rest from its unexpressed genes; with `fix_nonzero_prop`,
   at most `round(k * (1 - nonzero_prop) / nonzero_prop)` unexpressed genes for

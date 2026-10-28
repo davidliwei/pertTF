@@ -30,7 +30,7 @@ __all__ = [
 ]
 
 SPECIAL_TOKENS = ("<pad>", "<cls>", "<unk>", "<eos>")
-SAMPLING_MODES = ("uniform", "expressed", "hvg")
+SAMPLING_MODES = ("simple", "expressed", "hvg")
 TOTAL_COUNTS = "scorpus_total_counts"  # per-cell sum of stored counts, an obs column written by scorpus conversion
 
 
@@ -108,7 +108,7 @@ class PertTFAdapterConfig:
     # Genes of a cell are drawn from its pool (the genes its dataset measured that have a token),
     # with the quotas of pertTF's collator (custom_tokenizer.weighted_sample), uniformly within each
     # group; a cell whose pool fits in seq_len gets its whole pool:
-    #   "uniform":   seq_len genes.
+    #   "simple":    seq_len genes.
     #   "expressed": round(nonzero_prop * seq_len) of the cell's expressed genes (all if fewer), the
     #                rest of seq_len from its unexpressed genes; with fix_nonzero_prop at most
     #                round(k * (1 - p) / p) of those, for k expressed genes drawn.
@@ -116,7 +116,7 @@ class PertTFAdapterConfig:
     #                seq_len - non_hvg_size places (a uniform subset if it has more). HVGs are the
     #                genes of the dataset's var column highly_variable. pertTF's config sets
     #                max_seq_len to n_hvg + non_hvg_size + 1 for this mode.
-    sampling_mode: str = "uniform"
+    sampling_mode: str = "simple"
     nonzero_prop: float = 0.7
     fix_nonzero_prop: bool = False
     non_hvg_size: int = 1000
@@ -246,7 +246,7 @@ def _gene_quotas(config: PertTFAdapterConfig, n_pool: torch.Tensor, n_group: tor
     """Genes per cell from its group (its whole pool, its expressed genes or its HVGs) and from the rest
     of its pool, as in pertTF's custom_tokenizer.weighted_sample."""
     n_rest = n_pool - n_group
-    if config.sampling_mode == "uniform":
+    if config.sampling_mode == "simple":
         k_group, k_rest = n_group.clamp(max=seq_len), torch.zeros_like(n_group)
     elif config.sampling_mode == "expressed":
         p = config.nonzero_prop
@@ -325,7 +325,7 @@ class _CpuBatchBuilder:
                 self.local_pool[d, :len(in_pool)] = self.local_to_global[d, in_pool]
                 self.pool_position[d, in_pool] = np.arange(len(in_pool))
         else:
-            group = pool if config.sampling_mode == "uniform" else pool & hvg
+            group = pool if config.sampling_mode == "simple" else pool & hvg
             self.group_lists, self.n_group = _padded_lists(group)
             self.rest_lists, self.n_rest = _padded_lists(pool & ~group)
         self.n_local = local_to_global.shape[1]
@@ -677,7 +677,7 @@ class PertTFPairedBatchLoader:
         """Genes per cell with pertTF's quotas; -1 at the end of rows shorter than the longest."""
         mode = self.config.sampling_mode
         pool = self._sampling_pool[dataset]
-        group = pool if mode == "uniform" else pool & (counts > 0) if mode == "expressed" else pool & self._hvg[dataset]
+        group = pool if mode == "simple" else pool & (counts > 0) if mode == "expressed" else pool & self._hvg[dataset]
         k_group, k_rest = _gene_quotas(self.config, pool.sum(dim=1), group.sum(dim=1), self.seq_len)
         generator = torch.Generator(device=self.device).manual_seed(seed)
         keys = torch.rand(pool.shape, device=self.device, generator=generator)
