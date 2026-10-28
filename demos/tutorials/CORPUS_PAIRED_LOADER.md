@@ -155,9 +155,12 @@ Batch keys:
 
 - `gene_ids`, `next_gene_ids`: CLS, then the sampled genes' token IDs
 - `values`: source values with exactly `int(n * mask_ratio)` of a row's `n`
-  genes replaced by `mask_value`, as pertTF's `random_mask_value` does
+  genes replaced by `mask_value`, as pertTF's `random_mask_value` does; for a
+  pair across gene panels, genes the target's dataset did not measure are not
+  among the `n`, so the masked-gene losses never score a target's missing gene
 - `target_values`: unmasked source values
-- `target_values_next`: target values at the source's genes
+- `target_values_next`: target values at the source's genes (`pad_value` where
+  the target's dataset did not measure the gene)
 - expression values are `log1p(count / size_factor)`;
   positions without a gene hold `pad_value`, the CLS position `cls_value`
 - `sf`, `sf_next`: `1 / size_factor`, pertTF's normalization multiplier

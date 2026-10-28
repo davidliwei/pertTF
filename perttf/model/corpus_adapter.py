@@ -357,10 +357,11 @@ class _CpuBatchBuilder:
                                config.pad_value)
         gene_ids = _cls_first(np.where(valid, self.token_of_gene[safe], self.pad_id), self.cls_id)
         values = _cls_first(values.astype(np.float32), config.cls_value)
+        values_next = _cls_first(values_next.astype(np.float32), config.cls_value)
 
         out = {
-            "gene_ids": gene_ids, "values": self._mask(values, rng), "target_values": values,
-            "target_values_next": _cls_first(values_next.astype(np.float32), config.cls_value),
+            "gene_ids": gene_ids, "values": self._mask(values, values_next, rng), "target_values": values,
+            "target_values_next": values_next,
             "dataset": dataset, "dataset_next": dataset_next,
             "size_factor": item["size_factor"], "size_factor_next": item["size_factor_next"],
             "index": item["source_rows"], "next_index": item["target_rows"],
@@ -441,10 +442,11 @@ class _CpuBatchBuilder:
         found = (key[at] == query) & (local_genes >= 0)
         return np.where(found, counts[at], 0)
 
-    def _mask(self, values, rng):
-        """Exactly int(n * mask_ratio) of each row's values (not pad or CLS) set to mask_value."""
+    def _mask(self, values, values_next, rng):
+        """Exactly int(n * mask_ratio) of each row's maskable values (see the device build's _mask) set
+        to mask_value."""
         config = self.config
-        maskable = (values != config.pad_value) & (values != config.cls_value)
+        maskable = (values != config.pad_value) & (values != config.cls_value) & (values_next != config.pad_value)
         n_mask = (maskable.sum(axis=1) * config.mask_ratio).astype(np.int64)
         order = np.argsort(np.where(maskable, rng.random(values.shape), 2.0), axis=1)
         chosen = np.zeros(values.shape, dtype=bool)
@@ -663,14 +665,15 @@ class PertTFPairedBatchLoader:
         )
         gene_ids = _with_cls(gene_ids, self.tokens.cls_id)
         values = _with_cls(values, config.cls_value)
+        values_next = _with_cls(values_next, config.cls_value)
 
         n_cells = len(source)
         batch = {
             "gene_ids": gene_ids,
             "next_gene_ids": gene_ids.clone(),
-            "values": self._mask(values, seed + 1),
+            "values": self._mask(values, values_next, seed + 1),
             "target_values": values,
-            "target_values_next": _with_cls(values_next, config.cls_value),
+            "target_values_next": values_next,
             # pertTF's sf is the normalization multiplier, the inverse of the size factor.
             "sf": size_factor.reshape(-1, 1).reciprocal(),
             "sf_next": size_factor_next.reshape(-1, 1).reciprocal(),
@@ -717,11 +720,13 @@ class PertTFPairedBatchLoader:
         genes = genes.gather(1, torch.sort((genes < 0).to(torch.int8), dim=1, stable=True).indices)
         return genes[:, :int((genes >= 0).sum(dim=1).max())]
 
-    def _mask(self, values: torch.Tensor, seed: int) -> torch.Tensor:
-        """Replace exactly int(n * mask_ratio) of each row's values (not pad or CLS) by ``mask_value``,
-        as pertTF's random_mask_value does."""
+    def _mask(self, values: torch.Tensor, values_next: torch.Tensor, seed: int) -> torch.Tensor:
+        """Replace exactly int(n * mask_ratio) of each row's maskable values by ``mask_value``, as
+        pertTF's random_mask_value does. Pad and CLS are not maskable, nor, for a pair across gene
+        panels, a gene the target's dataset did not measure: its target value is the pad value, which
+        the masked-gene losses on the target (mvc_masked_train) would otherwise fit."""
         config = self.config
-        maskable = (values != config.pad_value) & (values != config.cls_value)
+        maskable = (values != config.pad_value) & (values != config.cls_value) & (values_next != config.pad_value)
         n_mask = (maskable.sum(dim=1).double() * config.mask_ratio).long()
         generator = torch.Generator(device=self.device).manual_seed(seed)
         keys = torch.where(maskable, torch.rand(values.shape, device=self.device, generator=generator), 2.0)

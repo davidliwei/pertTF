@@ -14,7 +14,7 @@ from .pert_emb import build_perturbation_mapping
 from .train_data_gen import _record_config_value
 from ..utils.custom_tokenizer import SimpleVocab
 from ..utils.split_check import check_train_valid_split
-from ..utils.pert_labels import canonical_label, max_set_size, validate_perturbation_labels
+from ..utils.pert_labels import canonical_label, max_set_size, resolve_control_value, validate_perturbation_labels
 from ..utils.pert_metrics import GroupMoments, expand_perturbation_rows, normalize_expression
 
 
@@ -100,6 +100,12 @@ def produce_corpus_datasets(
         raise ValueError("Align corpus features explicitly with concat(feature_key=...) before training")
     if any(kind == "non_count" for kind in corpus.expression_kinds.values()):
         raise ValueError("This training route requires counts; a no_count corpus needs explicit preprocessing first")
+    # Inference reads the control from the saved config (resolve_control_value), so control_label is
+    # recorded there; a config naming another control would split and predict sets with the wrong one.
+    configured_control = resolve_control_value(config, default=None)
+    if configured_control not in (None, control_label):
+        raise ValueError(f"control_label={control_label!r} contradicts the config's control {configured_control!r}")
+    _record_config_value(config, "perturbation_control_value", control_label)
     label_fields = {perturbation_column: "perturbation", celltype_column: "celltype", batch_column: "batch"}
     if len(label_fields) != 3:
         raise ValueError("Perturbation, celltype, and batch columns must be distinct")

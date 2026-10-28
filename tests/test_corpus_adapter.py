@@ -261,7 +261,8 @@ def test_device_and_worker_builds_agree(tmp_path):
         measured_next = batch["full_expr_next_mask"].gather(1, column)
         expected_next = torch.where(measured_next, batch["full_expr_next"].gather(1, column), torch.tensor(-2.0))
         torch.testing.assert_close(batch["target_values_next"][:, 1:], expected_next)
-        assert ((batch["values"] == -1).sum(dim=1) == 1).all()             # int(2 * 0.5) per row
+        maskable = (batch["target_values_next"][:, 1:] != -2).sum(dim=1)   # genes the target also measured
+        assert ((batch["values"] == -1).sum(dim=1) == (maskable * 0.5).long()).all()
 
 
 @BUILDS
@@ -283,6 +284,17 @@ def test_labels(tmp_path, in_workers):
     assert batch["dataset_labels"].tolist() == [0] and batch["dataset_labels_next"].tolist() == [1]
     assert batch["perturbation_labels"].tolist() == [2] and batch["perturbation_labels_next"].tolist() == [0]
     assert loader.label_to_index_by_name["batch"] == {"ds0_batch": 0, "ds1_batch": 1}
+
+
+@BUILDS
+def test_masking_skips_genes_the_target_did_not_measure(tmp_path, in_workers):
+    """Pairs across gene panels: a gene the target's dataset did not measure (target value pad) is never
+    masked, so the masked-gene losses on the target never fit the pad value."""
+    loader = _loader(_mixed(tmp_path), mask_ratio=1.0, build_in_workers=in_workers)
+    batch = loader.build_batch(np.array([0, 1]), np.array([3, 2]), seed=0)      # ds0 (A, B) -> ds1 (B, C)
+    masked = batch["values"] == -1
+    unmeasured = batch["target_values_next"] == -2
+    assert masked.any() and unmeasured.any() and not (masked & unmeasured).any()
 
 
 @BUILDS

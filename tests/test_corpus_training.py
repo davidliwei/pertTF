@@ -209,6 +209,7 @@ def test_multi_perturbation_sets(tmp_path, monkeypatch):
         best.save_pretrained(str(save_dir / "model"))
         reloaded = HFPerturbationTFModel.from_pretrained(str(save_dir / "model"))
         assert reloaded.training_config["pert_delimiter"] == "+" and reloaded.training_config["max_n_pert"] == 2
+        assert reloaded.training_config["perturbation_control_value"] == "ctrl"
         query = corpus.to_anndata(global_row_indices=[0, 3])                # the controls of dataset a
         counts = query.X.toarray()
         query.layers["lognorm"] = np.log1p(counts / counts.sum(axis=1, keepdims=True) * 10000)
@@ -218,6 +219,11 @@ def test_multi_perturbation_sets(tmp_path, monkeypatch):
         assert predicted.obsm["mvc_next_expr"].shape == (2, 3) and np.isfinite(predicted.obsm["mvc_next_expr"]).all()
         assert all(len(label.split("+")) <= 2 for label in predicted.obs["predicted_genotype"])
 
+        with pytest.raises(ValueError, match="contradicts"):
+            produce_corpus_datasets(
+                corpus, run.config, train_indices=[0, 1, 2, 6, 7, 8], valid_indices=[3, 4, 5, 9, 10, 11],
+                **{**options, "control_label": "WT"},
+            )
         (tmp_path / "respelled").mkdir()
         respelled = build_corpus(tmp_path / "respelled",["ctrl", "A", "B+A", "ctrl", "A+B", "B"])
         with pytest.raises(ValueError, match="canonical"):
