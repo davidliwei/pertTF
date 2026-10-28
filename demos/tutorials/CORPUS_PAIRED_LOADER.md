@@ -13,8 +13,9 @@ use the loader directly to inspect batches or to pair cells differently.
 - The metadata must contain the columns in `label_fields` and `dataset_index`,
   with no missing labels in the loader's rows.
 - Every dataset's obs must have `scorpus_total_counts` (written by scorpus
-  conversion). A cell's size factor is its total over the median of its
-  dataset's positive totals (1 for a cell without counts).
+  conversion). A cell's size factor is its total over `target_sum` (default
+  10,000) or, with `target_sum=None`, over the median positive total of its
+  dataset's cells among the loader's `rows`; 1 for a cell without counts.
 
 ## Basic Usage
 
@@ -33,7 +34,7 @@ rows = np.arange(len(corpus.metadata_index))      # or the training rows
 
 config = PertTFAdapterConfig(
     label_fields={"perturb_label": "perturbation", "cell_context": "celltype", "batch_id": "batch"},
-    normalization_scale=1.0,
+    target_sum=10000.0,                            # or None: each dataset's median total in rows
     sampling_mode="hvg",                           # each dataset's highly_variable genes (2,000 here)
     non_hvg_size=1000,
 )
@@ -157,9 +158,9 @@ Batch keys:
   genes replaced by `mask_value`, as pertTF's `random_mask_value` does
 - `target_values`: unmasked source values
 - `target_values_next`: target values at the source's genes
-- expression values are `log1p(count / size_factor * normalization_scale)`;
+- expression values are `log1p(count / size_factor)`;
   positions without a gene hold `pad_value`, the CLS position `cls_value`
-- `sf`, `sf_next`: `normalization_scale / size_factor`, pertTF's normalization multiplier
+- `sf`, `sf_next`: `1 / size_factor`, pertTF's normalization multiplier
 - `index`, `next_index`: source and target corpus rows
 - `{label}_labels`, `{label}_labels_next`: label IDs
 - `full_gene_ids`, `full_expr`, `full_expr_next`: every corpus gene, after CLS
@@ -207,4 +208,4 @@ for epoch in range(10):
 - Perturbed groups without a control (validation): relax `context_columns` or include those contexts' controls in `rows`.
 - Missing labels: filter those rows out of `rows`.
 - No HVGs for a dataset: `"hvg"` then gives its cells only `non_hvg_size` other genes; compute HVGs (e.g. scanpy on `to_anndata_lazy`), save them with `save_ex_var` and load with `ex_var=True`.
-- Missing `scorpus_total_counts`: migrate the corpus with current scorpus.
+- Missing `scorpus_total_counts`: the corpus was converted with scorpus older than 0.5.0; re-convert it.

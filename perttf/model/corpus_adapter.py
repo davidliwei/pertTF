@@ -34,16 +34,26 @@ SAMPLING_MODES = ("uniform", "expressed", "hvg")
 TOTAL_COUNTS = "scorpus_total_counts"  # per-cell sum of stored counts, an obs column written by scorpus conversion
 
 
-def _dataset_size_factors(corpus: Corpus, dataset_id: str) -> np.ndarray:
-    """Size factors of all cells of one dataset: total counts over the median of the dataset's
-    positive totals; cells without counts get 1."""
-    obs = corpus.obs_frames[dataset_id]
-    if TOTAL_COUNTS not in obs:
-        raise ValueError(f"{dataset_id!r} has no {TOTAL_COUNTS!r} obs column; re-convert or migrate it with current scorpus")
-    totals = obs[TOTAL_COUNTS].to_numpy(dtype=np.float64)
-    positive = totals[totals > 0]
-    median = np.median(positive) if len(positive) else 1.0
-    return np.where(totals > 0, totals / median, 1.0)
+def _size_factors(corpus: Corpus, rows: np.ndarray, dataset_index: np.ndarray, target_sum: float | None) -> np.ndarray:
+    """Size factors of the cells at corpus rows ``rows``: total counts over ``target_sum`` or, if None,
+    over the median positive total of the cells of the same dataset among ``rows`` (as scanpy's
+    normalize_total); cells without counts get 1."""
+    totals = []
+    for name in corpus.dataset_ids:
+        obs = corpus.obs_frames[name]
+        if TOTAL_COUNTS not in obs:
+            raise ValueError(f"{name!r} has no {TOTAL_COUNTS!r} obs column; convert it with scorpus >= 0.5.0, which writes it")
+        totals.append(obs[TOTAL_COUNTS].to_numpy(dtype=np.float64))
+    # Datasets follow each other in corpus row order, so their concatenated totals are indexed by corpus row.
+    totals = np.concatenate(totals)[rows]
+    if target_sum is None:
+        target = np.ones(len(rows))
+        for dataset in np.unique(dataset_index):
+            positive = totals[(dataset_index == dataset) & (totals > 0)]
+            target[dataset_index == dataset] = np.median(positive) if len(positive) else 1.0
+    else:
+        target = target_sum
+    return np.where(totals > 0, totals / target, 1.0)
 
 
 @dataclass(frozen=True)
@@ -87,7 +97,9 @@ class PertTFAdapterConfig:
     """How corpus cells become pertTF tensors."""
 
     label_fields: dict[str, str]  # metadata column -> label name, e.g. {"perturb_label": "perturbation"}
-    normalization_scale: float = 1.0  # values are log1p(count / size_factor * normalization_scale)
+    # Values are log1p(count / size_factor), size_factor = total counts / target_sum: each cell is scaled
+    # to target_sum counts, or with None to the median total of its dataset's cells in the loader's rows.
+    target_sum: float | None = 10000.0
     mask_ratio: float = 0.15
     pad_value: float = -2
     mask_value: float = -1
@@ -358,7 +370,7 @@ class _CpuBatchBuilder:
         return {key: torch.from_numpy(np.ascontiguousarray(value)) for key, value in out.items()}
 
     def _log1p(self, counts, size_factor):
-        return np.log1p(counts.astype(np.float32) / size_factor * np.float32(self.config.normalization_scale))
+        return np.log1p(counts.astype(np.float32) / size_factor)
 
     def _quotas(self, n_pool, n_group):
         quotas = _gene_quotas(self.config, torch.from_numpy(n_pool), torch.from_numpy(n_group), self.seq_len)
@@ -504,10 +516,7 @@ class PertTFPairedBatchLoader:
             self.label_to_index_by_name[name] = mapping
             self._label_ids[name] = values.replace_strict(mapping, return_dtype=pl.Int32).to_numpy()
         self._dataset_index = metadata["dataset_index"].to_numpy()
-        # Each dataset's factors are over all its cells, not only those in rows. Datasets follow each
-        # other in corpus row order, so their concatenated factors are indexed by corpus row.
-        size_factor = np.concatenate([_dataset_size_factors(corpus, name) for name in corpus.dataset_ids])
-        self._size_factor = size_factor[self.rows].astype(np.float32)
+        self._size_factor = _size_factors(corpus, self.rows, self._dataset_index, config.target_sum).astype(np.float32)
 
         registry = corpus.feature_registry
         on_device = self._on_device
@@ -584,8 +593,8 @@ class PertTFPairedBatchLoader:
         n_cells = len(cpu["gene_ids"])
         batch = {key: cpu[key] for key in ("gene_ids", "values", "target_values", "target_values_next", "index", "next_index")}
         batch["next_gene_ids"] = cpu["gene_ids"].clone()
-        batch["sf"] = cpu["size_factor"].reshape(-1, 1).reciprocal() * config.normalization_scale
-        batch["sf_next"] = cpu["size_factor_next"].reshape(-1, 1).reciprocal() * config.normalization_scale
+        batch["sf"] = cpu["size_factor"].reshape(-1, 1).reciprocal()
+        batch["sf_next"] = cpu["size_factor_next"].reshape(-1, 1).reciprocal()
         batch["ps"] = torch.zeros((n_cells, 1), device=self.device)
         batch["ps_next"] = torch.zeros((n_cells, 1), device=self.device)
         batch["full_gene_ids"] = _with_cls(self._token_of_gene.unsqueeze(0), self.tokens.cls_id).expand(n_cells, -1).clone()
@@ -629,8 +638,8 @@ class PertTFPairedBatchLoader:
             "target_values": values,
             "target_values_next": _with_cls(values_next, config.cls_value),
             # pertTF's sf is the normalization multiplier, the inverse of the size factor.
-            "sf": size_factor.reshape(-1, 1).reciprocal() * config.normalization_scale,
-            "sf_next": size_factor_next.reshape(-1, 1).reciprocal() * config.normalization_scale,
+            "sf": size_factor.reshape(-1, 1).reciprocal(),
+            "sf_next": size_factor_next.reshape(-1, 1).reciprocal(),
             "index": on_device(self.rows[source]),
             "next_index": on_device(self.rows[target]),
             "ps": torch.zeros((n_cells, 1), device=self.device),
@@ -659,7 +668,7 @@ class PertTFPairedBatchLoader:
         return torch.as_tensor(array, device=self.device)
 
     def _log1p(self, counts: torch.Tensor, size_factor: torch.Tensor) -> torch.Tensor:
-        return torch.log1p(counts / size_factor.unsqueeze(1) * self.config.normalization_scale)
+        return torch.log1p(counts / size_factor.unsqueeze(1))
 
     def _sample_genes(self, counts: torch.Tensor, dataset: torch.Tensor, seed: int) -> torch.Tensor:
         """Genes per cell with pertTF's quotas; -1 at the end of rows shorter than the longest."""

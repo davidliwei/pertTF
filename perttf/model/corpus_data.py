@@ -51,7 +51,7 @@ def produce_corpus_datasets(
     tokenizer_stoi: dict | None = None,
     feature_id_to_token: dict | None = None,
     pairing_columns: tuple[str, ...] = (),
-    normalization_scale: float = 1.0,
+    target_sum: float | None = 10000.0,
     num_workers: int = 0,
     device="cpu",
     build_in_workers: bool = False,
@@ -59,7 +59,9 @@ def produce_corpus_datasets(
 ):
     """Return the data_gen dictionary consumed by wrapper_train.
 
-    This counts-based route uses continuous log1p expression and pertTF's default
+    This counts-based route uses continuous log1p expression, each cell scaled to
+    ``target_sum`` counts (None: the median total of its dataset's cells in each
+    loader's rows, so training and validation compute it separately), and pertTF's default
     pairs (``default_pair_sampler``) within the same dataset and celltype: training
     uses every training cell once as a source, validation every validation cell
     once as a target. Additional pairing columns can constrain donor/condition.
@@ -109,7 +111,7 @@ def produce_corpus_datasets(
     if source_ids.difference(mapping):
         raise ValueError("genotype_to_index must include external source IDs")
     adapter_config = PertTFAdapterConfig(
-        label_fields=label_fields, normalization_scale=normalization_scale,
+        label_fields=label_fields, target_sum=target_sum,
         mask_ratio=config.get("mask_ratio", 0.15),
         pad_value=config.get("pad_value", -2), mask_value=config.get("mask_value", -1),
         cls_value=config.get("cls_value", -3),

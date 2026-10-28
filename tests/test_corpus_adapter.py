@@ -105,12 +105,12 @@ def test_gene_tokens(tmp_path):
 @BUILDS
 def test_values_are_log1p_counts_at_the_source_genes(tmp_path, in_workers):
     corpus = _small(tmp_path)
-    loader = _loader(corpus, normalization_scale=1.5, build_in_workers=in_workers)
+    loader = _loader(corpus, target_sum=12.0, build_in_workers=in_workers)
     batch = loader.build_batch(np.array([0, 1]), np.array([1, 1]), seed=5)
 
     dense = np.array([[5, 0, 1, 0], [0, 3, 0, 2]], dtype=np.float32)
-    size_factor = (np.array([6.0, 5.0]) / 6).astype(np.float32)             # totals over the median total 6
-    expected = np.log1p(dense / size_factor[:, None] * 1.5)
+    size_factor = (np.array([6.0, 5.0]) / 12).astype(np.float32)            # totals over target_sum 12
+    expected = np.log1p(dense / size_factor[:, None])
     assert torch.equal(batch["gene_ids"], batch["next_gene_ids"])
     assert (batch["gene_ids"][:, 0] == 1).all() and (batch["target_values"][:, 0] == -3).all()
     genes = batch["gene_ids"][:, 1:] - 4                                    # all 4 genes, in sampled order
@@ -118,8 +118,8 @@ def test_values_are_log1p_counts_at_the_source_genes(tmp_path, in_workers):
     for row, target_row in ((0, 1), (1, 1)):
         np.testing.assert_allclose(batch["target_values"][row, 1:], expected[row, genes[row]], rtol=1e-6)
         np.testing.assert_allclose(batch["target_values_next"][row, 1:], expected[target_row, genes[row]], rtol=1e-6)
-    torch.testing.assert_close(batch["sf"], torch.tensor([[1.5], [1.5 * 6 / 5]]))
-    torch.testing.assert_close(batch["sf_next"], torch.tensor([[1.5 * 6 / 5], [1.5 * 6 / 5]]))
+    torch.testing.assert_close(batch["sf"], torch.tensor([[12 / 6], [12 / 5]]))
+    torch.testing.assert_close(batch["sf_next"], torch.tensor([[12 / 5], [12 / 5]]))
     assert torch.equal(batch["values"], batch["target_values"])            # mask_ratio 0
     assert batch["index"].tolist() == [0, 1] and batch["next_index"].tolist() == [1, 1]
     assert batch["perturbation_labels"].tolist() == [0, 1] and batch["perturbation_labels_next"].tolist() == [1, 1]
@@ -147,7 +147,7 @@ def test_genes_without_a_token_are_never_sampled(tmp_path, in_workers):
 @BUILDS
 def test_full_expression_on_mixed_panels(tmp_path, in_workers):
     corpus = _mixed(tmp_path)
-    loader = _loader(corpus, seq_len=2, build_in_workers=in_workers)
+    loader = _loader(corpus, seq_len=2, target_sum=None, build_in_workers=in_workers)
     batch = loader.build_batch(np.array([0, 2]), np.array([1, 3]), seed=29)
 
     column = {gene: 1 + corpus.feature_registry.global_feature_ids.index(gene) for gene in ("GENE_A", "GENE_B", "GENE_C")}
@@ -289,18 +289,21 @@ def test_missing_label_raises(tmp_path):
 
 @BUILDS
 def test_size_factors_from_stored_totals(tmp_path, in_workers):
-    """A cell's size factor is its scorpus_total_counts over the median positive total of its dataset,
-    over all the dataset's cells, not only the loader's rows; a cell without counts gets 1."""
+    """A cell's size factor is its scorpus_total_counts over target_sum or, with None, over the median
+    positive total of its dataset's cells among the loader's rows; a cell without counts gets 1."""
     corpus = _corpus(tmp_path, [
-        {"name": "ds0", "genes": GENES,                                     # totals 6, 0, 2, 12: median 6
+        {"name": "ds0", "genes": GENES,                                     # totals 6, 0, 2, 12
          "cells": [("WT", [0, 1], [2, 4]), ("KO", [], []), ("KO", [2], [2]), ("WT", [3], [12])]},
-        {"name": "ds1", "genes": GENES, "cells": [("WT", [0], [3]), ("KO", [1], [5])]},  # median 4
+        {"name": "ds1", "genes": GENES, "cells": [("WT", [0], [3]), ("KO", [1], [5])]},  # totals 3, 5
     ])
-    loader = _loader(corpus, rows=[0, 1, 2, 4, 5], build_in_workers=in_workers)   # leaves out the cell with 12
-    cells = np.arange(5)
-    batch = loader.build_batch(cells, cells, seed=0)
-    size_factor = np.array([6 / 6, 1.0, 2 / 6, 3 / 4, 5 / 4], dtype=np.float32)
-    torch.testing.assert_close(batch["sf"], torch.from_numpy(1 / size_factor).reshape(-1, 1))
+    totals = np.array([6.0, 0.0, 2.0, 3.0, 5.0])
+    # Rows leave out the cell with 12, so the medians are ds0 4 (of 6, 2) and ds1 4 (of 3, 5).
+    for target_sum, target in ((10000.0, 10000.0), (None, 4.0)):
+        loader = _loader(corpus, rows=[0, 1, 2, 4, 5], target_sum=target_sum, build_in_workers=in_workers)
+        cells = np.arange(5)
+        batch = loader.build_batch(cells, cells, seed=0)
+        size_factor = np.where(totals > 0, totals / target, 1.0).astype(np.float32)
+        torch.testing.assert_close(batch["sf"], torch.from_numpy(1 / size_factor).reshape(-1, 1))
 
 
 def test_corpus_without_total_counts_raises(tmp_path):

@@ -107,7 +107,7 @@ def test_two_corpora_unified_training_and_validation(tmp_path, monkeypatch):
         saved = torch.load(save_dir / "running_parameters.pt", weights_only=False)
         assert saved["genotype_to_index"] == mapping
         assert saved["pert_source_config"]["control_label"] == "ctrl"
-        assert saved["corpus_config"]["adapter"]["normalization_scale"] == 1.0
+        assert saved["corpus_config"]["adapter"]["target_sum"] == 10000.0
         result = evaluate(
             best, data_gen["valid_loader"], run.config, vocab, device=torch.device("cpu"),
             cell_type_to_index=data_gen["cell_type_to_index"], genotype_to_index=mapping,
