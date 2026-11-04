@@ -94,8 +94,6 @@ config = dict(
     # perturbation prediction: a control cell plus a target perturbation -> the perturbed cell
     pert_sources=sources,
     next_cell_pred_type="pert",
-    next_weight=1.0,          # loss on the predicted perturbed cell; 0 would ignore the perturbation
-    this_weight=1.0,          # loss on reconstructing the input cell
     cell_type_classifier=False,
     genotype_classifier=False,
     perturbation_checkpoint_metric="pearson_delta_sample",

@@ -973,7 +973,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         loaded checkpoint (continued training or full fine-tuning). The settings are this model's
         training_config updated with train_config (e.g. {'epochs': 5, 'lr': 1e-4}); the objective follows
         next_cell_pred_type ('identity', 'pert' or 'lochness') as in wrapper_train. 'pert' needs explicit
-        train_indices / valid_indices; otherwise a random split is made when they are omitted.
+        train_indices / valid_indices; otherwise a random split is made when they are omitted. For 'pert' and
+        'lochness', next_weight defaults to 1 when neither the model's training_config nor train_config sets it.
 
         pretrain=True: label-free pretraining (masked-gene prediction and reconstruction of each cell's own
         expression), overriding any conflicting setting: identity objective, next_weight=0, this_weight=1,
@@ -1004,6 +1005,11 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
                 raise ValueError(
                     f"control label {requested_control!r} contradicts the checkpoint's control {checkpoint_control!r}; "
                     "continue training with the checkpoint's control, or build a new model with from_adata")
+        if (settings["next_cell_pred_type"] != "identity" and "next_weight" not in (train_config or {})
+                and "next_weight" not in (self.training_config or {})):
+            # The perturbation and lochNESS objectives are carried by the next-cell losses; the generic default
+            # next_weight=0 would also drop the target perturbation from the forward pass.
+            settings["next_weight"] = 1.0
         # Avoid duplicate kwarg collision in PertBatchCollator(vocab=..., **config).
         settings.pop("vocab", None)
         if pretrain:
