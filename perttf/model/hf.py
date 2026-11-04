@@ -922,7 +922,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         New untrained model for run_train. The gene vocabulary and the cell type / genotype label dictionaries
         come from adata (var names, obs 'celltype' and obs 'genotype'), built as the training data loader builds
         them; architecture and default training settings come from config (the keys of a pertTF training config,
-        e.g. layer_size, nlayers, nhead, GEPC, distribution, sampling_mode, lr, epochs).
+        e.g. layer_size, nlayers, nhead, GEPC, distribution, sampling_mode, lr, epochs). With config['pert_sources']
+        (from load_perturbation_sources) the model gets the unified encoder and the genotype dictionary is
+        build_perturbation_mapping's: dataset labels, control and every source ID.
         """
         special_tokens = config.get("special_tokens", ["<pad>", "<cls>", "<eoc>"])
         vocab = SimpleVocab(adata.var.index.tolist(), special_tokens)
@@ -941,7 +943,12 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         # With pert_delimiter the dictionary holds single perturbations (as PertTFUniDataManager builds it),
         # so a label such as "A+B" contributes A and B; without it labels are opaque as before.
         pert_delimiter = config.get("pert_delimiter", None)
-        if pert_delimiter is None:
+        if config.get("pert_sources") is not None:
+            # The unified encoder needs one mapping holding the dataset labels, the control and every source ID.
+            from .pert_emb import build_perturbation_mapping
+            genotype_to_index = build_perturbation_mapping(
+                adata.obs["genotype"].astype(str), config["pert_sources"], control_label=control, delimiter=pert_delimiter)
+        elif pert_delimiter is None:
             genotype_to_index = {g: i for i, g in enumerate(adata.obs["genotype"].unique())}
         else:
             singles = unique_perturbations(adata.obs["genotype"].astype(str), pert_delimiter, control)
