@@ -73,7 +73,7 @@ All these tutorials can run on Google Colab.
 
 ### Using the pertTF model
 
-- [Unified perturbation embeddings](demos/tutorials/PERTURBATION_SOURCES.md): select HF or custom sources, combine available features, and learn fallback embeddings for uncovered perturbations.
+- [Unified perturbation embeddings](demos/tutorials/PERTURBATION_SOURCES.md): train a perturbation model on HF or custom gene embedding tables (several can be combined; uncovered perturbations get learned vectors) and predict unseen perturbations.
 - [Inference Tutorial](demos/tutorials/INFERENCE.md) and [Google Colab notebook](https://colab.research.google.com/drive/1KWWvRJJJOj9QXuF5zgddLHkdCx6KJnTa?usp=sharing): use the HuggingFace pertTF model to make inferences
 - [LoRA fine tuning tutorial](demos/tutorials/LORA_FINETUNING.md) and [python notebook](demos/tutorials/lora_finetuning_tutorial.ipynb): use LoRA to fine tune the pertTF model
 - [Multi-perturbation (high-MOI) tutorial](demos/tutorials/MULTI_PERTURBATION.md): train, predict and screen cells carrying several perturbations (labels such as `A+B`), including settings for designed combinations versus random high-MOI screens.

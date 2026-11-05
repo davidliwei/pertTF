@@ -922,7 +922,9 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         New untrained model for run_train. The gene vocabulary and the cell type / genotype label dictionaries
         come from adata (var names, obs 'celltype' and obs 'genotype'), built as the training data loader builds
         them; architecture and default training settings come from config (the keys of a pertTF training config,
-        e.g. layer_size, nlayers, nhead, GEPC, distribution, sampling_mode, lr, epochs).
+        e.g. layer_size, nlayers, nhead, GEPC, distribution, sampling_mode, lr, epochs). With config['pert_sources']
+        (from load_perturbation_sources) the model gets the unified encoder and the genotype dictionary is
+        build_perturbation_mapping's: dataset labels, control and every source ID.
         """
         special_tokens = config.get("special_tokens", ["<pad>", "<cls>", "<eoc>"])
         vocab = SimpleVocab(adata.var.index.tolist(), special_tokens)
@@ -941,7 +943,12 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         # With pert_delimiter the dictionary holds single perturbations (as PertTFUniDataManager builds it),
         # so a label such as "A+B" contributes A and B; without it labels are opaque as before.
         pert_delimiter = config.get("pert_delimiter", None)
-        if pert_delimiter is None:
+        if config.get("pert_sources") is not None:
+            # The unified encoder needs one mapping holding the dataset labels, the control and every source ID.
+            from .pert_emb import build_perturbation_mapping
+            genotype_to_index = build_perturbation_mapping(
+                adata.obs["genotype"].astype(str), config["pert_sources"], control_label=control, delimiter=pert_delimiter)
+        elif pert_delimiter is None:
             genotype_to_index = {g: i for i, g in enumerate(adata.obs["genotype"].unique())}
         else:
             singles = unique_perturbations(adata.obs["genotype"].astype(str), pert_delimiter, control)
@@ -966,7 +973,8 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
         loaded checkpoint (continued training or full fine-tuning). The settings are this model's
         training_config updated with train_config (e.g. {'epochs': 5, 'lr': 1e-4}); the objective follows
         next_cell_pred_type ('identity', 'pert' or 'lochness') as in wrapper_train. 'pert' needs explicit
-        train_indices / valid_indices; otherwise a random split is made when they are omitted.
+        train_indices / valid_indices; otherwise a random split is made when they are omitted. For 'pert',
+        next_weight defaults to 1 when neither the model's training_config nor train_config sets it.
 
         pretrain=True: label-free pretraining (masked-gene prediction and reconstruction of each cell's own
         expression), overriding any conflicting setting: identity objective, next_weight=0, this_weight=1,
@@ -997,6 +1005,12 @@ class HFPerturbationTFModel(PerturbationTFModel, PyTorchModelHubMixin):
                 raise ValueError(
                     f"control label {requested_control!r} contradicts the checkpoint's control {checkpoint_control!r}; "
                     "continue training with the checkpoint's control, or build a new model with from_adata")
+        if (settings["next_cell_pred_type"] == "pert" and "next_weight" not in (train_config or {})
+                and "next_weight" not in (self.training_config or {})):
+            # The perturbation objective is carried by the next-cell losses; the generic default next_weight=0
+            # would also drop the target perturbation from the forward pass. Not for lochNESS: its pairs are the
+            # cell itself under a random PS gene, so a next-cell expression loss would teach that the gene does nothing.
+            settings["next_weight"] = 1.0
         # Avoid duplicate kwarg collision in PertBatchCollator(vocab=..., **config).
         settings.pop("vocab", None)
         if pretrain:
